@@ -21,6 +21,8 @@ func (s *Server) initStore() error {
 	s.serverDBCloseOnce = sync.Once{}
 	s.serverDBCloseErr = nil
 
+	// Server owns this shared handle. Domain stores created below borrow it and
+	// must not close it independently; closeServerDB is the single close path.
 	db, err := openServerDB(path)
 	if err != nil {
 		return err

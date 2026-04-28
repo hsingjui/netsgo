@@ -89,6 +89,8 @@ func NewTrafficStore(path string) (*TrafficStore, error) {
 	return newTrafficStoreWithDB(path, db, true), nil
 }
 
+// newTrafficStoreWithDB creates a traffic store over an existing DB handle.
+// When closeDB is false the caller retains DB ownership.
 func newTrafficStoreWithDB(path string, db *sql.DB, closeDB bool) *TrafficStore {
 	return &TrafficStore{
 		path:          path,

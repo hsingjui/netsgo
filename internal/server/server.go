@@ -25,7 +25,7 @@ type Server struct {
 	events                      *EventBus     // SSE event bus
 	store                       *TunnelStore  // tunnel persistent store
 	trafficStore                *TrafficStore // traffic history store
-	serverDB                    *sql.DB       // shared SQLite handle for server stores
+	serverDB                    *sql.DB       // owned shared SQLite handle for borrowed server stores; close only via closeServerDB
 	serverDBCloseOnce           sync.Once
 	serverDBCloseErr            error
 	startTime                   time.Time         // server start time

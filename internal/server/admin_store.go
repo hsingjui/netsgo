@@ -75,7 +75,7 @@ func generateUUID() string {
 		buf[0:4], buf[4:6], buf[6:8], buf[8:10], buf[10:16])
 }
 
-// NewAdminStore creates a new admin store.
+// NewAdminStore creates or opens a standalone admin store that owns its DB.
 func NewAdminStore(path string) (*AdminStore, error) {
 	db, err := openServerDB(path)
 	if err != nil {
@@ -90,6 +90,8 @@ func NewAdminStore(path string) (*AdminStore, error) {
 	return store, nil
 }
 
+// newAdminStoreWithDB creates an admin store over an existing DB handle.
+// When closeDB is false the caller retains DB ownership.
 func newAdminStoreWithDB(path string, db *sql.DB, closeDB bool) (*AdminStore, error) {
 	store := &AdminStore{
 		path:       path,

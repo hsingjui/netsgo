@@ -55,7 +55,7 @@ type TunnelStore struct {
 	failSaveCount int
 }
 
-// NewTunnelStore creates or opens a tunnel store.
+// NewTunnelStore creates or opens a standalone tunnel store that owns its DB.
 func NewTunnelStore(path string) (*TunnelStore, error) {
 	db, err := openServerDB(path)
 	if err != nil {
@@ -69,6 +69,8 @@ func NewTunnelStore(path string) (*TunnelStore, error) {
 	return store, nil
 }
 
+// newTunnelStoreWithDB creates a tunnel store over an existing DB handle.
+// When closeDB is false the caller retains DB ownership.
 func newTunnelStoreWithDB(path string, db *sql.DB, closeDB bool) (*TunnelStore, error) {
 	store := &TunnelStore{path: path, db: db, closeDB: closeDB}
 	if err := store.validateLoadedState(); err != nil {
