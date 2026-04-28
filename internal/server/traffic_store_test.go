@@ -232,6 +232,120 @@ func TestTrafficStore_FlushRejectsUint64SQLiteOverflow(t *testing.T) {
 	}
 }
 
+func TestTrafficStore_PendingMergeOverflowIsVisible(t *testing.T) {
+	ts, cleanup := newTestTrafficStore(t)
+	defer cleanup()
+
+	now := minuteFloorUTC(time.Now().UTC())
+	ts.ApplyDeltas([]TrafficDelta{
+		{ClientID: "c1", TunnelName: "web", TunnelType: "http", MinuteStart: now.Unix(), IngressBytes: ^uint64(0)},
+		{ClientID: "c1", TunnelName: "web", TunnelType: "http", MinuteStart: now.Unix(), IngressBytes: 1},
+	})
+
+	if _, err := ts.QueryWithResolution("c1", "web", now.Add(-time.Minute), now.Add(time.Minute), TrafficResolutionMinute); err == nil {
+		t.Fatal("QueryWithResolution should surface pending merge overflow")
+	} else if !strings.Contains(err.Error(), "ingress_bytes") {
+		t.Fatalf("pending overflow error should name ingress_bytes, got %v", err)
+	}
+	if err := ts.Flush(); err == nil {
+		t.Fatal("Flush should surface pending merge overflow")
+	} else if !strings.Contains(err.Error(), "ingress_bytes") {
+		t.Fatalf("flush overflow error should name ingress_bytes, got %v", err)
+	}
+}
+
+func TestTrafficStore_QueryRejectsTotalBytesOverflow(t *testing.T) {
+	ts, cleanup := newTestTrafficStore(t)
+	defer cleanup()
+
+	now := minuteFloorUTC(time.Now().UTC())
+	ts.ApplyDeltas([]TrafficDelta{{
+		ClientID:     "c1",
+		TunnelName:   "web",
+		TunnelType:   "http",
+		MinuteStart:  now.Unix(),
+		IngressBytes: ^uint64(0),
+		EgressBytes:  1,
+	}})
+
+	if _, err := ts.QueryWithResolution("c1", "web", now.Add(-time.Minute), now.Add(time.Minute), TrafficResolutionMinute); err == nil {
+		t.Fatal("QueryWithResolution should reject total byte overflow")
+	} else if !strings.Contains(err.Error(), "total_bytes") {
+		t.Fatalf("total overflow error should name total_bytes, got %v", err)
+	}
+}
+
+func TestTrafficStore_FlushRejectsPersistedMinuteAddOverflow(t *testing.T) {
+	ts, cleanup := newTestTrafficStore(t)
+	defer cleanup()
+
+	now := minuteFloorUTC(time.Now().UTC())
+	mustInsertTrafficBucket(t, ts, TrafficBucket{
+		ClientID:     "c1",
+		TunnelName:   "web",
+		TunnelType:   "http",
+		Resolution:   TrafficResolutionMinute,
+		BucketStart:  now.Unix(),
+		IngressBytes: maxSQLiteInt64,
+	})
+	ts.ApplyDeltas([]TrafficDelta{{
+		ClientID:     "c1",
+		TunnelName:   "web",
+		TunnelType:   "http",
+		MinuteStart:  now.Unix(),
+		IngressBytes: 1,
+	}})
+
+	if err := ts.Flush(); err == nil {
+		t.Fatal("Flush should reject persisted minute additive overflow")
+	} else if !strings.Contains(err.Error(), "ingress_bytes") {
+		t.Fatalf("minute add overflow error should name ingress_bytes, got %v", err)
+	}
+	var got int64
+	if err := ts.db.QueryRow(`SELECT ingress_bytes FROM traffic_buckets WHERE client_id = ? AND tunnel_name = ?`, "c1", "web").Scan(&got); err != nil {
+		t.Fatalf("failed to read persisted minute bucket: %v", err)
+	}
+	if uint64(got) != maxSQLiteInt64 {
+		t.Fatalf("failed overflow flush should not corrupt persisted value, got %d", got)
+	}
+}
+
+func TestTrafficStore_FlushRejectsExistingHourAddOverflow(t *testing.T) {
+	ts, cleanup := newTestTrafficStore(t)
+	defer cleanup()
+
+	now := time.Now().UTC()
+	completedHour := hourFloorUTC(now.Add(-2 * time.Hour))
+	mustInsertTrafficBucket(t, ts, TrafficBucket{
+		ClientID:     "c1",
+		TunnelName:   "web",
+		TunnelType:   "http",
+		Resolution:   TrafficResolutionHour,
+		BucketStart:  completedHour.Unix(),
+		IngressBytes: maxSQLiteInt64,
+	})
+	ts.ApplyDeltas([]TrafficDelta{{
+		ClientID:     "c1",
+		TunnelName:   "web",
+		TunnelType:   "http",
+		MinuteStart:  completedHour.Add(time.Minute).Unix(),
+		IngressBytes: 1,
+	}})
+
+	if err := ts.Flush(); err == nil {
+		t.Fatal("Flush should reject existing hour additive overflow")
+	} else if !strings.Contains(err.Error(), "ingress_bytes") {
+		t.Fatalf("hour add overflow error should name ingress_bytes, got %v", err)
+	}
+	var minuteRows int
+	if err := ts.db.QueryRow(`SELECT COUNT(*) FROM traffic_buckets WHERE resolution = ?`, string(TrafficResolutionMinute)).Scan(&minuteRows); err != nil {
+		t.Fatalf("failed to count minute rows: %v", err)
+	}
+	if minuteRows != 0 {
+		t.Fatalf("failed overflow transaction should not persist minute rows, got %d", minuteRows)
+	}
+}
+
 func TestTrafficStore_TunnelFilter(t *testing.T) {
 	ts, cleanup := newTestTrafficStore(t)
 	defer cleanup()
@@ -309,6 +423,43 @@ func TestTrafficStore_RollupAndHourQuery(t *testing.T) {
 	}
 	if series.Points[0].EgressBytes != 30 {
 		t.Errorf("hour egress expected 30, got %d", series.Points[0].EgressBytes)
+	}
+}
+
+func TestTrafficStore_CompactRejectsRollupOverflow(t *testing.T) {
+	ts, cleanup := newTestTrafficStore(t)
+	defer cleanup()
+
+	now := time.Now().UTC()
+	completedHour := hourFloorUTC(now.Add(-2 * time.Hour))
+	mustInsertTrafficBucket(t, ts, TrafficBucket{
+		ClientID:     "c1",
+		TunnelName:   "web",
+		TunnelType:   "http",
+		Resolution:   TrafficResolutionMinute,
+		BucketStart:  completedHour.Add(time.Minute).Unix(),
+		IngressBytes: maxSQLiteInt64,
+	})
+	mustInsertTrafficBucket(t, ts, TrafficBucket{
+		ClientID:     "c1",
+		TunnelName:   "web",
+		TunnelType:   "http",
+		Resolution:   TrafficResolutionMinute,
+		BucketStart:  completedHour.Add(2 * time.Minute).Unix(),
+		IngressBytes: 1,
+	})
+
+	if err := ts.Compact(now); err == nil {
+		t.Fatal("Compact should reject rollup overflow")
+	} else if !strings.Contains(err.Error(), "ingress_bytes") {
+		t.Fatalf("rollup overflow error should name ingress_bytes, got %v", err)
+	}
+	var hourRows int
+	if err := ts.db.QueryRow(`SELECT COUNT(*) FROM traffic_buckets WHERE resolution = ?`, string(TrafficResolutionHour)).Scan(&hourRows); err != nil {
+		t.Fatalf("failed to count hour rows: %v", err)
+	}
+	if hourRows != 0 {
+		t.Fatalf("failed rollup should not persist hour rows, got %d", hourRows)
 	}
 }
 
@@ -625,6 +776,24 @@ func TestTrafficStore_HourQueryIncludesCurrentHourFromMinuteBuckets(t *testing.T
 	}
 	if !series.Points[1].BucketStart.Equal(currentHour) || series.Points[1].IngressBytes != 20 {
 		t.Fatalf("Current hour fold error: %+v", series.Points[1])
+	}
+}
+
+func TestTrafficStore_HourQueryRejectsFoldOverflow(t *testing.T) {
+	ts, cleanup := newTestTrafficStore(t)
+	defer cleanup()
+
+	now := time.Now().UTC()
+	currentHour := hourFloorUTC(now)
+	ts.ApplyDeltas([]TrafficDelta{
+		{ClientID: "c1", TunnelName: "web", TunnelType: "http", MinuteStart: currentHour.Add(time.Minute).Unix(), IngressBytes: ^uint64(0)},
+		{ClientID: "c1", TunnelName: "web", TunnelType: "http", MinuteStart: currentHour.Add(2 * time.Minute).Unix(), IngressBytes: 1},
+	})
+
+	if _, err := ts.QueryWithResolution("c1", "web", currentHour, currentHour.Add(time.Hour), TrafficResolutionHour); err == nil {
+		t.Fatal("hour QueryWithResolution should reject folded minute overflow")
+	} else if !strings.Contains(err.Error(), "ingress_bytes") {
+		t.Fatalf("fold overflow error should name ingress_bytes, got %v", err)
 	}
 }
 
