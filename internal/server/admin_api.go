@@ -275,7 +275,11 @@ func (s *Server) handleAPIAdminConfig(w http.ResponseWriter, r *http.Request) {
 
 	switch r.Method {
 	case http.MethodGet:
-		config := s.auth.adminStore.GetServerConfig()
+		config, err := s.auth.adminStore.GetServerConfigE()
+		if err != nil {
+			http.Error(w, `{"error":"failed to load config"}`, http.StatusInternalServerError)
+			return
+		}
 		if config.AllowedPorts == nil {
 			config.AllowedPorts = []PortRange{}
 		}
@@ -293,7 +297,11 @@ func (s *Server) handleAPIAdminConfig(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		current := s.auth.adminStore.GetServerConfig()
+		current, err := s.auth.adminStore.GetServerConfigE()
+		if err != nil {
+			http.Error(w, `{"error":"failed to load config"}`, http.StatusInternalServerError)
+			return
+		}
 
 		normalizedServerAddr, err := normalizeServerAddrForConfigUpdate(config.ServerAddr, current.ServerAddr)
 		if err != nil {
@@ -322,8 +330,16 @@ func (s *Server) handleAPIAdminConfig(w http.ResponseWriter, r *http.Request) {
 			currentServerAddr = normalizedCurrent
 		}
 		// check affected tunnels (when new allowlist is non-empty)
-		affected := s.findTunnelsAffectedByPortChange(config.AllowedPorts)
-		conflicts := conflictingHTTPDomainsForServerAddr(config.ServerAddr, s)
+		affected, err := s.findTunnelsAffectedByPortChange(config.AllowedPorts)
+		if err != nil {
+			http.Error(w, `{"error":"failed to check affected tunnels"}`, http.StatusInternalServerError)
+			return
+		}
+		conflicts, err := conflictingHTTPDomainsForServerAddr(config.ServerAddr, s)
+		if err != nil {
+			http.Error(w, `{"error":"failed to check domain conflicts"}`, http.StatusInternalServerError)
+			return
+		}
 
 		// dry_run mode: preview affected tunnels without saving
 		if r.URL.Query().Get("dry_run") == "true" {
