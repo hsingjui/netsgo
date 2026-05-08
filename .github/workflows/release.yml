@@ -83,6 +83,28 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+  mirror-source-to-cnb:
+    runs-on: ubuntu-latest
+    needs:
+      - verify
+    env:
+      CNB_REPO_URL: ${{ secrets.CNB_REPO_URL }}
+      CNB_USERNAME: ${{ secrets.CNB_USERNAME }}
+      CNB_PASSWORD: ${{ secrets.CNB_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Mirror main branch to CNB
+        if: ${{ env.CNB_REPO_URL != '' && env.CNB_USERNAME != '' && env.CNB_PASSWORD != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          auth="$(printf '%s:%s' "$CNB_USERNAME" "$CNB_PASSWORD" | base64 -w 0)"
+          git -c http.extraHeader="Authorization: Basic ${auth}" \
+            push --force "$CNB_REPO_URL" refs/remotes/origin/main:refs/heads/main
+
   docker:
     runs-on: ubuntu-latest
     permissions:
@@ -94,6 +116,9 @@ jobs:
     env:
       DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
       DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+      CNB_REPO_URL: ${{ secrets.CNB_REPO_URL }}
+      CNB_USERNAME: ${{ secrets.CNB_USERNAME }}
+      CNB_PASSWORD: ${{ secrets.CNB_PASSWORD }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
@@ -114,10 +139,23 @@ jobs:
         with:
           username: ${{ env.DOCKERHUB_USERNAME }}
           password: ${{ env.DOCKERHUB_TOKEN }}
+      - uses: docker/login-action@v3
+        if: ${{ env.CNB_REPO_URL != '' && env.CNB_USERNAME != '' && env.CNB_PASSWORD != '' }}
+        with:
+          registry: docker.cnb.cool
+          username: ${{ env.CNB_USERNAME }}
+          password: ${{ env.CNB_PASSWORD }}
       - id: release-vars
         run: |
           echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
           echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+      - id: cnb-vars
+        if: ${{ env.CNB_REPO_URL != '' && env.CNB_USERNAME != '' && env.CNB_PASSWORD != '' }}
+        run: |
+          repo_url="${CNB_REPO_URL%.git}"
+          slug="${repo_url#https://cnb.cool/}"
+          slug="${slug,,}"
+          echo "image=docker.cnb.cool/${slug}" >> "$GITHUB_OUTPUT"
       - id: meta-ghcr
         uses: docker/metadata-action@v5
         with:
@@ -137,6 +175,16 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
             type=sha,format=short
             type=raw,value=latest,enable=${{ !contains(github.ref_name, '-') }}
+      - id: meta-cnb
+        if: ${{ steps.cnb-vars.outputs.image != '' }}
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.cnb-vars.outputs.image }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,format=short
+            type=raw,value=latest,enable=${{ !contains(github.ref_name, '-') }}
       - uses: docker/build-push-action@v6
         with:
           context: .
@@ -146,6 +194,7 @@ jobs:
           tags: |
             ${{ steps.meta-ghcr.outputs.tags }}
             ${{ steps.meta-dockerhub.outputs.tags }}
+            ${{ steps.meta-cnb.outputs.tags }}
           labels: ${{ steps.meta-ghcr.outputs.labels }}
           build-args: |
             NETSGO_VERSION=${{ steps.release-vars.outputs.version }}
