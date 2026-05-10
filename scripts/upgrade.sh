@@ -3,7 +3,7 @@
 set -eu
 
 # BEGIN NETSGO COMMON UPDATE HELPERS
-NETSGO_LATEST_CNB="https://cnb.cool/zsio/netsgo/-/raw/release-index/updates/index-v1/latest.json"
+NETSGO_LATEST_CNB="https://cnb.cool/zsio/netsgo/-/git/raw/release-index/updates/index-v1/latest.json"
 NETSGO_LATEST_GITHUB="https://raw.githubusercontent.com/zsio/netsgo/release-index/updates/index-v1/latest.json"
 
 # Release public keys are derived from the private release signing key stored in
@@ -67,7 +67,7 @@ release_detail_url() {
   provider="$1"
   tag="$2"
   case "$provider" in
-    cnb) printf 'https://cnb.cool/zsio/netsgo/-/raw/release-index/updates/index-v1/releases/%s.json\n' "$tag" ;;
+    cnb) printf 'https://cnb.cool/zsio/netsgo/-/git/raw/release-index/updates/index-v1/releases/%s.json\n' "$tag" ;;
     github) printf 'https://raw.githubusercontent.com/zsio/netsgo/release-index/updates/index-v1/releases/%s.json\n' "$tag" ;;
     *) return 1 ;;
   esac
@@ -160,7 +160,7 @@ official_url_allowed() {
     https://github.com/zsio/netsgo/releases/download/*) return 0 ;;
     https://raw.githubusercontent.com/zsio/netsgo/release-index/*) return 0 ;;
     https://cnb.cool/zsio/netsgo/-/releases/download/*) return 0 ;;
-    https://cnb.cool/zsio/netsgo/-/raw/release-index/*) return 0 ;;
+    https://cnb.cool/zsio/netsgo/-/git/raw/release-index/*) return 0 ;;
     *) return 1 ;;
   esac
 }

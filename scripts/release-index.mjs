@@ -64,7 +64,7 @@ function githubReleaseDetailURL(repo, tag) {
 
 function cnbReleaseDetailURL(repoSlug, tag) {
   const encodedRepo = repoSlug.split('/').map(encodeURIComponent).join('/');
-  return `https://cnb.cool/${encodedRepo}/-/raw/release-index/updates/index-v1/releases/${encodeURIComponent(tag)}.json`;
+  return `https://cnb.cool/${encodedRepo}/-/git/raw/release-index/updates/index-v1/releases/${encodeURIComponent(tag)}.json`;
 }
 
 function parseUploadedAssetSet(value) {

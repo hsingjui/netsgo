@@ -253,7 +253,7 @@ GET /api/clients/{id}/version/check?force=false
   "recommended_channel": "stable",
   "recommended_action": "run_script",
   "commands": {
-    "domestic": "curl -fsSL https://cnb.cool/zsio/netsgo/-/raw/main/scripts/upgrade.sh | sh -s -- --source cnb --channel stable -y",
+    "domestic": "curl -fsSL https://cnb.cool/zsio/netsgo/-/git/raw/main/scripts/upgrade.sh | sh -s -- --source cnb --channel stable -y",
     "global": "curl -fsSL https://raw.githubusercontent.com/zsio/netsgo/main/scripts/upgrade.sh | sh -s -- --source github --channel stable -y"
   },
   "release_url": "https://github.com/zsio/netsgo/releases",
@@ -451,7 +451,7 @@ Web 只展示 upgrade 命令，不展示 install 命令。
 国内源升级命令：
 
 ```sh
-curl -fsSL https://cnb.cool/zsio/netsgo/-/raw/main/scripts/upgrade.sh | sh -s -- --source cnb --channel stable -y
+curl -fsSL https://cnb.cool/zsio/netsgo/-/git/raw/main/scripts/upgrade.sh | sh -s -- --source cnb --channel stable -y
 ```
 
 国外源升级命令：
@@ -471,7 +471,7 @@ curl -fsSL https://raw.githubusercontent.com/zsio/netsgo/main/scripts/upgrade.sh
 国内源首次安装：
 
 ```sh
-curl -fsSL https://cnb.cool/zsio/netsgo/-/raw/main/scripts/install.sh | sh -s -- --source cnb
+curl -fsSL https://cnb.cool/zsio/netsgo/-/git/raw/main/scripts/install.sh | sh -s -- --source cnb
 ```
 
 国外源首次安装：
@@ -483,7 +483,7 @@ curl -fsSL https://raw.githubusercontent.com/zsio/netsgo/main/scripts/install.sh
 安装 beta：
 
 ```sh
-curl -fsSL https://cnb.cool/zsio/netsgo/-/raw/main/scripts/install.sh | sh -s -- --source cnb --channel beta
+curl -fsSL https://cnb.cool/zsio/netsgo/-/git/raw/main/scripts/install.sh | sh -s -- --source cnb --channel beta
 ```
 
 ## install.sh
@@ -648,7 +648,7 @@ updates/index-v1/releases/<tag>.json
 国内源 latest：
 
 ```text
-https://cnb.cool/zsio/netsgo/-/raw/release-index/updates/index-v1/latest.json
+https://cnb.cool/zsio/netsgo/-/git/raw/release-index/updates/index-v1/latest.json
 ```
 
 国外源 latest：
@@ -670,7 +670,7 @@ https://raw.githubusercontent.com/zsio/netsgo/release-index/updates/index-v1/lat
       "release_urls": [
         {
           "provider": "cnb",
-          "url": "https://cnb.cool/zsio/netsgo/-/raw/release-index/updates/index-v1/releases/v0.1.0.json"
+          "url": "https://cnb.cool/zsio/netsgo/-/git/raw/release-index/updates/index-v1/releases/v0.1.0.json"
         },
         {
           "provider": "github",
@@ -683,7 +683,7 @@ https://raw.githubusercontent.com/zsio/netsgo/release-index/updates/index-v1/lat
       "release_urls": [
         {
           "provider": "cnb",
-          "url": "https://cnb.cool/zsio/netsgo/-/raw/release-index/updates/index-v1/releases/v0.1.0-beta.1.json"
+          "url": "https://cnb.cool/zsio/netsgo/-/git/raw/release-index/updates/index-v1/releases/v0.1.0-beta.1.json"
         },
         {
           "provider": "github",
@@ -900,8 +900,8 @@ https://github.com/zsio/netsgo/releases/download/
 https://raw.githubusercontent.com/zsio/netsgo/release-index/
 https://raw.githubusercontent.com/zsio/netsgo/main/scripts/common-update.sh
 https://cnb.cool/zsio/netsgo/-/releases/download/
-https://cnb.cool/zsio/netsgo/-/raw/release-index/
-https://cnb.cool/zsio/netsgo/-/raw/main/scripts/common-update.sh
+https://cnb.cool/zsio/netsgo/-/git/raw/release-index/
+https://cnb.cool/zsio/netsgo/-/git/raw/main/scripts/common-update.sh
 ```
 
 不得允许 HTTP、localhost、内网地址、metadata 地址或任意第三方域名。

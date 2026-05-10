@@ -60,7 +60,7 @@ done
 [ -n "$out" ] || exit 2
 printf '%s\n' "$url" >> "${NETSGO_FAKE_CURL_LOG:?}"
 case "$url" in
-  https://cnb.cool/zsio/netsgo/-/raw/release-index/updates/index-v1/latest.json)
+  https://cnb.cool/zsio/netsgo/-/git/raw/release-index/updates/index-v1/latest.json)
     [ "${NETSGO_FAKE_CNB_INDEX_FAIL:-0}" = "1" ] && exit 1
     if [ "${NETSGO_FAKE_STABLE_HIGHER:-0}" = "1" ]; then
       stable_latest="v0.1.1"
@@ -99,7 +99,7 @@ JSON
 }
 JSON
     ;;
-  https://cnb.cool/zsio/netsgo/-/raw/release-index/updates/index-v1/releases/v0.1.0.json)
+  https://cnb.cool/zsio/netsgo/-/git/raw/release-index/updates/index-v1/releases/v0.1.0.json)
     [ "${NETSGO_FAKE_CNB_DETAIL_FAIL:-0}" = "1" ] && exit 1
     cat > "$out" <<'JSON'
 {

@@ -11,7 +11,7 @@ import (
 )
 
 const (
-	LatestIndexURLCNB    = "https://cnb.cool/zsio/netsgo/-/raw/release-index/updates/index-v1/latest.json"
+	LatestIndexURLCNB    = "https://cnb.cool/zsio/netsgo/-/git/raw/release-index/updates/index-v1/latest.json"
 	LatestIndexURLGitHub = "https://raw.githubusercontent.com/zsio/netsgo/release-index/updates/index-v1/latest.json"
 	ReleaseURL           = "https://github.com/zsio/netsgo/releases"
 )
