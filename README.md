@@ -15,7 +15,7 @@
 <p align="center">
   <a href="https://github.com/zsio/netsgo/actions/workflows/ci.yml"><img src="https://github.com/zsio/netsgo/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="https://github.com/zsio/netsgo/releases"><img src="https://img.shields.io/github/v/release/zsio/netsgo?include_prereleases&label=release" alt="Release"></a>
-  <a href="https://github.com/zsio/netsgo/pkgs/container/netsgo"><img src="https://img.shields.io/badge/docker-ghcr.io%2Fzsio%2Fnetsgo-blue?logo=docker" alt="Docker"></a>
+  <a href="https://hub.docker.com/r/zsio/netsgo"><img src="https://img.shields.io/badge/docker-zsio%2Fnetsgo-blue?logo=docker" alt="Docker"></a>
 </p>
 
 <p align="center">
