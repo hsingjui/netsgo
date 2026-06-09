@@ -30,8 +30,8 @@ function maybeCredentialDescriptors(value: unknown): PublicKeyCredentialDescript
 }
 
 export function normalizeCreationOptions(raw: unknown): PublicKeyCredentialCreationOptions {
-  const container = raw as { response?: Record<string, unknown> };
-  const options = (container.response ?? raw) as Record<string, unknown>;
+  const container = raw as { publicKey?: Record<string, unknown>; response?: Record<string, unknown> };
+  const options = (container.publicKey ?? container.response ?? raw) as Record<string, unknown>;
   const user = options.user as Record<string, unknown>;
   return {
     ...options,
@@ -45,8 +45,8 @@ export function normalizeCreationOptions(raw: unknown): PublicKeyCredentialCreat
 }
 
 export function normalizeRequestOptions(raw: unknown): PublicKeyCredentialRequestOptions {
-  const container = raw as { response?: Record<string, unknown> };
-  const options = (container.response ?? raw) as Record<string, unknown>;
+  const container = raw as { publicKey?: Record<string, unknown>; response?: Record<string, unknown> };
+  const options = (container.publicKey ?? container.response ?? raw) as Record<string, unknown>;
   return {
     ...options,
     challenge: base64UrlToArrayBuffer(options.challenge as string),
