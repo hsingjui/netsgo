@@ -5,7 +5,6 @@ import {
   CheckCircle2,
   Fingerprint,
   KeyRound,
-  LockKeyhole,
   Pencil,
   Plus,
   RotateCcw,
@@ -36,7 +35,6 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog';
 import { Input } from '@/components/ui/input';
-import { Separator } from '@/components/ui/separator';
 import { Skeleton } from '@/components/ui/skeleton';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { cn } from '@/lib/utils';
@@ -410,39 +408,29 @@ function AccountPasswordSection({
   onEditUsername,
   onEditPassword,
 }: {
-  currentUser: { username: string; role: string };
+  currentUser: { username: string };
   onEditUsername: () => void;
   onEditPassword: () => void;
 }) {
   const { t } = useTranslation();
 
   return (
-    <SecurityPanel
-      icon={UserRound}
-      title={t('admin.accountPasswordTab')}
-      description={t('admin.accountPasswordDescription')}
-      badge={<Badge variant="secondary">{currentUser.role}</Badge>}
-    >
-      <div className="overflow-hidden rounded-lg border border-border/50 bg-background/70">
-        <SettingRow
-          icon={UserRound}
-          title={t('admin.currentAdmin')}
-          description={t('admin.accountProfileDescription')}
-          value={currentUser.username}
-          actionLabel={t('admin.updateUsername')}
-          onAction={onEditUsername}
-        />
-        <Separator />
-        <SettingRow
-          icon={LockKeyhole}
-          title={t('admin.updatePassword')}
-          description={t('admin.passwordSecurityDescription')}
-          value={t('admin.passwordConfigured')}
-          actionLabel={t('admin.updatePassword')}
-          onAction={onEditPassword}
-        />
-      </div>
-    </SecurityPanel>
+    <SettingsList>
+      <SettingRow
+        title={t('admin.currentAdmin')}
+        description={t('admin.accountProfileDescription')}
+        value={currentUser.username}
+        actionLabel={t('admin.updateUsername')}
+        onAction={onEditUsername}
+      />
+      <SettingRow
+        title={t('admin.passwordSecurity')}
+        description={t('admin.passwordSecurityDescription')}
+        value={t('admin.passwordConfigured')}
+        actionLabel={t('admin.updatePassword')}
+        onAction={onEditPassword}
+      />
+    </SettingsList>
   );
 }
 
@@ -462,54 +450,34 @@ function TOTPSection({
   const { t } = useTranslation();
 
   return (
-    <SecurityPanel
-      icon={ShieldCheck}
-      title={t('admin.twoFactorAuth')}
-      description={t('admin.totpPanelDescription')}
-      badge={(
-        <Badge variant={enabled ? 'default' : 'secondary'}>
-          {enabled ? t('common.enabled') : t('common.disabled')}
-        </Badge>
-      )}
-    >
-      <FactorStatusRow
-        enabled={enabled}
+    <SettingsList>
+      <SettingRow
         title={enabled ? t('admin.totpEnabled') : t('admin.totpDisabled')}
         description={
           enabled
             ? t('admin.totpEnabledDescription', { count: recoveryCodesRemaining })
             : t('admin.totpDisabledDescription')
         }
+        value={(
+          <Badge variant={enabled ? 'default' : 'secondary'}>
+            {enabled ? t('common.enabled') : t('common.disabled')}
+          </Badge>
+        )}
+        actionLabel={enabled ? t('admin.disableTOTP') : t('admin.enableTOTP')}
+        actionVariant={enabled ? 'destructive' : 'default'}
+        onAction={enabled ? onDisableRequest : onEnableRequest}
       />
 
-      {!enabled ? (
-        <div className="flex justify-end">
-          <Button type="button" onClick={onEnableRequest}>
-            <Plus data-icon="inline-start" />
-            {t('admin.enableTOTP')}
-          </Button>
-        </div>
-      ) : (
-        <div className="flex flex-col gap-2 sm:flex-row sm:justify-end">
-          <Button
-            type="button"
-            variant="outline"
-            onClick={onRegenerateRequest}
-          >
-            <RotateCcw data-icon="inline-start" />
-            {t('admin.regenerateRecoveryCodes')}
-          </Button>
-          <Button
-            type="button"
-            variant="destructive"
-            onClick={onDisableRequest}
-          >
-            <X data-icon="inline-start" />
-            {t('admin.disableTOTP')}
-          </Button>
-        </div>
-      )}
-    </SecurityPanel>
+      {enabled ? (
+        <SettingRow
+          title={t('admin.recoveryCodes')}
+          description={t('admin.recoveryCodesManageDescription')}
+          value={t('admin.recoveryCodesRemaining', { count: recoveryCodesRemaining })}
+          actionLabel={t('admin.regenerateRecoveryCodes')}
+          onAction={onRegenerateRequest}
+        />
+      ) : null}
+    </SettingsList>
   );
 }
 
@@ -529,120 +497,91 @@ function PasskeySection({
   const { t } = useTranslation();
 
   return (
-    <SecurityPanel
-      icon={Fingerprint}
-      title={t('admin.passkeys')}
-      description={t('admin.passkeyPanelDescription')}
-      badge={<Badge variant="secondary">{passkeys.length}</Badge>}
-    >
-      {!passkeySupported ? (
-        <FactorStatusRow enabled={false} title={t('admin.passkeyUnavailableTitle')} description={t('admin.passkeyUnsupported')} />
-      ) : null}
-
-      <div className="overflow-hidden rounded-lg border border-border/50 bg-background/70">
-        <div className="grid gap-4 p-4 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center">
-          <SectionTaskHeader icon={Plus} title={t('admin.addPasskey')} description={t('admin.passkeyAddDescription')} />
-          <Button
-            type="button"
-            disabled={!passkeySupported}
-            onClick={onAddRequest}
-          >
-            <Plus data-icon="inline-start" />
-            {t('admin.addPasskey')}
-          </Button>
-        </div>
-      </div>
-
-      <PasskeyList
-        passkeys={passkeys}
-        onRename={onRename}
-        onDelete={onDelete}
+    <SettingsList>
+      <SettingRow
+        title={t('admin.addPasskey')}
+        description={passkeySupported ? t('admin.passkeyAddDescription') : t('admin.passkeyUnsupported')}
+        value={!passkeySupported ? <Badge variant="secondary">{t('common.disabled')}</Badge> : undefined}
+        actionLabel={t('admin.addPasskey')}
+        actionDisabled={!passkeySupported}
+        onAction={onAddRequest}
       />
-    </SecurityPanel>
+
+      {passkeys.length === 0 ? (
+        <SettingRow
+          title={t('admin.noPasskeys')}
+          description={t('admin.noPasskeysDescription')}
+        />
+      ) : (
+        passkeys.map((passkey) => (
+          <SettingRow
+            key={passkey.id}
+            title={passkey.name}
+            description={t('admin.passkeyCredentialDescription')}
+            actions={(
+              <>
+                <Button type="button" variant="ghost" size="icon-sm" onClick={() => onRename(passkey)} title={t('common.edit')} aria-label={t('common.edit')}>
+                  <Pencil />
+                </Button>
+                <Button type="button" variant="ghost" size="icon-sm" onClick={() => onDelete(passkey)} title={t('common.delete')} aria-label={t('common.delete')}>
+                  <Trash2 />
+                </Button>
+              </>
+            )}
+          />
+        ))
+      )}
+    </SettingsList>
   );
 }
 
 function SettingRow({
-  icon: Icon,
   title,
   description,
   value,
   actionLabel,
+  actionVariant = 'outline',
+  actionDisabled = false,
   onAction,
+  actions,
 }: {
-  icon: React.ComponentType<React.SVGProps<SVGSVGElement>>;
   title: string;
   description: string;
-  value: string;
-  actionLabel: string;
-  onAction: () => void;
+  value?: React.ReactNode;
+  actionLabel?: string;
+  actionVariant?: React.ComponentProps<typeof Button>['variant'];
+  actionDisabled?: boolean;
+  onAction?: () => void;
+  actions?: React.ReactNode;
 }) {
   return (
-    <div className="grid gap-4 p-4 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center">
-      <div className="flex min-w-0 items-start gap-3">
-        <div className="flex size-8 shrink-0 items-center justify-center rounded-lg bg-muted/45 text-muted-foreground">
-          <Icon />
-        </div>
-        <div className="min-w-0">
-          <p className="font-semibold">{title}</p>
-          <p className="mt-1 text-sm text-muted-foreground">{description}</p>
-        </div>
+    <div className="grid gap-4 px-4 py-4 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center sm:px-5">
+      <div className="min-w-0">
+        <p className="font-medium text-foreground">{title}</p>
+        <p className="mt-1 max-w-2xl text-sm text-muted-foreground">{description}</p>
       </div>
       <div className="flex min-w-0 items-center gap-3 sm:justify-end">
-        <span className="min-w-0 truncate rounded-md bg-muted px-2 py-1 text-xs font-medium text-muted-foreground">
-          {value}
-        </span>
-        <Button type="button" variant="outline" onClick={onAction}>
-          {actionLabel}
-        </Button>
+        {value ? (
+          <span className="min-w-0 truncate text-sm font-medium text-muted-foreground">
+            {value}
+          </span>
+        ) : null}
+        {actions}
+        {actionLabel && onAction ? (
+          <Button type="button" variant={actionVariant} disabled={actionDisabled} onClick={onAction}>
+            {actionLabel}
+          </Button>
+        ) : null}
       </div>
     </div>
   );
 }
 
-function SectionTaskHeader({ icon: Icon, title, description }: {
-  icon: React.ComponentType<React.SVGProps<SVGSVGElement>>;
-  title: string;
-  description: string;
-}) {
+function SettingsList({ children }: { children: React.ReactNode }) {
   return (
-    <div className="flex items-start gap-3">
-      <div className="flex size-8 shrink-0 items-center justify-center rounded-lg bg-muted/50 text-muted-foreground">
-        <Icon />
-      </div>
-      <div>
-        <h4 className="text-sm font-semibold">{title}</h4>
-        <p className="mt-1 text-xs text-muted-foreground">{description}</p>
-      </div>
+    <div className="overflow-hidden rounded-xl border border-border/50 bg-background/90 divide-y divide-border/50">
+      {children}
     </div>
-  );
-}
-
-function SecurityPanel({ icon: Icon, title, description, badge, children }: {
-  icon: React.ComponentType<React.SVGProps<SVGSVGElement>>;
-  title: string;
-  description: string;
-  badge?: React.ReactNode;
-  children: React.ReactNode;
-}) {
-  return (
-    <section className="overflow-hidden rounded-xl border border-border/50 bg-background/85 shadow-sm">
-      <div className="flex items-start justify-between gap-4 border-b border-border/40 bg-background p-5">
-        <div className="flex min-w-0 items-start gap-3">
-          <div className="flex size-9 shrink-0 items-center justify-center rounded-lg border border-border/50 bg-muted/30 text-primary shadow-sm">
-            <Icon />
-          </div>
-          <div className="min-w-0">
-            <h3 className="font-semibold text-foreground">{title}</h3>
-            <p className="mt-1 text-sm text-muted-foreground">{description}</p>
-          </div>
-        </div>
-        {badge}
-      </div>
-      <div className="flex flex-col gap-5 p-5">
-        {children}
-      </div>
-    </section>
   );
 }
 
@@ -964,50 +903,6 @@ function TOTPActionDialog({
         </form>
       </DialogContent>
     </Dialog>
-  );
-}
-
-function PasskeyList({ passkeys, onRename, onDelete }: {
-  passkeys: PasskeySummary[];
-  onRename: (passkey: PasskeySummary) => void;
-  onDelete: (passkey: PasskeySummary) => void;
-}) {
-  const { t } = useTranslation();
-
-  if (passkeys.length === 0) {
-    return (
-      <div className="rounded-lg border border-dashed border-border/70 bg-background/60 p-5 text-center">
-        <Fingerprint className="mx-auto text-muted-foreground" />
-        <p className="mt-3 text-sm font-medium">{t('admin.noPasskeys')}</p>
-        <p className="mt-1 text-sm text-muted-foreground">{t('admin.noPasskeysDescription')}</p>
-      </div>
-    );
-  }
-
-  return (
-    <div className="flex flex-col gap-2">
-      {passkeys.map((passkey) => (
-        <div key={passkey.id} className="rounded-lg border border-border/50 bg-background/70 p-4 transition-colors hover:bg-muted/20">
-          <div className="flex items-start justify-between gap-3">
-            <div className="min-w-0">
-              <div className="flex min-w-0 items-center gap-2">
-                <Fingerprint className="shrink-0 text-primary" />
-                <p className="truncate font-medium">{passkey.name}</p>
-              </div>
-              <p className="mt-1 text-xs text-muted-foreground">{t('admin.passkeyCredentialDescription')}</p>
-            </div>
-            <div className="flex shrink-0 items-center gap-1">
-              <Button type="button" variant="ghost" size="icon-sm" onClick={() => onRename(passkey)} title={t('common.edit')} aria-label={t('common.edit')}>
-                <Pencil />
-              </Button>
-              <Button type="button" variant="ghost" size="icon-sm" onClick={() => onDelete(passkey)} title={t('common.delete')} aria-label={t('common.delete')}>
-                <Trash2 />
-              </Button>
-            </div>
-          </div>
-        </div>
-      ))}
-    </div>
   );
 }
 
