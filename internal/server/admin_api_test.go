@@ -885,6 +885,7 @@ func TestAPI_UpdateClientBandwidthSettingsMutatesLiveRuntimeInPlace(t *testing.T
 	liveClient.proxyMu.RUnlock()
 	if tunnel == nil {
 		t.Fatal("live tunnel disappeared after client bandwidth update")
+		return
 	}
 	if tunnel.Config.DesiredState != protocol.ProxyDesiredStateRunning || tunnel.Config.RuntimeState != protocol.ProxyRuntimeStateExposed {
 		t.Fatalf("client bandwidth update should not alter tunnel state, got %s/%s", tunnel.Config.DesiredState, tunnel.Config.RuntimeState)
