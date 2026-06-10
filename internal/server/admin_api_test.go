@@ -920,6 +920,7 @@ func TestAPI_Login_SetsCookie(t *testing.T) {
 	}
 	if sessionCookie == nil {
 		t.Fatal("login response is missing the netsgo_session cookie")
+		return
 	}
 	if !sessionCookie.HttpOnly {
 		t.Error("session cookie should set HttpOnly")
@@ -970,6 +971,7 @@ func TestAPI_Logout_ClearsCookie(t *testing.T) {
 	}
 	if sessionCookie == nil {
 		t.Fatal("logout response is missing the Set-Cookie header that clears the netsgo_session cookie")
+		return
 	}
 	if sessionCookie.MaxAge != -1 {
 		t.Errorf("clearing cookie MaxAge should be -1, got %d", sessionCookie.MaxAge)
@@ -1001,6 +1003,7 @@ func TestAPI_Login_SetsSecureCookie_WhenRequestIsTLS(t *testing.T) {
 	}
 	if sessionCookie == nil {
 		t.Fatal("login response is missing the netsgo_session cookie")
+		return
 	}
 	if !sessionCookie.Secure {
 		t.Error("TLS requests should set a Secure cookie")
