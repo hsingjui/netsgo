@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"time"
 )
 
 type authSuccessPayload struct {
@@ -516,8 +517,8 @@ func (s *Server) handleAPIAdminSecurityPasskeyItem(w http.ResponseWriter, r *htt
 			MFACode         string `json:"mfa_code"`
 			Name            string `json:"name"`
 		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			writeAPIError(w, http.StatusBadRequest, "invalid_request_body", "invalid request body")
+		if err := decodeJSONRequestBody(r, &req); err != nil {
+			writeJSONRequestDecodeError(w, err)
 			return
 		}
 		if _, err := s.auth.adminStore.VerifyAdminSecurityCredentials(user.ID, req.CurrentPassword, req.MFACode); err != nil {
@@ -534,8 +535,8 @@ func (s *Server) handleAPIAdminSecurityPasskeyItem(w http.ResponseWriter, r *htt
 			CurrentPassword string `json:"current_password"`
 			MFACode         string `json:"mfa_code"`
 		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			writeAPIError(w, http.StatusBadRequest, "invalid_request_body", "invalid request body")
+		if err := decodeJSONRequestBody(r, &req); err != nil {
+			writeJSONRequestDecodeError(w, err)
 			return
 		}
 		if _, err := s.auth.adminStore.VerifyAdminSecurityCredentials(user.ID, req.CurrentPassword, req.MFACode); err != nil {
