@@ -6,13 +6,8 @@ import { renderToStaticMarkup } from 'react-dom/server';
 import { versionCheckQueryKey, type VersionCheckTarget } from '@/hooks/use-version-check';
 import type { VersionCheckResult } from '@/types';
 
-import {
-  CANONICAL_UPGRADE_COMMAND,
-  safeReleaseURL,
-  safeUpgradeCommand,
-  VersionUpdateContent,
-  VersionUpdateIndicator,
-} from './VersionUpdateIndicator';
+import { VersionUpdateContent, VersionUpdateIndicator } from './VersionUpdateIndicator';
+import { CANONICAL_UPGRADE_COMMAND, safeReleaseURL, safeUpgradeCommand } from './version-update-safety';
 import { manualVersionCheckToast } from './version-update-toast';
 import {
   safeReleaseUrl,
