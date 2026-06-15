@@ -5,8 +5,7 @@ set -eu
 ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 
 fail() {
-  printf 'FAIL: %s
-' "$*" >&2
+  printf 'FAIL: %s\n' "$*" >&2
   exit 1
 }
 
@@ -15,8 +14,7 @@ assert_contains() {
   needle="$2"
   case "$haystack" in
     *"$needle"*) ;;
-    *) fail "expected output to contain: $needle
-actual: $haystack" ;;
+    *) fail "expected output to contain: $needle; actual: $haystack" ;;
   esac
 }
 
@@ -80,5 +78,4 @@ mode="$(stat_mode_text_local "$default_root")"
 case "$mode" in ?????w*|????????w*) fail "default private cache root is writable by group/world: $mode" ;; esac
 case "$default_root" in "$safe_root/netsgo-update-cache") fail "default cache root is still predictable" ;; esac
 
-printf 'PASS: update helper cache hardening
-'
+printf 'PASS: update helper cache hardening\n'
