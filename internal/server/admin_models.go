@@ -11,6 +11,7 @@ type APIKey struct {
 	ID          string     `json:"id"`
 	Name        string     `json:"name"`
 	KeyHash     string     `json:"key_hash"` // for persistence only; must not be returned to the frontend
+	LookupDigest string    `json:"lookup_digest,omitempty"` // for candidate lookup only; must not be returned to the frontend
 	Permissions []string   `json:"permissions"`
 	CreatedAt   time.Time  `json:"created_at"`
 	ExpiresAt   *time.Time `json:"expires_at,omitempty"`
