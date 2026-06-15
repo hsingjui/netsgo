@@ -20,6 +20,10 @@ actual: $haystack" ;;
   esac
 }
 
+stat_mode_text_local() {
+  stat -c '%A' "$1" 2>/dev/null || stat -f '%Sp' "$1"
+}
+
 helpers_without_shebang() {
   # Keep the test process in control: load helper functions but not set -eu.
   sed '1,3d' "$ROOT/scripts/common-update.sh"
@@ -64,29 +68,17 @@ assert_contains "$output" "符号链接更新缓存路径"
 
 unset NETSGO_UPDATE_CACHE_DIR
 
-# Default cache roots must be per-run private directories, not a predictable /tmp/netsgo-update-cache tree.
-default_output="$(TMPDIR="$safe_root" run_helper '
-  first="$(cache_dir_for v1.2.3 linux_amd64)"
-  second="$(cache_dir_for v1.2.3 linux_arm64)"
-  printf "%s
-%s
-" "$first" "$second"
-')"
-first_line="$(printf '%s
-' "$default_output" | sed -n '1p')"
-second_line="$(printf '%s
-' "$default_output" | sed -n '2p')"
-case "$first_line" in
+# Default cache roots must be private mktemp directories, not a predictable /tmp/netsgo-update-cache tree.
+default_output="$(TMPDIR="$safe_root" run_helper 'cache_dir_for v1.2.3 linux_amd64')"
+case "$default_output" in
   "$safe_root"/netsgo-update-cache.*'/v1.2.3/linux_amd64') ;;
-  *) fail "default cache dir should use private mktemp root, got: $first_line" ;;
+  *) fail "default cache dir should use private mktemp root, got: $default_output" ;;
 esac
-first_root="${first_line%/v1.2.3/linux_amd64}"
-second_root="${second_line%/v1.2.3/linux_arm64}"
-[ "$first_root" = "$second_root" ] || fail "default cache root should be stable within a run"
-[ -d "$first_root" ] || fail "default private cache root missing"
-mode="$(stat_mode_text "$first_root")"
+default_root="${default_output%/v1.2.3/linux_amd64}"
+[ -d "$default_root" ] || fail "default private cache root missing"
+mode="$(stat_mode_text_local "$default_root")"
 case "$mode" in ?????w*|????????w*) fail "default private cache root is writable by group/world: $mode" ;; esac
-case "$first_root" in "$safe_root/netsgo-update-cache") fail "default cache root is still predictable" ;; esac
+case "$default_root" in "$safe_root/netsgo-update-cache") fail "default cache root is still predictable" ;; esac
 
 printf 'PASS: update helper cache hardening
 '

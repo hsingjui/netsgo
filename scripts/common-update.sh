@@ -428,7 +428,7 @@ cleanup_empty_cache_parents() {
   if [ -n "${NETSGO_UPDATE_CACHE_DIR:-}" ]; then
     root="$NETSGO_UPDATE_CACHE_DIR"
   else
-    root="$(default_cache_root)"
+    root="$(dirname "$(dirname "$cache_dir")")"
   fi
   parent="$(dirname "$cache_dir")"
   if [ "$parent" != "$root" ] && [ -d "$parent" ]; then

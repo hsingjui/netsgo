@@ -341,8 +341,6 @@ extract_netsgo() {
   chmod +x "$dest"
 }
 
-private_update_cache_root=""
-
 stat_owner_uid() {
   stat -c '%u' "$1" 2>/dev/null || stat -f '%u' "$1"
 }
@@ -355,17 +353,11 @@ reject_symlink_path() {
   [ ! -L "$1" ] || die "拒绝使用符号链接更新缓存路径: $1"
 }
 
-ensure_default_cache_root() {
-  if [ -z "$private_update_cache_root" ]; then
-    base="${TMPDIR:-/tmp}"
-    private_update_cache_root="$(mktemp -d "$base/netsgo-update-cache.XXXXXXXXXX")" || die "无法创建私有更新缓存目录"
-    chmod 700 "$private_update_cache_root" || die "无法保护私有更新缓存目录: $private_update_cache_root"
-  fi
-}
-
 default_cache_root() {
-  ensure_default_cache_root
-  printf '%s\n' "$private_update_cache_root"
+  base="${TMPDIR:-/tmp}"
+  root="$(mktemp -d "$base/netsgo-update-cache.XXXXXXXXXX")" || die "无法创建私有更新缓存目录"
+  chmod 700 "$root" || die "无法保护私有更新缓存目录: $root"
+  printf '%s\n' "$root"
 }
 
 validate_cache_root() {
@@ -413,8 +405,7 @@ cache_dir_for() {
     validate_cache_root "$NETSGO_UPDATE_CACHE_DIR"
     root="$NETSGO_UPDATE_CACHE_DIR"
   else
-    ensure_default_cache_root
-    root="$private_update_cache_root"
+    root="$(default_cache_root)"
   fi
   tag="$1"
   platform="$2"
@@ -438,8 +429,7 @@ cleanup_empty_cache_parents() {
   if [ -n "${NETSGO_UPDATE_CACHE_DIR:-}" ]; then
     root="$NETSGO_UPDATE_CACHE_DIR"
   else
-    ensure_default_cache_root
-    root="$private_update_cache_root"
+    root="$(dirname "$(dirname "$cache_dir")")"
   fi
   parent="$(dirname "$cache_dir")"
   if [ "$parent" != "$root" ] && [ -d "$parent" ]; then
