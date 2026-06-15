@@ -155,7 +155,7 @@ func validateEnvEntry(key, value string) error {
 		return fmt.Errorf("invalid env key: %q", key)
 	}
 	for _, r := range key {
-		if !(r == '_' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9') {
+		if r != '_' && (r < 'A' || r > 'Z') && (r < '0' || r > '9') {
 			return fmt.Errorf("invalid env key: %q", key)
 		}
 	}
