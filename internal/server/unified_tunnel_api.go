@@ -555,6 +555,14 @@ func decodeListenEndpointConfig(endpoint endpointSpecAPI, topology string) (ingr
 	}
 }
 
+func normalizeServerBindIP(bindIP string) string {
+	bindIP = strings.TrimSpace(bindIP)
+	if bindIP == "" {
+		return "0.0.0.0"
+	}
+	return bindIP
+}
+
 func decodeServiceEndpointConfig(endpoint endpointSpecAPI) (serviceConfigAPI, error) {
 	var cfg serviceConfigAPI
 	if err := decodeStrictEndpointConfig(endpoint.Config, &cfg); err != nil {
@@ -771,6 +779,7 @@ func (s *Server) storedTunnelFromUnifiedRequest(req tunnelCreateRequestAPI, exis
 			LocalIP:           targetConfig.Host,
 			LocalPort:         targetConfig.Port,
 			RemotePort:        ingressConfig.Port,
+			BindIP:            normalizeServerBindIP(ingressConfig.BindIP),
 			Domain:            ingressConfig.Domain,
 			BandwidthSettings: req.BandwidthSettings,
 		},
@@ -973,18 +982,18 @@ func (s *Server) preflightServerIngressResource(req tunnelCreateRequestAPI) erro
 			return newProxyRequestValidationError(fmt.Errorf("port %d is not in the allowed range", cfg.Port), "ingress.config.port", "", http.StatusBadRequest)
 		}
 	}
-	addr := fmt.Sprintf(":%d", cfg.Port)
+	addr := net.JoinHostPort(normalizeServerBindIP(cfg.BindIP), fmt.Sprintf("%d", cfg.Port))
 	if req.Ingress.Type == tunnelIngressTypeUDPListen {
 		conn, err := net.ListenPacket("udp", addr)
 		if err != nil {
-			return newProxyRequestValidationError(fmt.Errorf("server UDP ingress port %d is not available: %w", cfg.Port, err), "ingress.config.port", protocol.TunnelMutationErrorCodeIngressPortInUse, http.StatusConflict)
+			return newProxyRequestValidationError(fmt.Errorf("server UDP ingress %s is not available: %w", addr, err), "ingress.config.port", protocol.TunnelMutationErrorCodeIngressPortInUse, http.StatusConflict)
 		}
 		_ = conn.Close()
 		return nil
 	}
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
-		return newProxyRequestValidationError(fmt.Errorf("server TCP ingress port %d is not available: %w", cfg.Port, err), "ingress.config.port", protocol.TunnelMutationErrorCodeIngressPortInUse, http.StatusConflict)
+		return newProxyRequestValidationError(fmt.Errorf("server TCP ingress %s is not available: %w", addr, err), "ingress.config.port", protocol.TunnelMutationErrorCodeIngressPortInUse, http.StatusConflict)
 	}
 	_ = ln.Close()
 	return nil
@@ -1053,7 +1062,7 @@ func unifiedSpecFromProxyConfig(config protocol.ProxyConfig) tunnelSpecAPI {
 	switch config.Type {
 	case protocol.ProxyTypeUDP:
 		ingress.Type = tunnelIngressTypeUDPListen
-		ingress.Config = mustRawJSON(tcpListenConfigAPI{BindIP: "0.0.0.0", Port: config.RemotePort})
+		ingress.Config = mustRawJSON(tcpListenConfigAPI{BindIP: normalizeServerBindIP(config.BindIP), Port: config.RemotePort})
 		target.Type = tunnelTargetTypeUDPService
 		target.Config = mustRawJSON(serviceConfigAPI{IP: config.LocalIP, Port: config.LocalPort})
 	case protocol.ProxyTypeHTTP:
@@ -1063,7 +1072,7 @@ func unifiedSpecFromProxyConfig(config protocol.ProxyConfig) tunnelSpecAPI {
 		target.Config = mustRawJSON(serviceConfigAPI{IP: config.LocalIP, Port: config.LocalPort})
 	default:
 		ingress.Type = tunnelIngressTypeTCPListen
-		ingress.Config = mustRawJSON(tcpListenConfigAPI{BindIP: "0.0.0.0", Port: config.RemotePort})
+		ingress.Config = mustRawJSON(tcpListenConfigAPI{BindIP: normalizeServerBindIP(config.BindIP), Port: config.RemotePort})
 		target.Type = tunnelTargetTypeTCPService
 		target.Config = mustRawJSON(serviceConfigAPI{IP: config.LocalIP, Port: config.LocalPort})
 	}
