@@ -223,6 +223,66 @@ func TestAPI_MFAVerifyRateLimitsAfterTenInvalidCodes(t *testing.T) {
 	}
 }
 
+func TestAPI_MFAVerifyRateLimitSurvivesChallengeRotation(t *testing.T) {
+	s, cleanup := setupTestServerWithDB(t, true)
+	defer cleanup()
+	s.auth.mfaLimiter = newMFAAttemptLimiter(time.Minute, 10, 5*time.Minute)
+
+	user, err := s.auth.adminStore.ValidateAdminPassword("admin", "password123")
+	if err != nil {
+		t.Fatalf("ValidateAdminPassword failed: %v", err)
+	}
+	if _, err := s.auth.adminStore.db.Exec(`UPDATE admin_users SET totp_enabled = 1, totp_secret = ? WHERE id = ?`, "JBSWY3DPEHPK3PXP", user.ID); err != nil {
+		t.Fatalf("enable totp: %v", err)
+	}
+
+	loginFromIP := func() string {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodPost, "/api/auth/login", bytes.NewReader([]byte(`{"username":"admin","password":"password123"}`)))
+		req.RemoteAddr = "203.0.113.10:1000"
+		w := httptest.NewRecorder()
+		s.handleAPILogin(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("login should begin MFA challenge, got %d: %s", w.Code, w.Body.String())
+		}
+		var body struct {
+			MFAToken string `json:"mfa_token"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+			t.Fatalf("decode login body: %v", err)
+		}
+		if body.MFAToken == "" {
+			t.Fatal("mfa_token should be present")
+		}
+		return body.MFAToken
+	}
+
+	firstToken := loginFromIP()
+	for i := 1; i <= 10; i++ {
+		body := []byte(`{"mfa_token":"` + firstToken + `","code":"000000"}`)
+		req := httptest.NewRequest(http.MethodPost, "/api/auth/mfa/verify", bytes.NewReader(body))
+		req.RemoteAddr = "203.0.113.10:1000"
+		w := httptest.NewRecorder()
+		s.handleAPIMFAVerify(w, req)
+		if w.Code != http.StatusUnauthorized {
+			t.Fatalf("attempt %d: want 401, got %d body=%s", i, w.Code, w.Body.String())
+		}
+	}
+
+	secondToken := loginFromIP()
+	if secondToken == firstToken {
+		t.Fatal("rotated MFA challenge should issue a new token")
+	}
+	body := []byte(`{"mfa_token":"` + secondToken + `","code":"000000"}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/auth/mfa/verify", bytes.NewReader(body))
+	req.RemoteAddr = "203.0.113.10:1000"
+	w := httptest.NewRecorder()
+	s.handleAPIMFAVerify(w, req)
+	if w.Code != http.StatusTooManyRequests {
+		t.Fatalf("rotated challenge attempt: want 429, got %d body=%s", w.Code, w.Body.String())
+	}
+}
+
 func TestAPI_AdminSecurityResponse(t *testing.T) {
 	_, handler, token, cleanup := setupTestServerWithStores(t, true)
 	defer cleanup()

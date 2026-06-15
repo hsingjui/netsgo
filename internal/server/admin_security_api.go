@@ -60,7 +60,7 @@ func (s *Server) handleAPIMFAVerify(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusUnauthorized, "invalid_mfa_token", "invalid or expired mfa token")
 		return
 	}
-	limiterKey := s.mfaAttemptLimiterKey(r, challenge.ID)
+	limiterKey := s.mfaAttemptLimiterKey(r, challenge.UserID)
 	if s.auth.mfaLimiter != nil {
 		if allowed, retryAfter := s.auth.mfaLimiter.Allow(limiterKey, challenge.ExpiresAt); !allowed {
 			slog.Warn("MFA verification rate limited", "ip", s.clientIP(r), "module", "security")
@@ -99,12 +99,12 @@ func (s *Server) handleAPIMFAVerify(w http.ResponseWriter, r *http.Request) {
 	s.createAdminLoginSession(w, r, user)
 }
 
-func (s *Server) mfaAttemptLimiterKey(r *http.Request, challengeID string) string {
+func (s *Server) mfaAttemptLimiterKey(r *http.Request, userID string) string {
 	ip := s.clientIP(r)
 	if ip == "" {
 		ip = remoteIP(r.RemoteAddr)
 	}
-	return ip + ":" + challengeID
+	return ip + ":" + userID
 }
 
 func writeMFARateLimitResponse(w http.ResponseWriter, retryAfter time.Duration) {
