@@ -75,10 +75,6 @@ function buildTunnelSpec(data: {
   return buildTunnelSpecCreateRequest(data);
 }
 
-function encodePath(value: string) {
-  return encodeURIComponent(value);
-}
-
 export function useCreateTunnel() {
   const queryClient = useQueryClient();
 
