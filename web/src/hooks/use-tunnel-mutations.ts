@@ -75,14 +75,6 @@ function buildTunnelSpec(data: {
   return buildTunnelSpecCreateRequest(data);
 }
 
-function encodePath(value: string) {
-  return encodeURIComponent(value);
-}
-
-export function legacyClientTunnelPath(clientId: string, suffix = '') {
-  return `/api/clients/${encodePath(clientId)}/tunnels${suffix}`;
-}
-
 export function useCreateTunnel() {
   const queryClient = useQueryClient();
 
@@ -96,7 +88,7 @@ export function useCreateTunnel() {
         }
         try {
           return await api.post<{ success: boolean; message: string; remote_port: number }>(
-            legacyClientTunnelPath(data.clientId),
+            `/api/clients/${data.clientId}/tunnels`,
             {
               name: data.name,
               type: data.type,
@@ -123,7 +115,7 @@ export function useResumeTunnel() {
         if (!shouldUseLegacyTunnelEndpoint(error)) {
           throw error;
         }
-        return api.put(legacyClientTunnelPath(clientId, `/${encodePath(tunnelId)}/resume`));
+        return api.put(`/api/clients/${clientId}/tunnels/${encodeURIComponent(tunnelId)}/resume`);
       }),
     onSuccess: () => {
       invalidateTunnelQueries(queryClient);
@@ -140,7 +132,7 @@ export function useStopTunnel() {
         if (!shouldUseLegacyTunnelEndpoint(error)) {
           throw error;
         }
-        return api.put(legacyClientTunnelPath(clientId, `/${encodePath(tunnelId)}/stop`));
+        return api.put(`/api/clients/${clientId}/tunnels/${encodeURIComponent(tunnelId)}/stop`);
       }),
     onSuccess: () => {
       invalidateTunnelQueries(queryClient);
@@ -157,7 +149,7 @@ export function useDeleteTunnel() {
         if (!shouldUseLegacyTunnelEndpoint(error)) {
           throw error;
         }
-        return api.delete(legacyClientTunnelPath(clientId, `/${encodePath(tunnelId)}`));
+        return api.delete(`/api/clients/${clientId}/tunnels/${encodeURIComponent(tunnelId)}`);
       }),
     onSuccess: () => {
       invalidateTunnelQueries(queryClient);
@@ -180,7 +172,7 @@ export function useUpdateTunnel() {
           throw error;
         }
         try {
-          return await api.put(legacyClientTunnelPath(data.clientId, `/${encodePath(data.tunnelId)}`), {
+          return await api.put(`/api/clients/${data.clientId}/tunnels/${encodeURIComponent(data.tunnelId)}`, {
             name: data.name,
             ...buildTunnelMutationPayload(data),
           });

