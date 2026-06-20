@@ -3,6 +3,8 @@ package protocol
 const (
 	SOCKS5AuthTypeNone             = "none"
 	SOCKS5AuthTypeUsernamePassword = "username_password"
+	HTTPAuthTypeNone               = "none"
+	HTTPAuthTypeBasic              = "basic"
 
 	SOCKS5AddrTypeIPv4   = "ipv4"
 	SOCKS5AddrTypeDomain = "domain"
@@ -21,6 +23,16 @@ const (
 // accepted only on mutation input; persisted specs and provisioned specs carry
 // PasswordHash only.
 type SOCKS5AuthConfig struct {
+	Type         string `json:"type"`
+	Username     string `json:"username,omitempty"`
+	Password     string `json:"password,omitempty"`
+	PasswordHash string `json:"password_hash,omitempty"`
+}
+
+// HTTPAuthConfig is stored inside http_host endpoint config. Password is
+// accepted only on mutation input; persisted specs and provisioned specs carry
+// PasswordHash only.
+type HTTPAuthConfig struct {
 	Type         string `json:"type"`
 	Username     string `json:"username,omitempty"`
 	Password     string `json:"password,omitempty"`

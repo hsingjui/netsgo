@@ -319,8 +319,13 @@ func endpointSpecProtocolFromStored(endpoint EndpointSpec) protocol.EndpointSpec
 
 func endpointSpecProtocolFromStoredForRole(endpoint EndpointSpec, role string) protocol.EndpointSpec {
 	config := endpoint.Config
-	if role == protocol.DataStreamRoleTarget && endpoint.Type == protocol.IngressTypeSOCKS5Listen {
-		config = redactSOCKS5ListenConfig(endpoint.Config)
+	if role == protocol.DataStreamRoleTarget {
+		switch endpoint.Type {
+		case protocol.IngressTypeSOCKS5Listen:
+			config = redactSOCKS5ListenConfig(endpoint.Config)
+		case protocol.IngressTypeHTTPHost:
+			config = redactHTTPHostConfig(endpoint.Config)
+		}
 	}
 	return protocol.EndpointSpec{
 		Location: endpoint.Location,
@@ -346,6 +351,12 @@ func (s *Server) handleClientOpenedDataStream(openClient *ClientConn, openStream
 	if !ok {
 		log.Printf("⚠️ client relay target offline: %s", stored.Target.ClientID)
 		_ = s.updateStoredTunnelRuntime(stored, protocol.ProxyRuntimeStateOffline, "")
+		if stored.Ingress.Type == TunnelIngressTypeSOCKS5Listen {
+			_ = socks5wire.WriteDialResult(openStream, protocol.SOCKS5DialResult{
+				Status:  protocol.SOCKS5DialStatusNetworkUnreachable,
+				Message: "target client offline",
+			})
+		}
 		return
 	}
 
@@ -362,6 +373,12 @@ func (s *Server) handleClientOpenedDataStream(openClient *ClientConn, openStream
 			ObservedAt: time.Now().UTC(),
 		})
 		_ = s.updateStoredTunnelRuntime(stored, protocol.ProxyRuntimeStateError, err.Error())
+		if stored.Ingress.Type == TunnelIngressTypeSOCKS5Listen {
+			_ = socks5wire.WriteDialResult(openStream, protocol.SOCKS5DialResult{
+				Status:  protocol.SOCKS5DialStatusGeneralFailure,
+				Message: err.Error(),
+			})
+		}
 		return
 	}
 	defer func() { _ = targetStream.Close() }()

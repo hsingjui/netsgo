@@ -5,6 +5,7 @@ import {
   buildTunnelMutationPayload,
   buildTunnelSpecCreateRequest,
 } from '@/lib/tunnel-model';
+import { isDefaultAllowAllSourceCIDRs } from '@/lib/source-cidrs';
 import type { CreateTunnelInput, TunnelClientRole, TunnelTopology, UpdateTunnelInput } from '@/types';
 
 function invalidateTunnelQueries(queryClient: ReturnType<typeof useQueryClient>) {
@@ -39,6 +40,27 @@ export function shouldUseLegacyTunnelEndpoint(error: unknown, topology?: TunnelT
   return error instanceof ApiError && (error.status === 404 || error.status === 405);
 }
 
+function isAllowAllOrUnsetSourceCIDRs(values: string[] | undefined) {
+  const normalized = (values ?? []).map((value) => value.trim()).filter(Boolean);
+  return normalized.length === 0 || isDefaultAllowAllSourceCIDRs(normalized);
+}
+
+export function canFallbackToLegacyTunnelEndpoint(data: Pick<CreateTunnelInput, 'type' | 'topology' | 'allowed_source_cidrs' | 'http_auth'>, error: unknown) {
+  if (!shouldUseLegacyTunnelEndpoint(error, data.topology)) {
+    return false;
+  }
+  if (data.type === 'socks5') {
+    return false;
+  }
+  if (!isAllowAllOrUnsetSourceCIDRs(data.allowed_source_cidrs)) {
+    return false;
+  }
+  if (data.type === 'http' && data.http_auth?.enabled) {
+    return false;
+  }
+  return true;
+}
+
 function buildTunnelSpec(data: {
   topology?: TunnelTopology;
   ingress_client_id?: string;
@@ -50,9 +72,11 @@ function buildTunnelSpec(data: {
   local_port: number;
   remote_port?: number;
   domain?: string;
+  allowed_source_cidrs?: string[];
   ingress_bps?: number;
   egress_bps?: number;
   socks5?: CreateTunnelInput['socks5'];
+  http_auth?: CreateTunnelInput['http_auth'];
   confirm_no_auth_risk?: boolean;
 }) {
   if (data.topology === 'client_to_client') {
@@ -65,10 +89,12 @@ function buildTunnelSpec(data: {
       local_port: data.local_port,
       remote_port: data.remote_port,
       domain: data.domain,
+      allowed_source_cidrs: data.allowed_source_cidrs,
       bind_ip: data.bind_ip ?? '',
       ingress_bps: data.ingress_bps,
       egress_bps: data.egress_bps,
       socks5: data.socks5,
+      http_auth: data.http_auth,
       confirm_no_auth_risk: data.confirm_no_auth_risk,
     });
   }
@@ -83,7 +109,7 @@ export function useCreateTunnel() {
       try {
         return await tunnelApi.create(buildTunnelSpec(data));
       } catch (error) {
-        if (data.type === 'socks5' || !shouldUseLegacyTunnelEndpoint(error, data.topology)) {
+        if (!canFallbackToLegacyTunnelEndpoint(data, error)) {
           throw error;
         }
         try {
@@ -168,7 +194,7 @@ export function useUpdateTunnel() {
           spec: buildTunnelSpec(data),
         });
       } catch (error) {
-        if (data.type === 'socks5' || !shouldUseLegacyTunnelEndpoint(error, data.topology)) {
+        if (!canFallbackToLegacyTunnelEndpoint(data, error)) {
           throw error;
         }
         try {

@@ -2,6 +2,9 @@ package server
 
 import (
 	"context"
+	"crypto/subtle"
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -65,8 +68,9 @@ func (c *countingConn) Write(b []byte) (int, error) {
 }
 
 type httpTunnelRoute struct {
-	config protocol.ProxyConfig
-	client *ClientConn
+	config      protocol.ProxyConfig
+	client      *ClientConn
+	sourceCIDRs []*net.IPNet
 }
 
 func (r httpTunnelRoute) serviceable() bool {
@@ -221,8 +225,9 @@ func (s *Server) findRuntimeHTTPRoute(host string) (httpTunnelRoute, bool) {
 				return true
 			}
 			candidate := httpTunnelRoute{
-				config: tunnel.Config,
-				client: client,
+				config:      tunnel.Config,
+				client:      client,
+				sourceCIDRs: sourceCIDRsForTunnel(tunnel),
 			}
 			if !candidate.serviceable() {
 				return true
@@ -242,8 +247,58 @@ func (s *Server) serveHTTPRoute(w http.ResponseWriter, r *http.Request, route ht
 		http.Error(w, http.StatusText(http.StatusServiceUnavailable), http.StatusServiceUnavailable)
 		return
 	}
+	if !sourceAddressAllowed(stringAddr(httpTunnelSourceIP(s, r)), route.sourceCIDRs) {
+		http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
+		return
+	}
+	if !httpTunnelAuthAllowed(w, r, route.config) {
+		return
+	}
 
 	s.proxyHTTPRequest(w, r, route)
+}
+
+func httpTunnelAuthAllowed(w http.ResponseWriter, r *http.Request, config protocol.ProxyConfig) bool {
+	auth := httpTunnelAuthConfig(config)
+	if auth.Type != protocol.HTTPAuthTypeBasic {
+		return true
+	}
+	username, password, ok := parseBasicAuthHeader(r.Header.Get("Authorization"))
+	if !ok ||
+		subtle.ConstantTimeCompare([]byte(username), []byte(auth.Username)) != 1 ||
+		!verifyEndpointPassword(auth.PasswordHash, password) {
+		w.Header().Set("WWW-Authenticate", `Basic realm="NetsGo tunnel", charset="UTF-8"`)
+		http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
+		return false
+	}
+	return true
+}
+
+func httpTunnelAuthConfig(config protocol.ProxyConfig) protocol.HTTPAuthConfig {
+	if config.Ingress == nil {
+		return protocol.HTTPAuthConfig{Type: protocol.HTTPAuthTypeNone}
+	}
+	var cfg httpHostConfigAPI
+	if err := json.Unmarshal(config.Ingress.Config, &cfg); err != nil {
+		return protocol.HTTPAuthConfig{Type: protocol.HTTPAuthTypeNone}
+	}
+	if cfg.Auth.Type == "" {
+		cfg.Auth.Type = protocol.HTTPAuthTypeNone
+	}
+	return cfg.Auth
+}
+
+func parseBasicAuthHeader(value string) (string, string, bool) {
+	scheme, payload, ok := strings.Cut(value, " ")
+	if !ok || !strings.EqualFold(scheme, "Basic") || strings.TrimSpace(payload) == "" {
+		return "", "", false
+	}
+	decoded, err := base64.StdEncoding.DecodeString(strings.TrimSpace(payload))
+	if err != nil {
+		return "", "", false
+	}
+	username, password, ok := strings.Cut(string(decoded), ":")
+	return username, password, ok
 }
 
 func (s *Server) proxyHTTPRequest(w http.ResponseWriter, r *http.Request, route httpTunnelRoute) {

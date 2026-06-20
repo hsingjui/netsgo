@@ -961,6 +961,40 @@ func TestClientRelaySOCKS5TargetProvisionDoesNotReceiveIngressPasswordHash(t *te
 	}
 }
 
+func TestServerExposeHTTPBasicTargetProvisionDoesNotReceivePasswordHash(t *testing.T) {
+	stored := testClientRelayStoredTunnel(t)
+	stored.Topology = protocol.TunnelTopologyServerExpose
+	stored.Ingress = EndpointSpec{
+		Location: protocol.EndpointLocationServer,
+		Type:     protocol.IngressTypeHTTPHost,
+		Config: mustRawJSON(httpHostConfigAPI{
+			Domain:             "app.example.com",
+			AllowedSourceCIDRs: []string{"0.0.0.0/0", "::/0"},
+			Auth: protocol.HTTPAuthConfig{
+				Type:         protocol.HTTPAuthTypeBasic,
+				Username:     "alice",
+				PasswordHash: "$argon2id$v=19$m=65536,t=3,p=1$c2FsdA$Ynl0ZXM",
+			},
+		}),
+	}
+	stored.Target = EndpointSpec{
+		Location: protocol.EndpointLocationClient,
+		ClientID: "target-client",
+		Type:     protocol.TargetTypeTCPService,
+		Config:   mustRawJSON(serviceConfigAPI{IP: "127.0.0.1", Port: 8080}),
+	}
+
+	targetSpec := tunnelSpecProtocolForRole(stored, protocol.ProxyRuntimeStatePending, protocol.DataStreamRoleTarget)
+	if bytes.Contains(targetSpec.Ingress.Config, []byte("password_hash")) {
+		t.Fatalf("target provision should not receive HTTP ingress password hash: %s", string(targetSpec.Ingress.Config))
+	}
+
+	ingressSpec := tunnelSpecProtocolForRole(stored, protocol.ProxyRuntimeStatePending, protocol.DataStreamRoleIngress)
+	if !bytes.Contains(ingressSpec.Ingress.Config, []byte("password_hash")) {
+		t.Fatalf("ingress provision should retain HTTP ingress password hash: %s", string(ingressSpec.Ingress.Config))
+	}
+}
+
 func TestClientRelayActiveReconcileIsIdempotent(t *testing.T) {
 	s := New(0)
 	s.store = newTestTunnelStore(t)
@@ -1053,12 +1087,6 @@ func TestClientRelayTargetDataOfflineProjectsOffline(t *testing.T) {
 	stored := testClientRelayStoredTunnel(t)
 	mustAddStableTunnel(t, s.store, stored)
 	s.c2c.set(stored)
-	s.clients.Store(stored.Target.ClientID, &ClientConn{
-		ID:         stored.Target.ClientID,
-		proxies:    make(map[string]*ProxyTunnel),
-		generation: 1,
-		state:      clientStateLive,
-	})
 	s.clients.Store(stored.Ingress.ClientID, &ClientConn{
 		ID:         stored.Ingress.ClientID,
 		proxies:    make(map[string]*ProxyTunnel),
@@ -1089,5 +1117,61 @@ func TestClientRelayTargetDataOfflineProjectsOffline(t *testing.T) {
 	}
 	if len(spec.Issues) != 0 {
 		t.Fatalf("target data channel loss should suppress transport issues, got %+v", spec.Issues)
+	}
+}
+
+func TestClientRelaySOCKS5TargetOfflineWritesFailureDialResult(t *testing.T) {
+	s := New(0)
+	s.store = newTestTunnelStore(t)
+
+	stored := testClientRelayStoredTunnel(t)
+	stored.Ingress.Type = protocol.IngressTypeSOCKS5Listen
+	stored.Ingress.Config = mustRawJSON(protocol.SOCKS5ListenConfig{
+		BindIP:             "127.0.0.1",
+		Port:               18080,
+		AllowedSourceCIDRs: []string{"127.0.0.0/8"},
+		Auth:               protocol.SOCKS5AuthConfig{Type: protocol.SOCKS5AuthTypeNone},
+	})
+	stored.Target.Type = protocol.TargetTypeSOCKS5ConnectHandler
+	stored.Target.Config = mustRawJSON(protocol.SOCKS5ConnectHandlerConfig{
+		AllowedTargetCIDRs: []string{"0.0.0.0/0", "::/0"},
+		DialTimeoutSeconds: 5,
+	})
+	mustAddStableTunnel(t, s.store, stored)
+	s.c2c.set(stored)
+
+	s.clients.Store(stored.Ingress.ClientID, &ClientConn{
+		ID:         stored.Ingress.ClientID,
+		proxies:    make(map[string]*ProxyTunnel),
+		generation: 1,
+		state:      clientStateLive,
+	})
+
+	ingressStream, relayStream := net.Pipe()
+	defer mustClose(t, ingressStream)
+	header := testClientRelayHeader(stored)
+	header.TargetHost = "example.com"
+	header.TargetPort = 443
+	header.TargetAddrType = protocol.SOCKS5AddrTypeDomain
+	header.OriginalHost = "example.com"
+
+	done := make(chan struct{})
+	go func() {
+		s.handleClientOpenedDataStream(&ClientConn{ID: stored.Ingress.ClientID}, relayStream, header)
+		close(done)
+	}()
+
+	mustSetReadDeadline(t, ingressStream, time.Now().Add(2*time.Second))
+	result, err := socks5wire.ReadDialResult(ingressStream)
+	if err != nil {
+		t.Fatalf("read failure dial result: %v", err)
+	}
+	if result.Status != protocol.SOCKS5DialStatusNetworkUnreachable {
+		t.Fatalf("dial result: want network_unreachable, got %+v", result)
+	}
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("target offline relay did not return")
 	}
 }

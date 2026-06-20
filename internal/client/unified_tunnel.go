@@ -21,6 +21,7 @@ type clientTunnelRuntime struct {
 	role                string
 	listener            net.Listener
 	packetConn          net.PacketConn
+	sourceCIDRs         []*net.IPNet
 	wg                  sync.WaitGroup
 	runMu               sync.Mutex
 	closing             bool
@@ -304,7 +305,7 @@ func (c *Client) handleTunnelProvision(rt *sessionRuntime, req protocol.TunnelPr
 				ack.Message = err.Error()
 				return ack
 			}
-			c.socks5Targets.Store(req.TunnelID, targetRuntime)
+			c.socks5Targets.Store(req.TunnelID, &targetRuntime)
 			return ack
 		}
 		proxyReq, err := proxyRequestFromTunnelSpec(req.Spec)
@@ -350,7 +351,7 @@ func (c *Client) deleteSOCKS5TargetByTunnelUnprovision(req protocol.TunnelUnprov
 		return
 	}
 	if value, ok := c.socks5Targets.Load(req.TunnelID); ok {
-		if target, ok := value.(clientSOCKS5TargetRuntime); ok && tunnelUnprovisionCoversRevision(req.Revision, target.revision) {
+		if target, ok := value.(*clientSOCKS5TargetRuntime); ok && target != nil && tunnelUnprovisionCoversRevision(req.Revision, target.revision) {
 			c.socks5Targets.CompareAndDelete(req.TunnelID, value)
 		}
 	}
@@ -411,6 +412,11 @@ func (c *Client) startIngressTunnelRuntime(rt *sessionRuntime, req protocol.Tunn
 		role:     req.Role,
 		done:     make(chan struct{}),
 	}
+	policy, err := decodeIngressAccessPolicy(req.Spec.Ingress.Config, true)
+	if err != nil {
+		return fmt.Errorf("decode ingress access policy: %w", err)
+	}
+	runtime.sourceCIDRs = policy.sourceCIDRs
 
 	switch req.Spec.Ingress.Type {
 	case protocol.IngressTypeTCPListen:
@@ -545,6 +551,9 @@ func (c *Client) reapIngressUDPAssociations(runtime *clientTunnelRuntime) {
 
 func (c *Client) handleIngressUDPDatagram(rt *sessionRuntime, req protocol.TunnelProvisionRequest, runtime *clientTunnelRuntime, srcAddr net.Addr, payload []byte) {
 	if runtime == nil || runtime.packetConn == nil || srcAddr == nil {
+		return
+	}
+	if !sourceAddrAllowed(srcAddr, runtime.sourceCIDRs) {
 		return
 	}
 	assoc, ok := c.getOrCreateIngressUDPAssociation(rt, req, runtime, srcAddr)
@@ -696,6 +705,9 @@ func (c *Client) handleIngressTCPConn(rt *sessionRuntime, req protocol.TunnelPro
 		runtime.removeTCPConn(conn)
 		_ = conn.Close()
 	}()
+	if !sourceAddrAllowed(conn.RemoteAddr(), runtime.sourceCIDRs) {
+		return
+	}
 
 	rt.dataMu.RLock()
 	session := rt.dataSession

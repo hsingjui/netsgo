@@ -701,7 +701,7 @@ func TestClient_Cleanup(t *testing.T) {
 	c := New("ws://localhost:8080", "key")
 	c.ClientID = "cleanup-test"
 	c.proxies.Store("proxy1", protocol.ProxyNewRequest{Name: "proxy1"})
-	c.socks5Targets.Store("socks5-1", clientSOCKS5TargetRuntime{tunnelID: "socks5-1"})
+	c.socks5Targets.Store("socks5-1", &clientSOCKS5TargetRuntime{tunnelID: "socks5-1"})
 
 	// Simulate creating a dataSession
 	clientConn, serverConn := net.Pipe()

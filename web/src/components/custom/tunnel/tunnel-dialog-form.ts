@@ -19,10 +19,13 @@ export interface TunnelFormState {
   domain: string;
   ingressBps: string;
   egressBps: string;
-  socks5SourceCidrs: string;
-  socks5AuthType: 'none' | 'username_password';
+  sourceCidrs: string;
+  socks5AuthEnabled: boolean;
   socks5Username: string;
   socks5Password: string;
+  httpAuthEnabled: boolean;
+  httpUsername: string;
+  httpPassword: string;
   socks5TargetCidrs: string;
   socks5TargetHosts: string;
   socks5TargetPorts: string;
@@ -59,16 +62,21 @@ export function getInitialTunnelFormState(props: TunnelInitialFormProps): Tunnel
       domain: props.tunnel.domain || '',
       ingressBps: bpsToMbpsInput(props.tunnel.ingress_bps),
       egressBps: bpsToMbpsInput(props.tunnel.egress_bps),
-      socks5SourceCidrs: props.tunnel.ingress?.type === 'socks5_listen'
-        ? props.tunnel.ingress.config.allowed_source_cidrs.join(', ')
-        : '0.0.0.0/0, ::/0',
-      socks5AuthType: props.tunnel.ingress?.type === 'socks5_listen'
-        ? props.tunnel.ingress.config.auth.type
-        : 'none',
+      sourceCidrs: getInitialSourceCIDRs(props.tunnel),
+      socks5AuthEnabled: props.tunnel.ingress?.type === 'socks5_listen'
+        ? props.tunnel.ingress.config.auth.type === 'username_password'
+        : false,
       socks5Username: props.tunnel.ingress?.type === 'socks5_listen'
         ? props.tunnel.ingress.config.auth.username ?? ''
         : '',
       socks5Password: '',
+      httpAuthEnabled: props.tunnel.ingress?.type === 'http_host'
+        ? props.tunnel.ingress.config.auth?.type === 'basic'
+        : false,
+      httpUsername: props.tunnel.ingress?.type === 'http_host'
+        ? props.tunnel.ingress.config.auth?.username ?? ''
+        : '',
+      httpPassword: '',
       socks5TargetCidrs: props.tunnel.target?.type === 'socks5_connect_handler'
         ? props.tunnel.target.config.allowed_target_cidrs.join(', ')
         : '0.0.0.0/0, ::/0',
@@ -98,10 +106,13 @@ export function getInitialTunnelFormState(props: TunnelInitialFormProps): Tunnel
     domain: '',
     ingressBps: '',
     egressBps: '',
-    socks5SourceCidrs: '0.0.0.0/0, ::/0',
-    socks5AuthType: 'none',
+    sourceCidrs: '0.0.0.0/0, ::/0',
+    socks5AuthEnabled: false,
     socks5Username: '',
     socks5Password: '',
+    httpAuthEnabled: false,
+    httpUsername: '',
+    httpPassword: '',
     socks5TargetCidrs: '0.0.0.0/0, ::/0',
     socks5TargetHosts: '',
     socks5TargetPorts: '',
@@ -122,6 +133,22 @@ function getInitialType(tunnel: TunnelDialogEditData): TunnelFormType {
     return 'socks5';
   }
   return tunnel.type;
+}
+
+function getInitialSourceCIDRs(tunnel: TunnelDialogEditData) {
+  const ingress = tunnel.ingress;
+  if (
+    ingress?.type === 'tcp_listen'
+    || ingress?.type === 'udp_listen'
+    || ingress?.type === 'http_host'
+    || ingress?.type === 'socks5_listen'
+  ) {
+    const cidrs = ingress.config.allowed_source_cidrs ?? [];
+    if (cidrs.length > 0) {
+      return cidrs.join(', ');
+    }
+  }
+  return '0.0.0.0/0, ::/0';
 }
 
 function getInitialTargetHost(tunnel: TunnelDialogEditData) {

@@ -21,6 +21,15 @@ import (
 // Proxy management and listener tests
 // ============================================================
 
+type remoteAddrConn struct {
+	net.Conn
+	remote net.Addr
+}
+
+func (c remoteAddrConn) RemoteAddr() net.Addr {
+	return c.remote
+}
+
 func TestStartProxy_Success(t *testing.T) {
 	s := New(0)
 	clientID := "proxy-client"
@@ -217,6 +226,166 @@ func TestActivatePreparedTunnel_HTTPDoesNotConflictWithSelf(t *testing.T) {
 
 	if err := s.activatePreparedTunnel(client, tunnel); err != nil {
 		t.Fatalf("activatePreparedTunnel should not conflict with its own domain: %v", err)
+	}
+}
+
+func TestHandleProxyConnRejectsDisallowedSourceBeforeOpeningStream(t *testing.T) {
+	s := New(0)
+	clientConn, serverConn := net.Pipe()
+	serverSession, err := mux.NewServerSession(serverConn, mux.DefaultConfig())
+	if err != nil {
+		t.Fatalf("server session: %v", err)
+	}
+	clientSession, err := mux.NewClientSession(clientConn, mux.DefaultConfig())
+	if err != nil {
+		t.Fatalf("client session: %v", err)
+	}
+	defer mustClose(t, clientSession)
+	defer mustClose(t, serverSession)
+	defer mustClose(t, clientConn)
+	defer mustClose(t, serverConn)
+
+	client := &ClientConn{
+		ID:          "tcp-source-policy-client",
+		proxies:     make(map[string]*ProxyTunnel),
+		dataSession: serverSession,
+		generation:  1,
+		state:       clientStateLive,
+	}
+	tunnel := &ProxyTunnel{
+		Config: protocol.ProxyConfig{
+			ID:           "tcp-source-policy-id",
+			Name:         "tcp-source-policy",
+			Type:         protocol.ProxyTypeTCP,
+			DesiredState: protocol.ProxyDesiredStateRunning,
+			RuntimeState: protocol.ProxyRuntimeStateExposed,
+			Ingress: &protocol.EndpointSpec{
+				Location: protocol.EndpointLocationServer,
+				Type:     protocol.IngressTypeTCPListen,
+				Config: mustRawJSON(tcpListenConfigAPI{
+					BindIP:             "127.0.0.1",
+					Port:               18080,
+					AllowedSourceCIDRs: []string{"203.0.113.0/24"},
+				}),
+			},
+		},
+	}
+
+	accepted := make(chan struct{}, 1)
+	go func() {
+		stream, err := clientSession.AcceptStream()
+		if err == nil {
+			_ = stream.Close()
+			accepted <- struct{}{}
+		}
+	}()
+
+	for _, tc := range []struct {
+		name string
+		ip   string
+	}{
+		{name: "external", ip: "198.51.100.10"},
+		{name: "loopback", ip: "127.0.0.1"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			extConn, peer := net.Pipe()
+			defer mustClose(t, peer)
+			s.handleProxyConn(client, tunnel, nil, remoteAddrConn{
+				Conn:   extConn,
+				remote: &net.TCPAddr{IP: net.ParseIP(tc.ip), Port: 40000},
+			})
+
+			select {
+			case <-accepted:
+				t.Fatalf("disallowed TCP source %s should not open a client stream", tc.ip)
+			case <-time.After(100 * time.Millisecond):
+			}
+		})
+	}
+}
+
+func TestHandleSOCKS5ProxyConnRejectsDisallowedSourceBeforeHandshake(t *testing.T) {
+	s := New(0)
+	clientConn, serverConn := net.Pipe()
+	serverSession, err := mux.NewServerSession(serverConn, mux.DefaultConfig())
+	if err != nil {
+		t.Fatalf("server session: %v", err)
+	}
+	clientSession, err := mux.NewClientSession(clientConn, mux.DefaultConfig())
+	if err != nil {
+		t.Fatalf("client session: %v", err)
+	}
+	defer mustClose(t, clientSession)
+	defer mustClose(t, serverSession)
+	defer mustClose(t, clientConn)
+	defer mustClose(t, serverConn)
+
+	client := &ClientConn{
+		ID:          "socks5-source-policy-client",
+		proxies:     make(map[string]*ProxyTunnel),
+		dataSession: serverSession,
+		generation:  1,
+		state:       clientStateLive,
+	}
+	tunnel := &ProxyTunnel{
+		Config: protocol.ProxyConfig{
+			ID:           "socks5-source-policy-id",
+			Name:         "socks5-source-policy",
+			Type:         protocol.ProxyTypeTCP,
+			DesiredState: protocol.ProxyDesiredStateRunning,
+			RuntimeState: protocol.ProxyRuntimeStateExposed,
+		},
+	}
+	listenCfg := socks5ServerListenRuntimeConfig{
+		config: protocol.SOCKS5ListenConfig{
+			BindIP:             "127.0.0.1",
+			Port:               1080,
+			AllowedSourceCIDRs: []string{"203.0.113.0/24"},
+			Auth:               protocol.SOCKS5AuthConfig{Type: protocol.SOCKS5AuthTypeNone},
+		},
+		sourceCIDRs:        mustParseRuntimeCIDRs(t, []string{"203.0.113.0/24"}),
+		dialTimeoutSeconds: 1,
+	}
+
+	accepted := make(chan struct{}, 1)
+	go func() {
+		stream, err := clientSession.AcceptStream()
+		if err == nil {
+			_ = stream.Close()
+			accepted <- struct{}{}
+		}
+	}()
+
+	for _, tc := range []struct {
+		name string
+		ip   string
+	}{
+		{name: "external", ip: "198.51.100.10"},
+		{name: "loopback", ip: "127.0.0.1"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			extConn, peer := net.Pipe()
+			defer mustClose(t, peer)
+			done := make(chan struct{})
+			go func() {
+				s.handleSOCKS5ProxyConn(client, tunnel, nil, remoteAddrConn{
+					Conn:   extConn,
+					remote: &net.TCPAddr{IP: net.ParseIP(tc.ip), Port: 40000},
+				}, listenCfg)
+				close(done)
+			}()
+
+			select {
+			case <-done:
+			case <-time.After(2 * time.Second):
+				t.Fatalf("SOCKS5 handler did not return for disallowed source %s", tc.ip)
+			}
+			select {
+			case <-accepted:
+				t.Fatalf("disallowed SOCKS5 source %s should not open a client stream", tc.ip)
+			case <-time.After(100 * time.Millisecond):
+			}
+		})
 	}
 }
 
@@ -564,6 +733,14 @@ func TestProxyAcceptLoop_UnexpectedAcceptFailureMarksTunnelError(t *testing.T) {
 			ClientID:     client.ID,
 			DesiredState: protocol.ProxyDesiredStateRunning,
 			RuntimeState: protocol.ProxyRuntimeStateExposed,
+			Ingress: &protocol.EndpointSpec{
+				Type: protocol.IngressTypeTCPListen,
+				Config: mustRawJSON(tcpListenConfigAPI{
+					BindIP:             "0.0.0.0",
+					Port:               listener.addr.(*net.TCPAddr).Port,
+					AllowedSourceCIDRs: allowAllSourceCIDRs(),
+				}),
+			},
 		},
 		Listener: listener,
 		done:     make(chan struct{}),
@@ -739,7 +916,10 @@ func TestHandleProxyConn_OpenStreamFailureMarksTunnelError(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		s.handleProxyConn(client, tunnel, listener, extConn)
+		s.handleProxyConn(client, tunnel, listener, remoteAddrConn{
+			Conn:   extConn,
+			remote: &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 54321},
+		})
 		close(done)
 	}()
 

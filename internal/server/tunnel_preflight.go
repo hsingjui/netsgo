@@ -1,6 +1,7 @@
 package server
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -138,8 +139,19 @@ func preflightIngressEndpointSpec(req tunnelCreateRequestAPI) protocol.EndpointS
 		Location: req.Ingress.Location,
 		ClientID: req.Ingress.ClientID,
 		Type:     req.Ingress.Type,
-		Config:   mustRawJSON(tcpListenConfigAPI{BindIP: cfg.BindIP, Port: cfg.Port}),
+		Config:   preflightIngressConfigRaw(req.Ingress.Type, cfg),
 	}
+}
+
+func preflightIngressConfigRaw(endpointType string, cfg ingressEndpointConfigAPI) json.RawMessage {
+	if endpointType == tunnelIngressTypeSOCKS5Listen {
+		return mustRawJSON(tcpListenConfigAPI{
+			BindIP:             cfg.BindIP,
+			Port:               cfg.Port,
+			AllowedSourceCIDRs: cfg.AllowedSourceCIDRs,
+		})
+	}
+	return normalizedIngressConfigRaw(endpointType, cfg)
 }
 
 func sameClientIngressResource(current EndpointSpec, next endpointSpecAPI, currentTopology, nextTopology string) bool {

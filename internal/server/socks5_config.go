@@ -32,7 +32,7 @@ func normalizeSOCKS5ListenConfig(raw json.RawMessage, requireNoAuthConfirmation 
 	if cfg.Port < 1 || cfg.Port > 65535 {
 		return protocol.SOCKS5ListenConfig{}, fmt.Errorf("port must be in range 1-65535")
 	}
-	cidrs, err := normalizeCIDRList(cfg.AllowedSourceCIDRs, "allowed_source_cidrs")
+	cidrs, err := normalizeOptionalCIDRList(cfg.AllowedSourceCIDRs, "allowed_source_cidrs", allowAllSourceCIDRs())
 	if err != nil {
 		return protocol.SOCKS5ListenConfig{}, err
 	}
@@ -80,6 +80,55 @@ func normalizeSOCKS5AuthConfig(auth protocol.SOCKS5AuthConfig) (protocol.SOCKS5A
 	default:
 		return protocol.SOCKS5AuthConfig{}, fmt.Errorf("unsupported auth.type %q", auth.Type)
 	}
+}
+
+func normalizeHTTPAuthConfig(auth protocol.HTTPAuthConfig) (protocol.HTTPAuthConfig, error) {
+	auth.Type = strings.TrimSpace(auth.Type)
+	if auth.Type == "" {
+		auth.Type = protocol.HTTPAuthTypeNone
+	}
+	switch auth.Type {
+	case protocol.HTTPAuthTypeNone:
+		return protocol.HTTPAuthConfig{Type: protocol.HTTPAuthTypeNone}, nil
+	case protocol.HTTPAuthTypeBasic:
+		auth.Username = strings.TrimSpace(auth.Username)
+		if auth.Username == "" {
+			return protocol.HTTPAuthConfig{}, fmt.Errorf("auth.username is required")
+		}
+		if len(auth.Username) > 255 {
+			return protocol.HTTPAuthConfig{}, fmt.Errorf("auth.username cannot exceed 255 bytes")
+		}
+		if auth.Password != "" {
+			hash, err := hashEndpointPassword(auth.Password)
+			if err != nil {
+				return protocol.HTTPAuthConfig{}, err
+			}
+			auth.PasswordHash = hash
+		}
+		if auth.PasswordHash == "" {
+			return protocol.HTTPAuthConfig{}, fmt.Errorf("auth.password is required")
+		}
+		auth.Password = ""
+		return auth, nil
+	default:
+		return protocol.HTTPAuthConfig{}, fmt.Errorf("unsupported auth.type %q", auth.Type)
+	}
+}
+
+func redactHTTPHostConfig(raw json.RawMessage) json.RawMessage {
+	var cfg httpHostConfigAPI
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		return raw
+	}
+	if cfg.AllowedSourceCIDRs == nil {
+		cfg.AllowedSourceCIDRs = allowAllSourceCIDRs()
+	}
+	cfg.Auth.Password = ""
+	cfg.Auth.PasswordHash = ""
+	if cfg.Auth.Type == "" {
+		cfg.Auth.Type = protocol.HTTPAuthTypeNone
+	}
+	return mustRawJSON(cfg)
 }
 
 func redactSOCKS5ListenConfig(raw json.RawMessage) json.RawMessage {
@@ -167,6 +216,13 @@ func normalizeCIDRList(values []string, field string) ([]string, error) {
 		out = append(out, canonical)
 	}
 	return out, nil
+}
+
+func normalizeOptionalCIDRList(values []string, field string, fallback []string) ([]string, error) {
+	if values == nil {
+		values = fallback
+	}
+	return normalizeCIDRList(values, field)
 }
 
 func normalizeTargetHost(raw string) (string, error) {

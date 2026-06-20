@@ -142,6 +142,65 @@ func addLiveHTTPDispatchTunnel(t *testing.T, s *Server, clientID, tunnelName, do
 	}
 }
 
+func setHTTPDispatchSourceCIDRs(t *testing.T, s *Server, clientID, tunnelName string, cidrs []string) {
+	t.Helper()
+	setHTTPDispatchIngressConfig(t, s, clientID, tunnelName, httpHostConfigAPI{
+		AllowedSourceCIDRs: cidrs,
+	})
+}
+
+func setHTTPDispatchIngressConfig(t *testing.T, s *Server, clientID, tunnelName string, cfg httpHostConfigAPI) {
+	t.Helper()
+	value, ok := s.clients.Load(clientID)
+	if !ok {
+		t.Fatalf("client %q not found", clientID)
+	}
+	client := value.(*ClientConn)
+	client.proxyMu.Lock()
+	defer client.proxyMu.Unlock()
+	tunnel := client.proxies[tunnelName]
+	if tunnel == nil {
+		t.Fatalf("tunnel %q not found", tunnelName)
+	}
+	cfg.Domain = tunnel.Config.Domain
+	if cfg.AllowedSourceCIDRs == nil {
+		cfg.AllowedSourceCIDRs = allowAllSourceCIDRs()
+	}
+	tunnel.Config.Ingress = &protocol.EndpointSpec{
+		Location: protocol.EndpointLocationServer,
+		Type:     protocol.IngressTypeHTTPHost,
+		Config:   mustRawJSON(cfg),
+	}
+	stored, err := s.store.GetTunnelE(clientID, tunnelName)
+	if err != nil {
+		t.Fatalf("load stored tunnel: %v", err)
+	}
+	stored.Ingress = EndpointSpec{
+		Location: protocol.EndpointLocationServer,
+		Type:     protocol.IngressTypeHTTPHost,
+		Config:   tunnel.Config.Ingress.Config,
+	}
+	if err := s.store.ReplaceTunnelByID(stored.OwnerClientID, stored.ID, stored.Revision, stored); err != nil {
+		t.Fatalf("update stored tunnel: %v", err)
+	}
+}
+
+func setHTTPDispatchBasicAuth(t *testing.T, s *Server, clientID, tunnelName, username, password string) {
+	t.Helper()
+	hash, err := hashEndpointPassword(password)
+	if err != nil {
+		t.Fatalf("hash HTTP Basic password: %v", err)
+	}
+	setHTTPDispatchIngressConfig(t, s, clientID, tunnelName, httpHostConfigAPI{
+		AllowedSourceCIDRs: allowAllSourceCIDRs(),
+		Auth: protocol.HTTPAuthConfig{
+			Type:         protocol.HTTPAuthTypeBasic,
+			Username:     username,
+			PasswordHash: hash,
+		},
+	})
+}
+
 func relayDispatchStreamToBackend(stream *yamux.Stream, expectedTunnelName, backendAddr string) {
 	defer func() { _ = stream.Close() }()
 
@@ -272,6 +331,187 @@ func TestDispatch_HTTPTunnel_ManagementAPI_Blocked(t *testing.T) {
 	}
 	if got := resp.Header.Get("X-Backend"); got != "hit" {
 		t.Fatalf("Should enter business backend when business domain matches, got %q", got)
+	}
+}
+
+func TestDispatch_HTTPTunnelSourceAllowlistUsesTrustedForwardedIP(t *testing.T) {
+	testCases := []struct {
+		name       string
+		tlsConfig  *TLSConfig
+		remoteAddr string
+		headers    http.Header
+		wantStatus int
+	}{
+		{
+			name:       "direct denied",
+			tlsConfig:  &TLSConfig{Mode: TLSModeOff},
+			remoteAddr: "198.51.100.10:12345",
+			wantStatus: http.StatusForbidden,
+		},
+		{
+			name:       "loopback direct denied when not in allowlist",
+			tlsConfig:  &TLSConfig{Mode: TLSModeOff},
+			remoteAddr: "127.0.0.1:12345",
+			wantStatus: http.StatusForbidden,
+		},
+		{
+			name:       "trusted proxy xff allowed",
+			tlsConfig:  &TLSConfig{Mode: TLSModeOff, TrustedProxies: []string{"10.0.0.0/8"}},
+			remoteAddr: "10.1.2.3:12345",
+			headers: http.Header{
+				"X-Forwarded-For": []string{"203.0.113.44, 10.1.2.3"},
+			},
+			wantStatus: http.StatusNoContent,
+		},
+		{
+			name:       "trusted forwarded chain allowed with origin tls",
+			tlsConfig:  &TLSConfig{Mode: TLSModeAuto, TrustedProxies: []string{"10.0.0.0/8"}},
+			remoteAddr: "10.1.2.3:443",
+			headers: http.Header{
+				"Forwarded": []string{`for=203.0.113.44;proto=https, for=10.1.2.4`},
+			},
+			wantStatus: http.StatusNoContent,
+		},
+		{
+			name:       "cloudflare-specific spoof header ignored",
+			tlsConfig:  &TLSConfig{Mode: TLSModeOff, TrustedProxies: []string{"10.0.0.0/8"}},
+			remoteAddr: "10.1.2.3:443",
+			headers: http.Header{
+				"CF-Connecting-IP": []string{"203.0.113.44"},
+				"True-Client-IP":   []string{"203.0.113.45"},
+			},
+			wantStatus: http.StatusForbidden,
+		},
+		{
+			name:       "untrusted proxy header ignored",
+			tlsConfig:  &TLSConfig{Mode: TLSModeOff, TrustedProxies: []string{"10.0.0.0/8"}},
+			remoteAddr: "198.51.100.10:12345",
+			headers: http.Header{
+				"X-Forwarded-For": []string{"203.0.113.44"},
+			},
+			wantStatus: http.StatusForbidden,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, _ := newDispatchTestServer(t, true, "https://panel.example.com")
+			s.TLS = tc.tlsConfig
+
+			backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("X-Backend", "hit")
+				w.WriteHeader(http.StatusNoContent)
+			}))
+			defer backend.Close()
+
+			cleanupTunnel := addLiveHTTPDispatchTunnel(t, s, "client-http", "app-http", "app.example.com", backend.Listener.Addr())
+			defer cleanupTunnel()
+			setHTTPDispatchSourceCIDRs(t, s, "client-http", "app-http", []string{"203.0.113.0/24"})
+
+			req := newManagementRequest(http.MethodGet, "http://app.example.com/", "app.example.com", nil)
+			req.RemoteAddr = tc.remoteAddr
+			req.Header = tc.headers.Clone()
+			if tc.wantStatus == http.StatusNoContent {
+				if got := httpTunnelSourceIP(s, req); got != "203.0.113.44" {
+					t.Fatalf("preflight source IP = %q, want 203.0.113.44", got)
+				}
+			}
+			w := httptest.NewRecorder()
+
+			s.StartHTTPOnly().ServeHTTP(w, req)
+
+			if w.Code != tc.wantStatus {
+				t.Fatalf("status: want %d, got %d", tc.wantStatus, w.Code)
+			}
+			if tc.wantStatus == http.StatusNoContent && w.Header().Get("X-Backend") != "hit" {
+				t.Fatalf("allowed request should reach HTTP tunnel backend")
+			}
+		})
+	}
+}
+
+func TestDispatch_HTTPTunnelSourceAllowlistDoesNotGateManagementHost(t *testing.T) {
+	s, _ := newDispatchTestServer(t, true, "https://panel.example.com")
+	s.TLS = &TLSConfig{Mode: TLSModeOff, TrustedProxies: []string{"10.0.0.0/8"}}
+
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Backend", "hit")
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer backend.Close()
+
+	cleanupTunnel := addLiveHTTPDispatchTunnel(t, s, "client-http", "app-http", "app.example.com", backend.Listener.Addr())
+	defer cleanupTunnel()
+	setHTTPDispatchSourceCIDRs(t, s, "client-http", "app-http", []string{"203.0.113.0/24"})
+
+	req := newAuthenticatedManagementRequest(t, s, http.MethodGet, "/api/admin/config", "panel.example.com", nil)
+	req.RemoteAddr = "198.51.100.10:12345"
+	req.Header.Set("X-Forwarded-For", "198.51.100.10")
+	w := httptest.NewRecorder()
+
+	s.StartHTTPOnly().ServeHTTP(w, req)
+
+	if w.Code == http.StatusForbidden {
+		t.Fatalf("management host should not be gated by HTTP tunnel source allowlist")
+	}
+	if w.Code != http.StatusOK {
+		t.Fatalf("management host status: want 200, got %d body=%s", w.Code, w.Body.String())
+	}
+}
+
+func TestDispatch_HTTPTunnelHTTPBasicAuth(t *testing.T) {
+	s, _ := newDispatchTestServer(t, true, "https://panel.example.com")
+	hits := 0
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		w.Header().Set("X-Backend", "hit")
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer backend.Close()
+
+	cleanupTunnel := addLiveHTTPDispatchTunnel(t, s, "client-http", "app-http", "app.example.com", backend.Listener.Addr())
+	defer cleanupTunnel()
+	setHTTPDispatchBasicAuth(t, s, "client-http", "app-http", "alice", "secret")
+
+	testCases := []struct {
+		name       string
+		username   string
+		password   string
+		wantStatus int
+		wantHit    bool
+	}{
+		{name: "missing", wantStatus: http.StatusUnauthorized},
+		{name: "wrong password", username: "alice", password: "wrong", wantStatus: http.StatusUnauthorized},
+		{name: "correct", username: "alice", password: "secret", wantStatus: http.StatusNoContent, wantHit: true},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := newManagementRequest(http.MethodGet, "http://app.example.com/", "app.example.com", nil)
+			if tc.username != "" || tc.password != "" {
+				req.SetBasicAuth(tc.username, tc.password)
+			}
+			before := hits
+			w := httptest.NewRecorder()
+
+			s.StartHTTPOnly().ServeHTTP(w, req)
+
+			if w.Code != tc.wantStatus {
+				t.Fatalf("status: want %d, got %d body=%s", tc.wantStatus, w.Code, w.Body.String())
+			}
+			if tc.wantStatus == http.StatusUnauthorized && w.Header().Get("WWW-Authenticate") == "" {
+				t.Fatalf("HTTP Basic rejection should advertise WWW-Authenticate")
+			}
+			if tc.wantHit {
+				if hits != before+1 || w.Header().Get("X-Backend") != "hit" {
+					t.Fatalf("valid HTTP Basic credentials should reach backend, hits before=%d after=%d headers=%v", before, hits, w.Header())
+				}
+				return
+			}
+			if hits != before {
+				t.Fatalf("invalid HTTP Basic credentials should not reach backend, hits before=%d after=%d", before, hits)
+			}
+		})
 	}
 }
 

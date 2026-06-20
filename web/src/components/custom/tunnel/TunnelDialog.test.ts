@@ -3,6 +3,7 @@ import { createElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 
 import { TooltipProvider } from '@/components/ui/tooltip';
+import { preserveLoopbackSourceCIDRsOnFirstRestriction } from '@/lib/source-cidrs';
 
 import { ClientToClientTopologyButton } from './TunnelDialog';
 import { getInitialTunnelFormState } from './tunnel-dialog-form';
@@ -82,5 +83,34 @@ describe('getInitialTunnelFormState', () => {
     });
 
     expect(form.bindIp).toBe('0.0.0.0');
+  });
+});
+
+describe('preserveLoopbackSourceCIDRsOnFirstRestriction', () => {
+  test('首次从默认 allow-all 收窄时自动追加 loopback CIDR', () => {
+    expect(
+      preserveLoopbackSourceCIDRsOnFirstRestriction(
+        '0.0.0.0/0, ::/0',
+        '203.0.113.0/24',
+      ),
+    ).toBe('203.0.113.0/24, 127.0.0.0/8, ::1/128');
+  });
+
+  test('用户后续删除 loopback CIDR 时不再强行补回', () => {
+    expect(
+      preserveLoopbackSourceCIDRsOnFirstRestriction(
+        '203.0.113.0/24, 127.0.0.0/8, ::1/128',
+        '203.0.113.0/24',
+      ),
+    ).toBe('203.0.113.0/24');
+  });
+
+  test('清空输入保持由提交逻辑回退为 allow-all', () => {
+    expect(
+      preserveLoopbackSourceCIDRsOnFirstRestriction(
+        '0.0.0.0/0, ::/0',
+        '',
+      ),
+    ).toBe('');
   });
 });

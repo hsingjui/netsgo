@@ -15,8 +15,9 @@ import (
 // UDPProxyState is the runtime state of a server-side UDP proxy.
 type UDPProxyState struct {
 	packetConn   net.PacketConn // public-facing UDP listener
-	sessions     sync.Map       // srcAddr(string) → *UDPSession
-	sessionCount atomic.Int64   // current active session count (O(1))
+	sourceCIDRs  []*net.IPNet
+	sessions     sync.Map     // srcAddr(string) → *UDPSession
+	sessionCount atomic.Int64 // current active session count (O(1))
 	sessionIPMu  sync.Mutex
 	sessionIPs   map[string]int // src IP → active session count
 	done         chan struct{}  // shutdown signal
@@ -198,13 +199,19 @@ func (s *Server) bindUDPProxyRuntime(tunnel *ProxyTunnel) (*udpProxyRuntime, err
 	if err != nil {
 		return nil, fmt.Errorf("failed to listen on UDP port %d: %w", tunnel.Config.RemotePort, err)
 	}
+	policy, err := decodeIngressAccessPolicyFromProxyConfig(tunnel.Config)
+	if err != nil {
+		_ = packetConn.Close()
+		return nil, fmt.Errorf("decode UDP ingress policy: %w", err)
+	}
 
 	actualPort := packetConn.LocalAddr().(*net.UDPAddr).Port
 
 	state := &UDPProxyState{
-		packetConn: packetConn,
-		sessionIPs: make(map[string]int),
-		done:       make(chan struct{}),
+		packetConn:  packetConn,
+		sourceCIDRs: policy.sourceCIDRs,
+		sessionIPs:  make(map[string]int),
+		done:        make(chan struct{}),
 	}
 
 	return &udpProxyRuntime{
@@ -301,6 +308,10 @@ func (s *Server) udpReadLoop(client *ClientConn, tunnel *ProxyTunnel, state *UDP
 		}
 
 		key := srcAddr.String()
+		if !sourceAddressAllowed(srcAddr, state.sourceCIDRs) {
+			log.Printf("⚠️ UDP proxy [%s] rejected source: %s", tunnel.Config.Name, rejectSourceAddressMessage(srcAddr))
+			continue
+		}
 		ipKey := udpSourceIPKey(srcAddr)
 
 		// Look up or create a session.

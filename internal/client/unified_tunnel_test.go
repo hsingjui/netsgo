@@ -3,6 +3,7 @@ package client
 import (
 	"bytes"
 	"encoding/json"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -20,7 +21,11 @@ import (
 func testTunnelProvisionRequest(t *testing.T, role string, port int) protocol.TunnelProvisionRequest {
 	t.Helper()
 
-	ingressConfig, err := json.Marshal(map[string]any{"bind_ip": "127.0.0.1", "port": port})
+	ingressConfig, err := json.Marshal(map[string]any{
+		"bind_ip":              "127.0.0.1",
+		"port":                 port,
+		"allowed_source_cidrs": []string{"0.0.0.0/0", "::/0"},
+	})
 	if err != nil {
 		t.Fatalf("marshal ingress config: %v", err)
 	}
@@ -112,6 +117,15 @@ func assertTCPPortAccepts(t *testing.T, addr string) {
 	mustClose(t, conn)
 }
 
+type testRemoteAddrConn struct {
+	net.Conn
+	remote net.Addr
+}
+
+func (c testRemoteAddrConn) RemoteAddr() net.Addr {
+	return c.remote
+}
+
 func TestClientReportsIngressRuntimeErrorWhenDataSessionUnavailable(t *testing.T) {
 	c := New("ws://localhost:8080", "key")
 	c.ClientID = "ingress-client"
@@ -123,11 +137,18 @@ func TestClientReportsIngressRuntimeErrorWhenDataSessionUnavailable(t *testing.T
 	req := testTunnelProvisionRequest(t, protocol.DataStreamRoleIngress, reserveClientTCPPort(t))
 	externalConn, tunnelConn := net.Pipe()
 	defer mustClose(t, externalConn)
-	runtime := &clientTunnelRuntime{done: make(chan struct{})}
+	sourcePolicy, err := parseIngressAccessPolicy([]string{"0.0.0.0/0", "::/0"}, false)
+	if err != nil {
+		t.Fatalf("parse source policy: %v", err)
+	}
+	runtime := &clientTunnelRuntime{done: make(chan struct{}), sourceCIDRs: sourcePolicy.sourceCIDRs}
 
 	done := make(chan struct{})
 	go func() {
-		c.handleIngressTCPConn(rt, req, runtime, tunnelConn)
+		c.handleIngressTCPConn(rt, req, runtime, testRemoteAddrConn{
+			Conn:   tunnelConn,
+			remote: &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 40000},
+		})
 		close(done)
 	}()
 
@@ -159,6 +180,56 @@ func TestClientReportsIngressRuntimeErrorWhenDataSessionUnavailable(t *testing.T
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("ingress connection handler did not return")
+	}
+}
+
+func TestClientIngressTCPRejectsDisallowedSourceBeforeDataSession(t *testing.T) {
+	c := New("ws://localhost:8080", "key")
+	c.ClientID = "ingress-client"
+	clientWS, serverWS := newClientTestWebSocketPair(t)
+	defer mustClose(t, clientWS)
+	defer mustClose(t, serverWS)
+
+	rt := &sessionRuntime{done: make(chan struct{}), conn: clientWS}
+	req := testTunnelProvisionRequest(t, protocol.DataStreamRoleIngress, reserveClientTCPPort(t))
+	sourcePolicy, err := parseIngressAccessPolicy([]string{"203.0.113.0/24"}, false)
+	if err != nil {
+		t.Fatalf("parse source policy: %v", err)
+	}
+	runtime := &clientTunnelRuntime{done: make(chan struct{}), sourceCIDRs: sourcePolicy.sourceCIDRs}
+	for _, tc := range []struct {
+		name string
+		ip   string
+	}{
+		{name: "external", ip: "198.51.100.10"},
+		{name: "loopback", ip: "127.0.0.1"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			externalConn, tunnelConn := net.Pipe()
+			defer mustClose(t, externalConn)
+
+			done := make(chan struct{})
+			go func() {
+				c.handleIngressTCPConn(rt, req, runtime, testRemoteAddrConn{
+					Conn:   tunnelConn,
+					remote: &net.TCPAddr{IP: net.ParseIP(tc.ip), Port: 40000},
+				})
+				close(done)
+			}()
+
+			select {
+			case <-done:
+			case <-time.After(2 * time.Second):
+				t.Fatalf("ingress connection handler did not return for disallowed source %s", tc.ip)
+			}
+			if err := serverWS.SetReadDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
+				t.Fatalf("set websocket read deadline: %v", err)
+			}
+			var msg protocol.Message
+			if err := serverWS.ReadJSON(&msg); err == nil {
+				t.Fatalf("disallowed TCP source %s should not report data-session error or open stream, got message %s", tc.ip, msg.Type)
+			}
+		})
 	}
 }
 
@@ -280,12 +351,95 @@ func TestClientTunnelProvisionSOCKS5TargetUsesEndpointRuntime(t *testing.T) {
 	if !ok {
 		t.Fatal("SOCKS5 target provision did not store endpoint-specific runtime")
 	}
-	target := value.(clientSOCKS5TargetRuntime)
+	target, ok := value.(*clientSOCKS5TargetRuntime)
+	if !ok || target == nil {
+		t.Fatalf("SOCKS5 target runtime has unexpected type %T", value)
+	}
 	if target.tunnelID != req.TunnelID || target.revision != req.Revision {
 		t.Fatalf("SOCKS5 target runtime identity mismatch: %+v", target)
 	}
 	if target.config.DialTimeoutSeconds != 2 {
 		t.Fatalf("SOCKS5 target config not preserved: %+v", target.config)
+	}
+}
+
+func TestClientTunnelUnprovisionDeletesSOCKS5TargetWithoutComparingUncomparableValue(t *testing.T) {
+	c := New("ws://localhost:8080", "key")
+	req := testTunnelProvisionRequest(t, protocol.DataStreamRoleTarget, reserveClientTCPPort(t))
+	req.Spec.Target.Type = protocol.TargetTypeSOCKS5ConnectHandler
+	req.Spec.Target.Config = mustJSON(t, protocol.SOCKS5ConnectHandlerConfig{
+		AllowedTargetCIDRs: []string{"127.0.0.0/8"},
+		AllowedTargetHosts: []string{"localhost"},
+		AllowedTargetPorts: []int{8080},
+		DialTimeoutSeconds: 2,
+	})
+
+	ack := c.handleTunnelProvision(&sessionRuntime{}, req)
+	if !ack.Accepted {
+		t.Fatalf("SOCKS5 target provision rejected: %s", ack.Message)
+	}
+
+	c.handleTunnelUnprovision(protocol.TunnelUnprovisionRequest{
+		TunnelID: req.TunnelID,
+		Revision: req.Revision - 1,
+		Role:     protocol.DataStreamRoleTarget,
+	})
+	if _, ok := c.socks5Targets.Load(req.TunnelID); !ok {
+		t.Fatal("stale SOCKS5 target unprovision should not delete current runtime")
+	}
+
+	c.handleTunnelUnprovision(protocol.TunnelUnprovisionRequest{
+		TunnelID: req.TunnelID,
+		Revision: req.Revision,
+		Role:     protocol.DataStreamRoleTarget,
+	})
+	if _, ok := c.socks5Targets.Load(req.TunnelID); ok {
+		t.Fatal("matching SOCKS5 target unprovision should delete current runtime")
+	}
+}
+
+func TestClientSOCKS5TargetPolicyDialResults(t *testing.T) {
+	addr, port := startClientTestTCPEchoService(t)
+	req := testTunnelProvisionRequest(t, protocol.DataStreamRoleTarget, reserveClientTCPPort(t))
+	req.Spec.Target.Type = protocol.TargetTypeSOCKS5ConnectHandler
+	req.Spec.Target.Config = mustJSON(t, protocol.SOCKS5ConnectHandlerConfig{
+		AllowedTargetCIDRs: []string{"127.0.0.0/8"},
+		AllowedTargetHosts: []string{addr},
+		AllowedTargetPorts: []int{port},
+		DialTimeoutSeconds: 2,
+	})
+	target, err := newClientSOCKS5TargetRuntime(req)
+	if err != nil {
+		t.Fatalf("build SOCKS5 target runtime: %v", err)
+	}
+
+	conn, result := dialSOCKS5Target(protocol.DataStreamHeader{TargetHost: addr, TargetPort: port}, target)
+	if result.Status != protocol.SOCKS5DialStatusSuccess {
+		t.Fatalf("allowed target should dial successfully: %+v", result)
+	}
+	if conn == nil {
+		t.Fatal("allowed target returned nil connection")
+	}
+	_ = conn.Close()
+
+	_, result = dialSOCKS5Target(protocol.DataStreamHeader{TargetHost: addr, TargetPort: port + 1}, target)
+	if result.Status != protocol.SOCKS5DialStatusTargetDenied {
+		t.Fatalf("denied port should return target_denied, got %+v", result)
+	}
+
+	req.Spec.Target.Config = mustJSON(t, protocol.SOCKS5ConnectHandlerConfig{
+		AllowedTargetCIDRs: []string{"192.0.2.0/24"},
+		AllowedTargetHosts: []string{addr},
+		AllowedTargetPorts: []int{port},
+		DialTimeoutSeconds: 2,
+	})
+	target, err = newClientSOCKS5TargetRuntime(req)
+	if err != nil {
+		t.Fatalf("build restrictive SOCKS5 target runtime: %v", err)
+	}
+	_, result = dialSOCKS5Target(protocol.DataStreamHeader{TargetHost: addr, TargetPort: port}, target)
+	if result.Status != protocol.SOCKS5DialStatusTargetDenied {
+		t.Fatalf("denied resolved IP should return target_denied, got %+v", result)
 	}
 }
 
@@ -759,4 +913,69 @@ func TestClientUDPAssociationBoundsAndOldestEviction(t *testing.T) {
 	if got := runtime.udpAssociationCount.Load(); got != 1 {
 		t.Fatalf("association count: want 1, got %d", got)
 	}
+}
+
+func TestClientIngressUDPRejectsDisallowedSourceBeforeAssociation(t *testing.T) {
+	c := New("ws://localhost:8080", "key")
+	rt := &sessionRuntime{done: make(chan struct{})}
+	req := testTunnelProvisionRequest(t, protocol.DataStreamRoleIngress, reserveClientTCPPort(t))
+	sourcePolicy, err := parseIngressAccessPolicy([]string{"203.0.113.0/24"}, false)
+	if err != nil {
+		t.Fatalf("parse source policy: %v", err)
+	}
+	packetConn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen udp: %v", err)
+	}
+	defer mustClose(t, packetConn)
+	runtime := &clientTunnelRuntime{
+		packetConn:  packetConn,
+		sourceCIDRs: sourcePolicy.sourceCIDRs,
+		done:        make(chan struct{}),
+	}
+
+	for _, tc := range []struct {
+		name string
+		ip   string
+	}{
+		{name: "external", ip: "198.51.100.10"},
+		{name: "loopback", ip: "127.0.0.1"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srcAddr := &net.UDPAddr{IP: net.ParseIP(tc.ip), Port: 40000}
+			c.handleIngressUDPDatagram(rt, req, runtime, srcAddr, []byte("blocked"))
+
+			if got := runtime.udpAssociationCount.Load(); got != 0 {
+				t.Fatalf("disallowed UDP source %s should not create association, got %d", tc.ip, got)
+			}
+			if _, ok := runtime.udpAssociations.Load(srcAddr.String()); ok {
+				t.Fatalf("disallowed UDP source %s association should not be stored", tc.ip)
+			}
+		})
+	}
+}
+
+func startClientTestTCPEchoService(t *testing.T) (string, int) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen echo service: %v", err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer func() { _ = conn.Close() }()
+				_, _ = io.Copy(conn, conn)
+			}()
+		}
+	}()
+
+	addr := ln.Addr().(*net.TCPAddr)
+	return addr.IP.String(), addr.Port
 }

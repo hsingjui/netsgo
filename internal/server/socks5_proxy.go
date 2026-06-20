@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"netsgo/internal/ingresspolicy"
 	"netsgo/internal/socks5wire"
 	"netsgo/pkg/protocol"
 )
@@ -18,7 +19,10 @@ type socks5ServerListenRuntimeConfig struct {
 	dialTimeoutSeconds int
 }
 
-const socks5HandshakeTimeout = 10 * time.Second
+const (
+	socks5HandshakeTimeout       = 10 * time.Second
+	socks5DialResultGraceSeconds = 5
+)
 
 func isSOCKS5ServerExpose(config protocol.ProxyConfig) bool {
 	return config.Topology == protocol.TunnelTopologyServerExpose &&
@@ -37,7 +41,7 @@ func decodeSOCKS5ServerListenRuntimeConfigFromSpec(raw []byte, targetRaw []byte)
 	if err := json.Unmarshal(raw, &cfg); err != nil {
 		return socks5ServerListenRuntimeConfig{}, err
 	}
-	cidrs, err := parseRuntimeCIDRs(cfg.AllowedSourceCIDRs)
+	cidrs, err := ingresspolicy.ParseCIDRs(cfg.AllowedSourceCIDRs)
 	if err != nil {
 		return socks5ServerListenRuntimeConfig{}, err
 	}
@@ -52,38 +56,6 @@ func decodeSOCKS5ServerListenRuntimeConfigFromSpec(raw []byte, targetRaw []byte)
 		}
 	}
 	return socks5ServerListenRuntimeConfig{config: cfg, sourceCIDRs: cidrs, dialTimeoutSeconds: dialTimeoutSeconds}, nil
-}
-
-func parseRuntimeCIDRs(values []string) ([]*net.IPNet, error) {
-	if len(values) == 0 {
-		return nil, fmt.Errorf("CIDR allowlist is required")
-	}
-	out := make([]*net.IPNet, 0, len(values))
-	for _, value := range values {
-		_, ipNet, err := net.ParseCIDR(value)
-		if err != nil {
-			return nil, fmt.Errorf("invalid CIDR %q: %w", value, err)
-		}
-		out = append(out, ipNet)
-	}
-	return out, nil
-}
-
-func sourceAddressAllowed(addr net.Addr, cidrs []*net.IPNet) bool {
-	host, _, err := net.SplitHostPort(addr.String())
-	if err != nil {
-		host = addr.String()
-	}
-	ip := net.ParseIP(host)
-	if ip == nil {
-		return false
-	}
-	for _, cidr := range cidrs {
-		if cidr.Contains(ip) {
-			return true
-		}
-	}
-	return false
 }
 
 func (s *Server) activatePreparedSOCKS5ServerExposeTunnel(client *ClientConn, tunnel *ProxyTunnel) error {
@@ -169,7 +141,7 @@ func (s *Server) handleSOCKS5ProxyConn(client *ClientConn, tunnel *ProxyTunnel, 
 	}
 	defer func() { _ = stream.Close() }()
 
-	_ = stream.SetReadDeadline(time.Now().Add(time.Duration(listenCfg.dialTimeoutSeconds) * time.Second))
+	_ = stream.SetReadDeadline(time.Now().Add(socks5DialResultWaitTimeout(listenCfg.dialTimeoutSeconds)))
 	result, err := socks5wire.ReadDialResult(stream)
 	_ = stream.SetReadDeadline(time.Time{})
 	if err != nil {
@@ -191,6 +163,13 @@ func (s *Server) handleSOCKS5ProxyConn(client *ClientConn, tunnel *ProxyTunnel, 
 		}
 	}
 	_, _ = relayTunnelPayload(stream, extConn, client.BandwidthRuntime(), tunnel.limits, recordTraffic)
+}
+
+func socks5DialResultWaitTimeout(dialTimeoutSeconds int) time.Duration {
+	if dialTimeoutSeconds <= 0 {
+		dialTimeoutSeconds = defaultSOCKS5DialTimeoutSeconds
+	}
+	return time.Duration(dialTimeoutSeconds+socks5DialResultGraceSeconds) * time.Second
 }
 
 func (s *Server) openSOCKS5StreamToClient(client *ClientConn, tunnel *ProxyTunnel, request socks5wire.ConnectRequest) (net.Conn, error) {

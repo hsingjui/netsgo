@@ -94,12 +94,22 @@ export interface BandwidthSettings {
 export interface TcpListenConfig {
   bind_ip: string;
   port: number;
+  allowed_source_cidrs?: string[];
 }
 
 export type UdpListenConfig = TcpListenConfig;
 
 export interface HttpHostConfig {
   domain: string;
+  allowed_source_cidrs?: string[];
+  auth?: HttpAuthConfig;
+}
+
+export interface HttpAuthConfig {
+  type: "none" | "basic";
+  username?: string;
+  password?: string;
+  password_hash?: string;
 }
 
 export interface TcpServiceConfig {
@@ -297,10 +307,10 @@ export interface CreateTunnelInput {
   local_port: number;
   remote_port?: number;
   domain?: string;
+  allowed_source_cidrs?: string[];
   ingress_bps?: number;
   egress_bps?: number;
   socks5?: {
-    allowed_source_cidrs?: string[];
     auth_type: Socks5AuthConfig["type"];
     username?: string;
     password?: string;
@@ -308,6 +318,11 @@ export interface CreateTunnelInput {
     allowed_target_hosts?: string[];
     allowed_target_ports?: number[];
     dial_timeout_seconds?: number;
+  };
+  http_auth?: {
+    enabled: boolean;
+    username?: string;
+    password?: string;
   };
   confirm_no_auth_risk?: boolean;
 }
@@ -325,9 +340,11 @@ export interface UpdateTunnelInput {
   local_port: number;
   remote_port?: number;
   domain?: string;
+  allowed_source_cidrs?: string[];
   ingress_bps?: number;
   egress_bps?: number;
   socks5?: CreateTunnelInput["socks5"];
+  http_auth?: CreateTunnelInput["http_auth"];
   confirm_no_auth_risk?: boolean;
 }
 

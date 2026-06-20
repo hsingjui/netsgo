@@ -194,6 +194,7 @@ describe('tunnel-model', () => {
         config: {
           bind_ip: '0.0.0.0',
           port: 18080,
+          allowed_source_cidrs: ['0.0.0.0/0', '::/0'],
         },
       },
       target: {
@@ -235,6 +236,7 @@ describe('tunnel-model', () => {
         config: {
           bind_ip: '127.0.0.1',
           port: 18080,
+          allowed_source_cidrs: ['0.0.0.0/0', '::/0'],
         },
       },
       target: {
@@ -277,6 +279,7 @@ describe('tunnel-model', () => {
         config: {
           bind_ip: '0.0.0.0',
           port: 1053,
+          allowed_source_cidrs: ['0.0.0.0/0', '::/0'],
         },
       },
       target: {
@@ -305,9 +308,9 @@ describe('tunnel-model', () => {
         local_ip: '',
         local_port: 0,
         remote_port: 1080,
+        allowed_source_cidrs: ['0.0.0.0/0', '::/0'],
         socks5: {
           auth_type: 'none',
-          allowed_source_cidrs: ['0.0.0.0/0', '::/0'],
           allowed_target_cidrs: ['10.0.0.0/8'],
           allowed_target_hosts: ['db.internal'],
           allowed_target_ports: [443],
@@ -359,11 +362,11 @@ describe('tunnel-model', () => {
         local_ip: '',
         local_port: 0,
         remote_port: 1081,
+        allowed_source_cidrs: ['127.0.0.0/8'],
         socks5: {
           auth_type: 'username_password',
           username: 'u',
           password: 'p',
-          allowed_source_cidrs: ['127.0.0.0/8'],
           allowed_target_cidrs: ['0.0.0.0/0', '::/0'],
           dial_timeout_seconds: 10,
         },
@@ -394,6 +397,7 @@ describe('tunnel-model', () => {
           config: {
             bind_ip: '0.0.0.0',
             port: 10022,
+            allowed_source_cidrs: ['0.0.0.0/0', '::/0'],
           },
         },
         target: {

@@ -76,6 +76,21 @@ func TestTLSConfig_Validate_Auto(t *testing.T) {
 	}
 }
 
+func TestTLSConfig_Validate_Auto_ValidatesTrustedProxies(t *testing.T) {
+	cfg := &TLSConfig{
+		Mode:           TLSModeAuto,
+		TrustedProxies: []string{"10.0.0.0/8", "203.0.113.10"},
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Auto mode should accept valid trusted_proxies: %v", err)
+	}
+
+	cfg.TrustedProxies = []string{"not-a-cidr"}
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("Auto mode should reject invalid trusted_proxies")
+	}
+}
+
 func TestTLSConfig_Validate_Off_ValidCIDR(t *testing.T) {
 	cfg := &TLSConfig{
 		Mode:           TLSModeOff,
@@ -332,6 +347,9 @@ func TestIsTrustedProxy_NotOffMode(t *testing.T) {
 	}
 	if cfg.isTrustedProxy("127.0.0.1") {
 		t.Error("Non-off mode should not match trusted proxy")
+	}
+	if !cfg.isConfiguredTrustedProxy("127.0.0.1") {
+		t.Error("Configured trusted proxy should match independently of TLS mode")
 	}
 }
 

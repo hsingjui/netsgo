@@ -32,12 +32,15 @@ type TLSConfig struct {
 	Mode           string   `json:"mode"`            // custom / auto / off
 	CertFile       string   `json:"cert_file"`       // custom mode: certificate file path
 	KeyFile        string   `json:"key_file"`        // custom mode: private key file path
-	TrustedProxies []string `json:"trusted_proxies"` // off mode: list of trusted proxy CIDRs
+	TrustedProxies []string `json:"trusted_proxies"` // list of trusted proxy CIDRs for forwarded client headers
 	AutoDir        string   `json:"auto_dir"`        // auto mode: certificate storage directory (empty = default)
 }
 
 // Validate checks the TLS configuration for validity.
 func (c *TLSConfig) Validate() error {
+	if err := c.validateTrustedProxies(); err != nil {
+		return err
+	}
 	switch c.Mode {
 	case TLSModeCustom:
 		if c.CertFile == "" || c.KeyFile == "" {
@@ -52,19 +55,23 @@ func (c *TLSConfig) Validate() error {
 	case TLSModeAuto:
 		// No additional parameters required for auto mode.
 	case TLSModeOff:
-		// Validate trusted_proxies CIDR format for off mode.
-		for _, cidr := range c.TrustedProxies {
-			if _, _, err := net.ParseCIDR(cidr); err != nil {
-				// Try parsing as a plain IP address.
-				if ip := net.ParseIP(cidr); ip == nil {
-					return fmt.Errorf("trusted_proxies has invalid format: %s (expected CIDR like 127.0.0.1/32 or an IP address)", cidr)
-				}
-			}
-		}
+		// No additional parameters required for off mode.
 	case "":
 		return fmt.Errorf("tls.mode cannot be empty; valid values: custom / auto / off")
 	default:
 		return fmt.Errorf("unsupported tls.mode: %s; valid values: custom / auto / off", c.Mode)
+	}
+	return nil
+}
+
+func (c *TLSConfig) validateTrustedProxies() error {
+	for _, cidr := range c.TrustedProxies {
+		if _, _, err := net.ParseCIDR(cidr); err != nil {
+			// Try parsing as a plain IP address.
+			if ip := net.ParseIP(cidr); ip == nil {
+				return fmt.Errorf("trusted_proxies has invalid format: %s (expected CIDR like 127.0.0.1/32 or an IP address)", cidr)
+			}
+		}
 	}
 	return nil
 }
@@ -277,12 +284,28 @@ func formatFingerprint(hexStr string) string {
 	return strings.Join(parts, ":")
 }
 
-// isTrustedProxy reports whether the given IP is in the trusted proxy list.
+// isTrustedProxy reports whether the given IP is in the trusted proxy list for
+// management-plane proxy headers. Those headers remain limited to TLS off mode
+// because they affect admin auth, sessions, rate limits, and secure cookies.
 func (c *TLSConfig) isTrustedProxy(ip string) bool {
-	if c.Mode != TLSModeOff || len(c.TrustedProxies) == 0 {
+	if c.Mode != TLSModeOff {
 		return false
 	}
+	return c.hasTrustedProxyIP(ip)
+}
 
+// isConfiguredTrustedProxy reports whether the given IP is explicitly configured
+// as a trusted proxy, independent of TLS mode. HTTP tunnel source allowlists use
+// this narrower helper because the decision only gates business tunnel traffic;
+// it does not change management-plane trust semantics.
+func (c *TLSConfig) isConfiguredTrustedProxy(ip string) bool {
+	return c.hasTrustedProxyIP(ip)
+}
+
+func (c *TLSConfig) hasTrustedProxyIP(ip string) bool {
+	if c == nil || len(c.TrustedProxies) == 0 {
+		return false
+	}
 	parsedIP := net.ParseIP(ip)
 	if parsedIP == nil {
 		return false

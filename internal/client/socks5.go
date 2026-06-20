@@ -9,12 +9,15 @@ import (
 	"strings"
 	"time"
 
+	"netsgo/internal/ingresspolicy"
 	"netsgo/internal/socks5wire"
 	"netsgo/pkg/mux"
 	"netsgo/pkg/protocol"
 )
 
 const socks5HandshakeTimeout = 10 * time.Second
+
+const socks5DialResultGraceSeconds = 5
 
 type clientSOCKS5TargetRuntime struct {
 	tunnelID    string
@@ -138,6 +141,9 @@ func dialSOCKS5Target(header protocol.DataStreamHeader, target clientSOCKS5Targe
 		return nil, socks5DialResultFromError(err)
 	}
 	result := protocol.SOCKS5DialResult{Status: protocol.SOCKS5DialStatusSuccess}
+	// Keep RFC 1928 BND.ADDR/BND.PORT semantics: report the target client's
+	// actual local socket endpoint. This may expose an internal address by
+	// design; callers that need privacy should enforce that policy above SOCKS5.
 	if addr, ok := conn.LocalAddr().(*net.TCPAddr); ok {
 		result.BoundAddr = addr.IP.String()
 		result.BoundPort = addr.Port
@@ -193,6 +199,8 @@ func targetAllowsResolvedIPs(ips []net.IP, cidrs []*net.IPNet) bool {
 	if len(ips) == 0 || len(cidrs) == 0 {
 		return false
 	}
+	// Be conservative for multi-answer DNS: every returned address must be
+	// allowed so a mixed DNS response cannot bypass the target CIDR policy.
 	for _, ip := range ips {
 		allowed := false
 		for _, cidr := range cidrs {
@@ -257,7 +265,7 @@ func decodeSOCKS5ListenRuntimeConfigFromSpec(raw []byte, targetRaw []byte) (sock
 	if err := json.Unmarshal(raw, &cfg); err != nil {
 		return socks5ListenRuntimeConfig{}, err
 	}
-	cidrs, err := parseCIDRs(cfg.AllowedSourceCIDRs)
+	cidrs, err := ingresspolicy.ParseCIDRs(cfg.AllowedSourceCIDRs)
 	if err != nil {
 		return socks5ListenRuntimeConfig{}, err
 	}
@@ -295,7 +303,7 @@ func (c *Client) handleIngressSOCKS5Conn(rt *sessionRuntime, req protocol.Tunnel
 		return
 	}
 	defer func() { _ = stream.Close() }()
-	_ = stream.SetReadDeadline(time.Now().Add(time.Duration(listenCfg.dialTimeoutSeconds) * time.Second))
+	_ = stream.SetReadDeadline(time.Now().Add(socks5DialResultWaitTimeout(listenCfg.dialTimeoutSeconds)))
 	result, err := socks5wire.ReadDialResult(stream)
 	_ = stream.SetReadDeadline(time.Time{})
 	if err != nil {
@@ -312,21 +320,11 @@ func (c *Client) handleIngressSOCKS5Conn(rt *sessionRuntime, req protocol.Tunnel
 	mux.Relay(stream, conn)
 }
 
-func sourceAddrAllowed(addr net.Addr, cidrs []*net.IPNet) bool {
-	host, _, err := net.SplitHostPort(addr.String())
-	if err != nil {
-		host = addr.String()
+func socks5DialResultWaitTimeout(dialTimeoutSeconds int) time.Duration {
+	if dialTimeoutSeconds <= 0 {
+		dialTimeoutSeconds = 10
 	}
-	ip := net.ParseIP(host)
-	if ip == nil {
-		return false
-	}
-	for _, cidr := range cidrs {
-		if cidr.Contains(ip) {
-			return true
-		}
-	}
-	return false
+	return time.Duration(dialTimeoutSeconds+socks5DialResultGraceSeconds) * time.Second
 }
 
 func openIngressSOCKS5Stream(rt *sessionRuntime, req protocol.TunnelProvisionRequest, openClientID string, request socks5wire.ConnectRequest) (net.Conn, error) {

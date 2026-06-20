@@ -63,14 +63,15 @@ interface TunnelMutationPayloadInput {
   local_port: number;
   remote_port?: number;
   domain?: string;
+  allowed_source_cidrs?: string[];
   ingress_bps?: number;
   egress_bps?: number;
   socks5?: Socks5MutationInput;
+  http_auth?: HTTPAuthMutationInput;
   confirm_no_auth_risk?: boolean;
 }
 
 export interface Socks5MutationInput {
-  allowed_source_cidrs?: string[];
   auth_type: Socks5AuthConfig['type'];
   username?: string;
   password?: string;
@@ -78,6 +79,12 @@ export interface Socks5MutationInput {
   allowed_target_hosts?: string[];
   allowed_target_ports?: number[];
   dial_timeout_seconds?: number;
+}
+
+export interface HTTPAuthMutationInput {
+  enabled: boolean;
+  username?: string;
+  password?: string;
 }
 
 export interface TunnelSpecMutationInput extends TunnelMutationPayloadInput {
@@ -140,8 +147,9 @@ export function buildTunnelMutationPayload(input: TunnelMutationPayloadInput) {
 
 export function buildTunnelSpecCreateRequest(input: TunnelSpecMutationInput): TunnelCreateRequest {
   const payload = buildTunnelMutationPayload(input);
+  const allowedSourceCIDRs = normalizeSourceCIDRs(input.allowed_source_cidrs);
   if (input.type === 'socks5') {
-    const socks5 = buildSocks5EndpointConfigs(input.socks5, payload.remote_port, '0.0.0.0');
+    const socks5 = buildSocks5EndpointConfigs(input.socks5, payload.remote_port, '0.0.0.0', allowedSourceCIDRs);
     return {
       name: input.name,
       topology: 'server_expose',
@@ -183,7 +191,7 @@ export function buildTunnelSpecCreateRequest(input: TunnelSpecMutationInput): Tu
         port: payload.local_port,
       },
     };
-  const ingress = buildServerExposeIngress(input.type, payload.remote_port, payload.domain);
+  const ingress = buildServerExposeIngress(input.type, payload.remote_port, payload.domain, allowedSourceCIDRs, input.http_auth);
 
   return {
     name: input.name,
@@ -208,12 +216,13 @@ export function buildClientToClientTunnelSpecCreateRequest(
     throw new Error(i18n.t('errors.client_to_client_same_participant'));
   }
   const payload = buildTunnelMutationPayload(input);
+  const allowedSourceCIDRs = normalizeSourceCIDRs(input.allowed_source_cidrs);
   const bindIP = input.bind_ip.trim();
   if (!bindIP) {
     throw new Error(i18n.t('errors.client_to_client_bind_ip_required'));
   }
   if (input.type === 'socks5') {
-    const socks5 = buildSocks5EndpointConfigs(input.socks5, payload.remote_port, bindIP);
+    const socks5 = buildSocks5EndpointConfigs(input.socks5, payload.remote_port, bindIP, allowedSourceCIDRs);
     return {
       name: input.name,
       topology: 'client_to_client',
@@ -263,6 +272,7 @@ export function buildClientToClientTunnelSpecCreateRequest(
       config: {
         bind_ip: bindIP,
         port: payload.remote_port,
+        allowed_source_cidrs: allowedSourceCIDRs,
       },
     }
     : {
@@ -272,6 +282,7 @@ export function buildClientToClientTunnelSpecCreateRequest(
       config: {
         bind_ip: bindIP,
         port: payload.remote_port,
+        allowed_source_cidrs: allowedSourceCIDRs,
       },
     };
 
@@ -424,13 +435,19 @@ function buildServerExposeIngress(
   proxyType: ProxyType,
   remotePort: number,
   domain: string,
+  allowedSourceCIDRs: string[],
+  httpAuth?: HTTPAuthMutationInput,
 ): TunnelIngress {
   switch (proxyType) {
     case 'http':
       return {
         location: 'server',
         type: 'http_host',
-        config: { domain },
+        config: {
+          domain,
+          allowed_source_cidrs: allowedSourceCIDRs,
+          auth: buildHTTPAuthConfig(httpAuth),
+        },
       };
     case 'udp':
       return {
@@ -439,6 +456,7 @@ function buildServerExposeIngress(
         config: {
           bind_ip: '0.0.0.0',
           port: remotePort,
+          allowed_source_cidrs: allowedSourceCIDRs,
         },
       };
     case 'tcp':
@@ -449,15 +467,28 @@ function buildServerExposeIngress(
         config: {
           bind_ip: '0.0.0.0',
           port: remotePort,
+          allowed_source_cidrs: allowedSourceCIDRs,
         },
       };
   }
+}
+
+function buildHTTPAuthConfig(input: HTTPAuthMutationInput | undefined) {
+  if (!input?.enabled) {
+    return { type: 'none' as const };
+  }
+  return {
+    type: 'basic' as const,
+    username: (input.username ?? '').trim(),
+    password: input.password ?? '',
+  };
 }
 
 function buildSocks5EndpointConfigs(
   input: Socks5MutationInput | undefined,
   port: number,
   bindIP: string,
+  allowedSourceCIDRs: string[],
 ): { listen: Socks5ListenConfig; target: Socks5ConnectHandlerConfig } {
   const authType = input?.auth_type ?? 'none';
   const auth: Socks5AuthConfig = authType === 'username_password'
@@ -471,7 +502,7 @@ function buildSocks5EndpointConfigs(
     listen: {
       bind_ip: bindIP,
       port,
-      allowed_source_cidrs: normalizeStringList(input?.allowed_source_cidrs, ['0.0.0.0/0', '::/0']),
+      allowed_source_cidrs: allowedSourceCIDRs,
       auth,
     },
     target: {
@@ -481,6 +512,10 @@ function buildSocks5EndpointConfigs(
       dial_timeout_seconds: input?.dial_timeout_seconds ?? 10,
     },
   };
+}
+
+function normalizeSourceCIDRs(values: string[] | undefined) {
+  return normalizeStringList(values, ['0.0.0.0/0', '::/0']);
 }
 
 function normalizeStringList(values: string[] | undefined, fallback: string[]) {

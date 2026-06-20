@@ -1,6 +1,7 @@
 package socks5wire
 
 import (
+	"crypto/subtle"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -143,7 +144,8 @@ func Authenticate(conn net.Conn, auth protocol.SOCKS5AuthConfig) bool {
 	if _, err := io.ReadFull(conn, password); err != nil {
 		return false
 	}
-	ok := string(username) == auth.Username && credential.VerifyPassword(auth.PasswordHash, string(password))
+	ok := subtle.ConstantTimeCompare(username, []byte(auth.Username)) == 1 &&
+		credential.VerifyPassword(auth.PasswordHash, string(password))
 	status := byte(0x01)
 	if ok {
 		status = 0x00
@@ -205,6 +207,8 @@ func ReadAddress(r io.Reader, atyp byte) (string, string, byte, bool) {
 		if _, err := io.ReadFull(r, raw); err != nil {
 			return "", "", RepGeneralFailure, false
 		}
+		// NetsGo stores domain targets in normalized lowercase form; OriginalHost
+		// on ConnectRequest carries this normalized host, not the byte-exact input.
 		return strings.ToLower(string(raw)), protocol.SOCKS5AddrTypeDomain, 0, true
 	default:
 		return "", "", RepAddrUnsupported, false

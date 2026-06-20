@@ -135,8 +135,8 @@ All flags support environment variable configuration with NETSGO_ prefix, e.g.:
   # Start with user-provided certificate
   netsgo server --tls-mode custom --tls-cert /path/to/cert.pem --tls-key /path/to/key.pem
 
-  # Reverse proxy mode (trust specific proxy IPs)
-  netsgo server --tls-mode off --trusted-proxies 127.0.0.1/32,10.0.0.0/8`,
+  # Trust non-local reverse proxies for Forwarded/X-Forwarded-For/X-Real-IP client headers
+  netsgo server --trusted-proxies 10.0.0.0/8,192.0.2.10/32`,
 	Run: func(cmd *cobra.Command, args []string) {
 		slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, nil)))
 
@@ -228,7 +228,7 @@ func init() {
 	serverCmd.Flags().String("tls-cert", "", "TLS certificate file path (custom mode)")
 	serverCmd.Flags().String("tls-key", "", "TLS private key file path (custom mode)")
 	serverCmd.Flags().String("tls-auto-dir", "", "Self-signed cert storage dir (auto mode, default: <data-dir>/server/tls)")
-	serverCmd.Flags().String("trusted-proxies", "", "Trusted proxy CIDR list, comma-separated (off mode)")
+	serverCmd.Flags().String("trusted-proxies", "", "Trusted proxy CIDR/IP list for forwarded client headers, comma-separated")
 	serverCmd.Flags().String("init-admin-username", "", "Admin username for first-time initialization")
 	serverCmd.Flags().String("init-admin-password", "", "Admin password for first-time initialization")
 	serverCmd.Flags().String("init-server-addr", "", "Server external address for first-time initialization")

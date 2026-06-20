@@ -10,6 +10,7 @@ import (
 
 	"github.com/hashicorp/yamux"
 
+	"netsgo/internal/ingresspolicy"
 	"netsgo/pkg/mux"
 	"netsgo/pkg/protocol"
 )
@@ -25,6 +26,15 @@ func reserveUDPPort(t *testing.T) int {
 		t.Fatalf("failed to close reserved UDP port: %v", err)
 	}
 	return port
+}
+
+func mustParseRuntimeCIDRs(t *testing.T, values []string) []*net.IPNet {
+	t.Helper()
+	cidrs, err := ingresspolicy.ParseCIDRs(values)
+	if err != nil {
+		t.Fatalf("parse runtime CIDRs: %v", err)
+	}
+	return cidrs
 }
 
 func TestStartProxy_UDP(t *testing.T) {
@@ -218,6 +228,44 @@ func TestUDPProxySessionBoundsAndOldestEviction(t *testing.T) {
 	}
 	if got := state.sessionCountForIP("127.0.0.1"); got != 1 {
 		t.Fatalf("per-IP session count: want 1, got %d", got)
+	}
+}
+
+func TestUDPReadLoopRejectsDisallowedLoopbackSourceBeforeCreatingSession(t *testing.T) {
+	s := New(0)
+	packetConn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen UDP: %v", err)
+	}
+	state := &UDPProxyState{
+		packetConn:  packetConn,
+		sourceCIDRs: mustParseRuntimeCIDRs(t, []string{"203.0.113.0/24"}),
+		sessionIPs:  make(map[string]int),
+		done:        make(chan struct{}),
+	}
+	defer state.Close()
+
+	client := &ClientConn{
+		ID:         "udp-source-policy-client",
+		proxies:    make(map[string]*ProxyTunnel),
+		generation: 1,
+		state:      clientStateLive,
+	}
+	tunnel := &ProxyTunnel{Config: protocol.ProxyConfig{Name: "udp-source-policy", Type: protocol.ProxyTypeUDP}}
+	go s.udpReadLoop(client, tunnel, state)
+
+	sender, err := net.Dial("udp", packetConn.LocalAddr().String())
+	if err != nil {
+		t.Fatalf("dial UDP listener: %v", err)
+	}
+	defer func() { _ = sender.Close() }()
+	if _, err := sender.Write([]byte("blocked")); err != nil {
+		t.Fatalf("write UDP packet: %v", err)
+	}
+	time.Sleep(100 * time.Millisecond)
+
+	if got := state.sessionCount.Load(); got != 0 {
+		t.Fatalf("disallowed UDP source should not create session, got %d", got)
 	}
 }
 

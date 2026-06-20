@@ -157,10 +157,9 @@ func (s *Server) Start() error {
 	log.Printf("🚀 NetsGo Server started, listening on :%d", s.Port)
 	logServerEndpoints(s.Port, s.tlsEnabled, s.webFS != nil, serverConfig)
 
-	if s.TLS != nil && s.TLS.Mode == TLSModeOff && len(s.TLS.TrustedProxies) == 0 {
-		log.Printf("⚠️ TLS mode is off (reverse proxy mode), but --trusted-proxies is not configured")
-		log.Printf("⚠️ The X-Forwarded-For header will be ignored, and rate limiting will use the proxy IP instead of the real client IP")
-		log.Printf("⚠️ If you are running behind a reverse proxy, configure: --trusted-proxies 127.0.0.1/32")
+	if s.TLS != nil && len(s.TLS.TrustedProxies) == 0 {
+		log.Printf("⚠️ Forwarded client headers are trusted from loopback proxies only")
+		log.Printf("⚠️ HTTP tunnel source allowlists and rate limiting behind non-local reverse proxies require --trusted-proxies")
 	}
 
 	s.httpServer = &http.Server{

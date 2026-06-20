@@ -262,7 +262,8 @@ func forwardedProto(v string) string {
 
 // isLoopback reports whether the IP is a loopback address.
 func isLoopback(ip string) bool {
-	return ip == "127.0.0.1" || ip == "::1"
+	parsed := net.ParseIP(strings.Trim(ip, "[]"))
+	return parsed != nil && parsed.IsLoopback()
 }
 
 // remoteIPFromAddr extracts the IP from a host:port formatted address.

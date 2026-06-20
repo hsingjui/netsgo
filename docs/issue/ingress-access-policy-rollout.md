@@ -40,7 +40,7 @@ rate_limits
 
 SOCKS5 CONNECT 本次必须实现 `allowed_source_cidrs` 和 SOCKS5 auth。TCP/UDP/HTTP 的 ingress handler 也必须在同一 PR 中补齐 `allowed_source_cidrs`。
 
-默认值为允许所有，但必须显式表达：前端默认填入允许所有，字段必填，用户可自行收窄。API 不能把字段缺失默认为允许所有。
+默认值为允许所有，但新 UI/API payload 应显式表达：前端默认填入允许所有，用户可自行收窄。后端不对 loopback 做隐式放行；需要本机访问时必须显式包含 `127.0.0.0/8` 和/或 `::1/128`。为兼容本功能上线前的本地数据与旧调用方，server 读取/视图/legacy 转换路径会把缺失的 `allowed_source_cidrs` 持久化或展示为显式 allow-all；空数组仍然非法，避免歧义。
 
 ## Why in SOCKS5 CONNECT PR
 

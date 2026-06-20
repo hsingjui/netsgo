@@ -354,12 +354,14 @@ IPv4 与 IPv6 CIDR 都应支持。
 
 ### 6.4 默认策略
 
-`allowed_source_cidrs` 与 `allowed_target_*` 的产品默认值确定为“允许所有”。但这不能通过缺省字段或空数组隐式表达，必须在 UI/API 中作为显式配置处理：
+`allowed_source_cidrs` 与 `allowed_target_*` 的产品默认值确定为“允许所有”。新 UI/API payload 应使用显式配置表达该选择；空数组不能表示允许所有。
 
 - 前端创建表单默认填入“允许所有”的表达；
-- allowlist 字段对支持该策略的 tunnel type 必填；
+- allowlist 字段对支持该策略的 tunnel type 应显式写入；
 - 用户可以自行收窄为 CIDR、host、port 列表；
-- API 必须能区分“用户显式选择允许所有”和“字段缺失/客户端未填写”；
+- 后端不对 loopback 做隐式放行；如果收窄来源后仍需要同机反代、本机调试或本机健康检查访问入口，配置中必须显式包含 `127.0.0.0/8` 和/或 `::1/128`；
+- 为兼容本功能上线前的本地数据与旧调用方，server 读取/视图/legacy 转换路径会把缺失的 `allowed_source_cidrs` 持久化或展示为显式 allow-all；新 UI 清空输入框也会提交显式 allow-all；
+- 空数组仍为非法值，避免把“未配置任何允许来源”误读成 allow-all；
 - 文案必须提示：允许所有来源或所有目标有安全风险，尤其 SOCKS5 target allow-all 可能形成开放代理。
 
 建议使用明确表达而不是空数组，例如：
@@ -371,7 +373,7 @@ IPv4 与 IPv6 CIDR 都应支持。
 }
 ```
 
-如果最终实现选择使用 `allow_all: true` 之类结构化字段，也必须保证 API 和 UI 能明确展示这是用户选择的 allow-all。
+如果未来选择使用 `allow_all: true` 之类结构化字段，应继续保证 UI 能明确展示这是用户选择的 allow-all。
 
 ## 7. 安全要求
 

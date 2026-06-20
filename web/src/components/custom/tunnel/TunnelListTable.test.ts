@@ -213,6 +213,7 @@ describe('TunnelListTable', () => {
           config: {
             bind_ip: '0.0.0.0',
             port: 10022,
+            allowed_source_cidrs: ['0.0.0.0/0', '::/0'],
           },
         },
         target: {

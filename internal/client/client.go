@@ -977,12 +977,12 @@ func (c *Client) handleStream(stream *yamux.Stream) {
 
 func (c *Client) socks5TargetForDataStreamHeader(header protocol.DataStreamHeader) (clientSOCKS5TargetRuntime, bool) {
 	if val, ok := c.socks5Targets.Load(header.TunnelID); ok {
-		target, ok := val.(clientSOCKS5TargetRuntime)
-		if !ok {
+		target, ok := val.(*clientSOCKS5TargetRuntime)
+		if !ok || target == nil {
 			log.Printf("⚠️ invalid SOCKS5 target cache entry for tunnel %s: %T", header.TunnelID, val)
 			return clientSOCKS5TargetRuntime{}, false
 		}
-		return target, true
+		return *target, true
 	}
 	return clientSOCKS5TargetRuntime{}, false
 }

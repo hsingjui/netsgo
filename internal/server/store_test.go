@@ -1,10 +1,12 @@
 package server
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -16,6 +18,148 @@ func newTestTunnelStore(t *testing.T) *TunnelStore {
 	t.Helper()
 
 	return newTestTunnelStoreAt(t, filepath.Join(t.TempDir(), serverDBFileName))
+}
+
+func TestTunnelStore_BackfillsExplicitAllowAllSourceCIDRs(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, serverDBFileName)
+	store := newTestTunnelStoreAt(t, path)
+	mustAddStableTunnel(t, store, StoredTunnel{
+		ProxyNewRequest: protocol.ProxyNewRequest{
+			ID:         "tcp-backfill",
+			Name:       "tcp-backfill",
+			Type:       protocol.ProxyTypeTCP,
+			LocalIP:    "127.0.0.1",
+			LocalPort:  80,
+			RemotePort: 18080,
+		},
+		ClientID: "client-1",
+		Ingress: EndpointSpec{
+			Location: protocol.EndpointLocationServer,
+			Type:     protocol.IngressTypeTCPListen,
+			Config:   mustRawJSON(tcpListenConfigAPI{BindIP: "0.0.0.0", Port: 18080, AllowedSourceCIDRs: allowAllSourceCIDRs()}),
+		},
+		Target: EndpointSpec{
+			Location: protocol.EndpointLocationClient,
+			ClientID: "client-1",
+			Type:     protocol.TargetTypeTCPService,
+			Config:   mustRawJSON(serviceConfigAPI{IP: "127.0.0.1", Port: 80}),
+		},
+		Revision: 7,
+	})
+	_ = store.Close()
+
+	db, err := openServerDB(path)
+	if err != nil {
+		t.Fatalf("open sqlite database failed: %v", err)
+	}
+	if _, err := db.Exec(`UPDATE tunnels SET ingress_config = ? WHERE id = ?`, `{"bind_ip":"0.0.0.0","port":18080}`, "tcp-backfill"); err != nil {
+		t.Fatalf("simulate old ingress_config: %v", err)
+	}
+	_ = db.Close()
+
+	reloaded := newTestTunnelStoreAt(t, path)
+	stored, ok := reloaded.GetTunnel("client-1", "tcp-backfill")
+	if !ok {
+		t.Fatal("expected backfilled tunnel")
+	}
+	if stored.Revision != 7 {
+		t.Fatalf("backfill should not bump revision, got %d", stored.Revision)
+	}
+	var cfg tcpListenConfigAPI
+	if err := json.Unmarshal(stored.Ingress.Config, &cfg); err != nil {
+		t.Fatalf("decode backfilled ingress config: %v", err)
+	}
+	if got, want := strings.Join(cfg.AllowedSourceCIDRs, ","), "0.0.0.0/0,::/0"; got != want {
+		t.Fatalf("backfilled source CIDRs: got %q want %q", got, want)
+	}
+
+	raw := queryTunnelIngressConfig(t, path, "tcp-backfill")
+	if !strings.Contains(raw, `"allowed_source_cidrs":["0.0.0.0/0","::/0"]`) {
+		t.Fatalf("expected persisted explicit allow-all, got %s", raw)
+	}
+}
+
+func TestTunnelStore_BackfillSOCKS5KeepsAuth(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, serverDBFileName)
+	store := newTestTunnelStoreAt(t, path)
+	mustAddStableTunnel(t, store, StoredTunnel{
+		ProxyNewRequest: protocol.ProxyNewRequest{
+			ID:        "socks5-backfill",
+			Name:      "socks5-backfill",
+			Type:      protocol.ProxyTypeTCP,
+			LocalIP:   "127.0.0.1",
+			LocalPort: 0,
+		},
+		ClientID: "client-1",
+		Topology: protocol.TunnelTopologyServerExpose,
+		Revision: 3,
+		Ingress: EndpointSpec{
+			Location: protocol.EndpointLocationServer,
+			Type:     protocol.IngressTypeSOCKS5Listen,
+			Config: mustRawJSON(protocol.SOCKS5ListenConfig{
+				BindIP:             "127.0.0.1",
+				Port:               19080,
+				AllowedSourceCIDRs: allowAllSourceCIDRs(),
+				Auth: protocol.SOCKS5AuthConfig{
+					Type:         protocol.SOCKS5AuthTypeUsernamePassword,
+					Username:     "alice",
+					PasswordHash: "$argon2id$test",
+				},
+			}),
+		},
+		Target: EndpointSpec{
+			Location: protocol.EndpointLocationClient,
+			ClientID: "client-1",
+			Type:     protocol.TargetTypeSOCKS5ConnectHandler,
+			Config: mustRawJSON(protocol.SOCKS5ConnectHandlerConfig{
+				AllowedTargetCIDRs: []string{"0.0.0.0/0", "::/0"},
+				DialTimeoutSeconds: 10,
+			}),
+		},
+	})
+	_ = store.Close()
+
+	db, err := openServerDB(path)
+	if err != nil {
+		t.Fatalf("open sqlite database failed: %v", err)
+	}
+	oldConfig := `{"bind_ip":"127.0.0.1","port":19080,"auth":{"type":"username_password","username":"alice","password_hash":"$argon2id$test"}}`
+	if _, err := db.Exec(`UPDATE tunnels SET ingress_config = ? WHERE id = ?`, oldConfig, "socks5-backfill"); err != nil {
+		t.Fatalf("simulate old socks5 ingress_config: %v", err)
+	}
+	_ = db.Close()
+
+	reloaded := newTestTunnelStoreAt(t, path)
+	stored, ok := reloaded.GetTunnel("client-1", "socks5-backfill")
+	if !ok {
+		t.Fatal("expected backfilled tunnel")
+	}
+	var cfg protocol.SOCKS5ListenConfig
+	if err := json.Unmarshal(stored.Ingress.Config, &cfg); err != nil {
+		t.Fatalf("decode backfilled socks5 ingress config: %v", err)
+	}
+	if cfg.Auth.Username != "alice" || cfg.Auth.PasswordHash != "$argon2id$test" {
+		t.Fatalf("SOCKS5 auth was not preserved: %+v", cfg.Auth)
+	}
+	if got, want := strings.Join(cfg.AllowedSourceCIDRs, ","), "0.0.0.0/0,::/0"; got != want {
+		t.Fatalf("backfilled socks5 source CIDRs: got %q want %q", got, want)
+	}
+}
+
+func queryTunnelIngressConfig(t *testing.T, path, id string) string {
+	t.Helper()
+	db, err := openServerDB(path)
+	if err != nil {
+		t.Fatalf("open raw sqlite database failed: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	var raw string
+	if err := db.QueryRow(`SELECT ingress_config FROM tunnels WHERE id = ?`, id).Scan(&raw); err != nil {
+		t.Fatalf("query ingress_config: %v", err)
+	}
+	return raw
 }
 
 func newTestTunnelStoreAt(t *testing.T, path string) *TunnelStore {
