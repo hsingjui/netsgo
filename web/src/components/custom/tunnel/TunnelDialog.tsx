@@ -43,6 +43,8 @@ import { i18n } from '@/i18n';
 import { useTranslation } from 'react-i18next';
 import { getInitialTunnelFormState, type TunnelDialogEditData } from './tunnel-dialog-form';
 import {
+  getDefaultSourceCidrs,
+  isDefaultSourceCidrs,
   preserveLoopbackSourceCIDRsOnFirstRestriction,
   shouldWarnMissingLoopbackSourceCIDRs,
 } from '@/lib/source-cidrs';
@@ -343,7 +345,7 @@ function TunnelDialogForm({
   const [socks5TargetPorts, setSocks5TargetPorts] = useState(initialForm.socks5TargetPorts);
   const [socks5DialTimeout, setSocks5DialTimeout] = useState(initialForm.socks5DialTimeout);
   const [confirmNoAuthRisk, setConfirmNoAuthRisk] = useState(initialForm.confirmNoAuthRisk);
-  const [advancedOpen, setAdvancedOpen] = useState(initialForm.type === 'socks5');
+  const [advancedOpen, setAdvancedOpen] = useState(false);
 
   const clients = props.clients ?? [];
   const selectedTargetClientId = targetClientId || (props.mode === 'create' ? props.clientId : props.tunnel?.target?.client_id ?? props.tunnel?.owner_client_id ?? props.tunnel?.clientId ?? '');
@@ -701,6 +703,9 @@ function TunnelDialogForm({
               onSelect={() => {
                 clearMutationFeedback();
                 setTopology('server_expose');
+                if (isSocks5 && isDefaultSourceCidrs(sourceCidrs)) {
+                  setSourceCidrs(getDefaultSourceCidrs(type, 'server_expose'));
+                }
               }}
             />
             <ClientToClientTopologyButton
@@ -716,6 +721,9 @@ function TunnelDialogForm({
                 clearMutationFeedback();
                 setTopology('client_to_client');
                 if (type === 'http') setType('tcp');
+                if (isSocks5 && isDefaultSourceCidrs(sourceCidrs)) {
+                  setSourceCidrs(getDefaultSourceCidrs(type, 'client_to_client'));
+                }
               }}
             />
           </div>
@@ -795,8 +803,8 @@ function TunnelDialogForm({
                   onClick={() => {
                     clearMutationFeedback();
                     setType(opt.value);
-                    if (opt.value === 'socks5') {
-                      setAdvancedOpen(true);
+                    if (isDefaultSourceCidrs(sourceCidrs)) {
+                      setSourceCidrs(getDefaultSourceCidrs(opt.value, topology));
                     }
                   }}
                 >
@@ -893,7 +901,7 @@ function TunnelDialogForm({
               </div>
             )}
             <div className="space-y-1.5">
-              <label className="text-sm font-medium">{isClientToClient ? t('tunnels.bindPort') : t('tunnels.publicPort')}</label>
+              <label className="block text-sm font-medium">{isClientToClient ? t('tunnels.bindPort') : t('tunnels.publicPort')}</label>
               <Input
                 aria-label={isClientToClient ? t('tunnels.bindPort') : t('tunnels.publicPort')}
                 type="number"
@@ -1023,7 +1031,7 @@ function TunnelDialogForm({
               {isSocks5 && (
                 <div className="space-y-3">
                   <div className="space-y-1.5">
-                    <label className="text-sm font-medium">{t('tunnels.socks5DialTimeout')}</label>
+                    <label className="block text-sm font-medium">{t('tunnels.socks5DialTimeout')}</label>
                     <Input
                       aria-label={t('tunnels.socks5DialTimeout')}
                       type="number"
@@ -1059,7 +1067,7 @@ function TunnelDialogForm({
                       <label className="text-sm font-medium">{t('tunnels.socks5TargetPorts')}</label>
                       <Input
                         aria-label={t('tunnels.socks5TargetPorts')}
-                        placeholder="443, 8080"
+                        placeholder={t('tunnels.socks5TargetPortsPlaceholder')}
                         value={socks5TargetPorts}
                         onChange={(e) => {
                           clearMutationFeedback();

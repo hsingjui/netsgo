@@ -217,6 +217,7 @@ export const zhCN = {
     socks5TargetCidrs: '允许目标 CIDR',
     socks5TargetHosts: '允许目标主机',
     socks5TargetPorts: '允许目标端口',
+    socks5TargetPortsPlaceholder: '默认允许所有',
     socks5TargetHostsHelp: '按域名或 IP 精确匹配的目标白名单，多个用逗号分隔；留空表示不额外按主机限制。',
     socks5TargetHelp: '限制该 SOCKS5 代理可访问的目标范围（出口白名单）；目标 CIDR 留空等于放通全部目标。',
     socks5DialTimeout: '拨号超时（秒）',

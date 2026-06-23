@@ -215,6 +215,7 @@ export const enUS = {
     socks5TargetCidrs: 'Allowed target CIDRs',
     socks5TargetHosts: 'Allowed target hosts',
     socks5TargetPorts: 'Allowed target ports',
+    socks5TargetPortsPlaceholder: 'Allow all by default',
     socks5TargetHostsHelp: 'Allowlist of target hostnames or IPs matched exactly, comma-separated; leave blank to not restrict by host.',
     socks5TargetHelp: 'Restrict which targets this SOCKS5 proxy may reach (egress allowlist); leaving target CIDRs blank allows all targets.',
     socks5DialTimeout: 'Dial timeout (s)',
