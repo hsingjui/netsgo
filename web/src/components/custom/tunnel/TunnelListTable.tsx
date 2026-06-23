@@ -247,7 +247,7 @@ export function TunnelListTable({
         {tunnels.length > 0 ? (
           filteredTunnels.length > 0 ? (
             <div className="overflow-x-auto [scrollbar-width:thin]">
-              <table className="min-w-[56rem] w-full table-fixed text-left text-sm">
+              <table className="min-w-[56rem] w-full text-left text-sm">
                 <thead className="text-xs text-muted-foreground bg-muted/30 uppercase">
                   <tr>
                     <th className="w-[150px] whitespace-nowrap px-4 py-3 font-medium sm:px-6">{t('tunnels.tunnel')}</th>
@@ -586,7 +586,7 @@ function TunnelStatusBadge({
     <div className="flex flex-col gap-1 items-start">
       <Badge variant="outline" className={cn(badgeClassName, 'px-2 sm:px-2.5')} aria-label={statusLabel}>
         <span className={dotClassName} />
-        <span className="hidden sm:inline">{statusLabel}</span>
+        <span className="whitespace-nowrap">{statusLabel}</span>
         {additionalIssueCount > 0 && (
           <span className="rounded bg-background/70 px-1 font-mono text-[10px]">+{additionalIssueCount}</span>
         )}
@@ -604,10 +604,10 @@ function TunnelStatusBadge({
         )}
       </Badge>
       {issueSummary && (
-        <p className="hidden max-w-[18rem] truncate text-[11px] text-destructive sm:block">{issueSummary}</p>
+        <p className="max-w-[18rem] truncate text-[11px] text-destructive">{issueSummary}</p>
       )}
       {statusDescription && issueItems.length === 0 && (status.key !== 'error' || !error) && (
-        <p className="hidden text-[11px] text-muted-foreground sm:block">{statusDescription}</p>
+        <p className="text-[11px] text-muted-foreground">{statusDescription}</p>
       )}
     </div>
   );
