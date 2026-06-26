@@ -1,4 +1,4 @@
-.PHONY: build build-web build-go build-desktop-sidecar build-desktop build-desktop-macos-local sign-desktop-macos-app package-desktop-macos-local clean docs dev-server dev-client dev-bench dev-web test test-race lint test-system-e2e test-system-e2e-nginx test-system-e2e-caddy test-playwright-e2e test-playwright-e2e-smoke test-playwright-e2e-full test-playwright-e2e-cdp test-playwright-e2e-cdp-smoke test-playwright-e2e-cdp-full test-playwright-e2e-cdp-run test-playwright-e2e-cdp-check test-playwright-e2e-run bench-data system-e2e-up system-e2e-logs system-e2e-down system-e2e-clean
+.PHONY: build build-web build-go build-desktop-sidecar build-desktop build-desktop-macos-local sign-desktop-macos-app package-desktop-macos-local clean docs dev-server dev-client dev-bench dev-web test test-race lint test-tdd-red test-tdd-red-client test-tdd-red-server test-system-e2e test-system-e2e-nginx test-system-e2e-caddy test-playwright-e2e test-playwright-e2e-smoke test-playwright-e2e-full test-playwright-e2e-cdp test-playwright-e2e-cdp-smoke test-playwright-e2e-cdp-full test-playwright-e2e-cdp-run test-playwright-e2e-cdp-check test-playwright-e2e-run bench-data system-e2e-up system-e2e-logs system-e2e-down system-e2e-clean docker-build-e2e-current docker-build-e2e-stable test-baseline-e2e test-compat-e2e test-upgrade-e2e
 
 # 编译输出目录
 BIN_DIR=bin
@@ -95,6 +95,8 @@ E2E_PROXY ?= nginx
 E2E_PROJECT ?= netsgo-system-$(E2E_PROXY)
 E2E_PROXY_PORT ?= 19080
 E2E_UPSTREAM_PORT ?= 19081
+E2E_SERVER_TCP_PORT ?= 19093
+E2E_SERVER_UDP_PORT ?= 19094
 E2E_SERVER_SOCKS5_PORT ?= 19095
 E2E_C2C_SOCKS5_PORT ?= 19096
 E2E_C2C_SOCKS5_DENY_PORT ?= 19097
@@ -110,6 +112,8 @@ E2E_PORT_ENV = \
 	NETSGO_E2E_DIR=$(CURDIR) \
 	PROXY_PORT=$(E2E_PROXY_PORT) \
 	UPSTREAM_PORT=$(E2E_UPSTREAM_PORT) \
+	SERVER_TCP_PORT=$(E2E_SERVER_TCP_PORT) \
+	SERVER_UDP_PORT=$(E2E_SERVER_UDP_PORT) \
 	SERVER_SOCKS5_PORT=$(E2E_SERVER_SOCKS5_PORT) \
 	C2C_SOCKS5_PORT=$(E2E_C2C_SOCKS5_PORT) \
 	C2C_SOCKS5_DENY_PORT=$(E2E_C2C_SOCKS5_DENY_PORT) \
@@ -168,6 +172,14 @@ test:
 test-race:
 	go test -race ./...
 
+test-tdd-red: test-tdd-red-client test-tdd-red-server
+
+test-tdd-red-client:
+	NETSGO_TDD_RED=1 go test ./internal/client -run 'TestClient_HandleStream_Fixed(TCP|UDP|HTTP)Target|TestClientControlLoopUnifiedPayloadIgnoresLegacyFlatFields|TestUnifiedClientRuntime(DoesNotCallProxyRequestFromTunnelSpec|DefinesFixedTargetStore)|TestClientCleanupClearsFixedTargetRuntimes|TestClientHandleStreamUsesFixedTargetRuntimes|TestClientHandleTunnelUnprovisionUsesFixedTargetRuntimes|TestClientTunnelProvisionFixed(TCP|UDP)TargetDoesNotRegisterLegacyProxy|TestClientTunnelProvisionUnsupportedTargetRejectsWithoutRuntime' -count=1
+
+test-tdd-red-server:
+	NETSGO_TDD_RED=1 go test ./internal/server -run 'TestUnifiedHTTPHostDispatchRoutesByIngressEndpointDomain|TestUnifiedReconcileRegistry(SerializesSameTunnelAndRerunsDirty|CoalescesMultipleDirtyCallsIntoSingleRerun)|TestUnifiedServerExpose(RuntimeDoesNotReadStoredProxyNewRequest|ReconcileRejectsStaleProvisionAckAfterRevisionAdvance|RejectedProvisionLeavesNoListenerOrAckWaiter)' -count=1
+
 lint:
 	cd web && bun run lint
 
@@ -188,7 +200,7 @@ test-system-e2e-run:
 	NETSGO_ADMIN_PASS="$${admin_pass}" \
 	NETSGO_E2E_COMPOSE_PROJECT=$(E2E_PROJECT) \
 	NETSGO_E2E_COMPOSE_FILES=$(E2E_BASE_COMPOSE),$(E2E_PROXY_COMPOSE) \
-	go test -tags=e2e ./test/e2e -run TestSystemE2E -count=1 -timeout 15m
+	go test -tags=e2e ./test/e2e -run 'TestSystem.*E2E' -count=1 -timeout 20m
 
 test-playwright-e2e: test-playwright-e2e-smoke
 
@@ -275,3 +287,102 @@ system-e2e-down:
 
 system-e2e-clean:
 	$(E2E_PORT_ENV) NETSGO_ADMIN_PASS="$${NETSGO_ADMIN_PASS:-unused-for-compose-command}" docker compose -f $(E2E_BASE_COMPOSE) -f $(E2E_PROXY_COMPOSE) -p $(E2E_PROJECT) down -v --remove-orphans
+
+# ========== Compatibility / Upgrade E2E ==========
+
+COMPAT_BASELINE ?= v0.1.8
+E2E_CURRENT_IMAGE ?= netsgo-e2e:current
+E2E_STABLE_IMAGE ?= netsgo-e2e:$(COMPAT_BASELINE)
+COMPAT_MODE ?= full
+COMPAT_ABORT_ON_FAILURE ?= false
+BASELINE_MODE ?= full
+BASELINE_REBUILD_IMAGE ?= false
+UPGRADE_RECOVERY_TIMEOUT_SECONDS ?= 120
+
+docker-build-e2e-current: build-web
+	@echo "Building e2e image $(E2E_CURRENT_IMAGE) from current code..."
+	docker buildx build --load --target e2e \
+		--build-arg NETSGO_VERSION=$(VERSION) \
+		--build-arg NETSGO_COMMIT=$(COMMIT) \
+		--build-arg NETSGO_DATE=$(DATE) \
+		-t $(E2E_CURRENT_IMAGE) .
+
+docker-build-e2e-stable:
+	@bash $(CURDIR)/test/e2e/scripts/build-e2e-stable.sh "$(COMPAT_BASELINE)" "$(E2E_STABLE_IMAGE)"
+
+test-baseline-e2e:
+	@E2E_PROXY="$(E2E_PROXY)" \
+	E2E_PROJECT="$(E2E_PROJECT)" \
+	E2E_BASE_COMPOSE="$(E2E_BASE_COMPOSE)" \
+	E2E_PROXY_COMPOSE="$(E2E_PROXY_COMPOSE)" \
+	PROXY_PORT="$(E2E_PROXY_PORT)" \
+	UPSTREAM_PORT="$(E2E_UPSTREAM_PORT)" \
+	SERVER_TCP_PORT="$(E2E_SERVER_TCP_PORT)" \
+	SERVER_UDP_PORT="$(E2E_SERVER_UDP_PORT)" \
+	SERVER_SOCKS5_PORT="$(E2E_SERVER_SOCKS5_PORT)" \
+	C2C_SOCKS5_PORT="$(E2E_C2C_SOCKS5_PORT)" \
+	C2C_SOCKS5_DENY_PORT="$(E2E_C2C_SOCKS5_DENY_PORT)" \
+	C2C_TCP_PORT="$(E2E_C2C_TCP_PORT)" \
+	C2C_TCP_ALT_PORT="$(E2E_C2C_TCP_ALT_PORT)" \
+	C2C_TCP_SLOW_PORT="$(E2E_C2C_TCP_SLOW_PORT)" \
+	C2C_UDP_PORT="$(E2E_C2C_UDP_PORT)" \
+	C2C_SOCKS5_AUTH_PORT="$(E2E_C2C_SOCKS5_AUTH_PORT)" \
+	C2C_SOCKS5_SOURCE_DENY_PORT="$(E2E_C2C_SOCKS5_SOURCE_DENY_PORT)" \
+	COMPAT_BASELINE="$(COMPAT_BASELINE)" \
+	E2E_STABLE_IMAGE="$(E2E_STABLE_IMAGE)" \
+	BASELINE_MODE="$(BASELINE_MODE)" \
+	BASELINE_REBUILD_IMAGE="$(BASELINE_REBUILD_IMAGE)" \
+	NETSGO_E2E_DIR="$(CURDIR)" \
+	bash $(CURDIR)/test/e2e/scripts/test-baseline.sh
+
+test-compat-e2e:
+	@E2E_PROXY="$(E2E_PROXY)" \
+	E2E_PROJECT="$(E2E_PROJECT)" \
+	E2E_BASE_COMPOSE="$(E2E_BASE_COMPOSE)" \
+	E2E_PROXY_COMPOSE="$(E2E_PROXY_COMPOSE)" \
+	PROXY_PORT="$(E2E_PROXY_PORT)" \
+	UPSTREAM_PORT="$(E2E_UPSTREAM_PORT)" \
+	SERVER_TCP_PORT="$(E2E_SERVER_TCP_PORT)" \
+	SERVER_UDP_PORT="$(E2E_SERVER_UDP_PORT)" \
+	SERVER_SOCKS5_PORT="$(E2E_SERVER_SOCKS5_PORT)" \
+	C2C_SOCKS5_PORT="$(E2E_C2C_SOCKS5_PORT)" \
+	C2C_SOCKS5_DENY_PORT="$(E2E_C2C_SOCKS5_DENY_PORT)" \
+	C2C_TCP_PORT="$(E2E_C2C_TCP_PORT)" \
+	C2C_TCP_ALT_PORT="$(E2E_C2C_TCP_ALT_PORT)" \
+	C2C_TCP_SLOW_PORT="$(E2E_C2C_TCP_SLOW_PORT)" \
+	C2C_UDP_PORT="$(E2E_C2C_UDP_PORT)" \
+	C2C_SOCKS5_AUTH_PORT="$(E2E_C2C_SOCKS5_AUTH_PORT)" \
+	C2C_SOCKS5_SOURCE_DENY_PORT="$(E2E_C2C_SOCKS5_SOURCE_DENY_PORT)" \
+	COMPAT_BASELINE="$(COMPAT_BASELINE)" \
+	E2E_CURRENT_IMAGE="$(E2E_CURRENT_IMAGE)" \
+	E2E_STABLE_IMAGE="$(E2E_STABLE_IMAGE)" \
+	COMPAT_MODE="$(COMPAT_MODE)" \
+	COMPAT_ABORT_ON_FAILURE="$(COMPAT_ABORT_ON_FAILURE)" \
+	NETSGO_E2E_DIR="$(CURDIR)" \
+	bash $(CURDIR)/test/e2e/scripts/test-compat.sh
+
+test-upgrade-e2e:
+	@E2E_PROXY="$(E2E_PROXY)" \
+	E2E_PROJECT="$(E2E_PROJECT)" \
+	E2E_BASE_COMPOSE="$(E2E_BASE_COMPOSE)" \
+	E2E_PROXY_COMPOSE="$(E2E_PROXY_COMPOSE)" \
+	PROXY_PORT="$(E2E_PROXY_PORT)" \
+	UPSTREAM_PORT="$(E2E_UPSTREAM_PORT)" \
+	SERVER_TCP_PORT="$(E2E_SERVER_TCP_PORT)" \
+	SERVER_UDP_PORT="$(E2E_SERVER_UDP_PORT)" \
+	SERVER_SOCKS5_PORT="$(E2E_SERVER_SOCKS5_PORT)" \
+	C2C_SOCKS5_PORT="$(E2E_C2C_SOCKS5_PORT)" \
+	C2C_SOCKS5_DENY_PORT="$(E2E_C2C_SOCKS5_DENY_PORT)" \
+	C2C_TCP_PORT="$(E2E_C2C_TCP_PORT)" \
+	C2C_TCP_ALT_PORT="$(E2E_C2C_TCP_ALT_PORT)" \
+	C2C_TCP_SLOW_PORT="$(E2E_C2C_TCP_SLOW_PORT)" \
+	C2C_UDP_PORT="$(E2E_C2C_UDP_PORT)" \
+	C2C_SOCKS5_AUTH_PORT="$(E2E_C2C_SOCKS5_AUTH_PORT)" \
+	C2C_SOCKS5_SOURCE_DENY_PORT="$(E2E_C2C_SOCKS5_SOURCE_DENY_PORT)" \
+	COMPAT_BASELINE="$(COMPAT_BASELINE)" \
+	E2E_CURRENT_IMAGE="$(E2E_CURRENT_IMAGE)" \
+	E2E_STABLE_IMAGE="$(E2E_STABLE_IMAGE)" \
+	NETSGO_E2E_TOOLS_IMAGE="$(E2E_STABLE_IMAGE)" \
+	UPGRADE_RECOVERY_TIMEOUT_SECONDS="$(UPGRADE_RECOVERY_TIMEOUT_SECONDS)" \
+	NETSGO_E2E_DIR="$(CURDIR)" \
+	bash $(CURDIR)/test/e2e/scripts/test-upgrade.sh

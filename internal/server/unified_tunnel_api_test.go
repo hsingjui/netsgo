@@ -837,6 +837,144 @@ func TestStoredTunnelViewConfigBackfillsMissingSourceCIDRs(t *testing.T) {
 	}
 }
 
+func TestSpecFromStoredTunnelPrefersEndpointConfigOverLegacyFlatFields(t *testing.T) {
+	s, _, _, cleanup := setupTestServerWithStores(t, true)
+	defer cleanup()
+
+	stored := StoredTunnel{
+		ProxyNewRequest: protocol.ProxyNewRequest{
+			ID:         "endpoint-priority",
+			Name:       "endpoint-priority",
+			Type:       protocol.ProxyTypeHTTP,
+			Domain:     "flat.example.com",
+			LocalIP:    "127.0.0.10",
+			LocalPort:  10010,
+			RemotePort: 18080,
+		},
+		ClientID:        "target-client",
+		OwnerClientID:   "target-client",
+		Binding:         TunnelBindingClientID,
+		Revision:        7,
+		Topology:        TunnelTopologyServerExpose,
+		DesiredState:    protocol.ProxyDesiredStateRunning,
+		RuntimeState:    protocol.ProxyRuntimeStateOffline,
+		TransportPolicy: protocol.TransportPolicyServerRelayOnly,
+		ActualTransport: protocol.ActualTransportUnknown,
+		P2P:             P2PState{State: TunnelP2PStateIdle},
+		Ingress: EndpointSpec{
+			Location: protocol.EndpointLocationServer,
+			Type:     protocol.IngressTypeHTTPHost,
+			Config: mustRawJSON(httpHostConfigAPI{
+				Domain:             "endpoint.example.com",
+				AllowedSourceCIDRs: allowAllSourceCIDRs(),
+				Auth:               protocol.HTTPAuthConfig{Type: protocol.HTTPAuthTypeNone},
+			}),
+		},
+		Target: EndpointSpec{
+			Location: protocol.EndpointLocationClient,
+			ClientID: "target-client",
+			Type:     protocol.TargetTypeTCPService,
+			Config:   mustRawJSON(serviceConfigAPI{Host: "10.20.30.40", Port: 2040}),
+		},
+		CreatedAt: time.Now().UTC(),
+		UpdatedAt: time.Now().UTC(),
+	}
+	if err := stored.normalize(); err != nil {
+		t.Fatalf("normalize stored tunnel: %v", err)
+	}
+
+	spec := specFromStoredTunnel(stored, s)
+	var ingress httpHostConfigAPI
+	if err := json.Unmarshal(spec.Ingress.Config, &ingress); err != nil {
+		t.Fatalf("decode spec ingress config: %v", err)
+	}
+	if ingress.Domain != "endpoint.example.com" {
+		t.Fatalf("spec ingress domain should come from endpoint config, got %q", ingress.Domain)
+	}
+	var target serviceConfigAPI
+	if err := json.Unmarshal(spec.Target.Config, &target); err != nil {
+		t.Fatalf("decode spec target config: %v", err)
+	}
+	if target.Host != "10.20.30.40" || target.Port != 2040 {
+		t.Fatalf("spec target should come from endpoint config, got %+v", target)
+	}
+
+	view := s.storedTunnelViewConfig(stored)
+	if view.Ingress == nil || view.Target == nil {
+		t.Fatalf("view should include endpoint specs: %+v", view)
+	}
+	var viewIngress httpHostConfigAPI
+	if err := json.Unmarshal(view.Ingress.Config, &viewIngress); err != nil {
+		t.Fatalf("decode view ingress config: %v", err)
+	}
+	if viewIngress.Domain != "endpoint.example.com" {
+		t.Fatalf("view ingress domain should come from endpoint config, got %q", viewIngress.Domain)
+	}
+	var viewTarget serviceConfigAPI
+	if err := json.Unmarshal(view.Target.Config, &viewTarget); err != nil {
+		t.Fatalf("decode view target config: %v", err)
+	}
+	if viewTarget.Host != "10.20.30.40" || viewTarget.Port != 2040 {
+		t.Fatalf("view target should come from endpoint config, got %+v", viewTarget)
+	}
+}
+
+func TestSpecFromStoredTunnelBackfillsMissingEndpointsFromLegacyFlatFields(t *testing.T) {
+	s, _, _, cleanup := setupTestServerWithStores(t, true)
+	defer cleanup()
+
+	stored := StoredTunnel{
+		ProxyNewRequest: protocol.ProxyNewRequest{
+			ID:        "flat-backfill",
+			Name:      "flat-backfill",
+			Type:      protocol.ProxyTypeHTTP,
+			Domain:    "flat.example.com",
+			LocalIP:   "127.0.0.44",
+			LocalPort: 18044,
+		},
+		ClientID:        "target-client",
+		OwnerClientID:   "target-client",
+		Binding:         TunnelBindingClientID,
+		Revision:        3,
+		Topology:        TunnelTopologyServerExpose,
+		DesiredState:    protocol.ProxyDesiredStateRunning,
+		RuntimeState:    protocol.ProxyRuntimeStateOffline,
+		TransportPolicy: protocol.TransportPolicyServerRelayOnly,
+		ActualTransport: protocol.ActualTransportUnknown,
+		P2P:             P2PState{State: TunnelP2PStateIdle},
+		CreatedAt:       time.Now().UTC(),
+		UpdatedAt:       time.Now().UTC(),
+	}
+	if err := stored.normalize(); err != nil {
+		t.Fatalf("normalize stored tunnel: %v", err)
+	}
+
+	spec := specFromStoredTunnel(stored, s)
+	if spec.Ingress.Type != protocol.IngressTypeHTTPHost {
+		t.Fatalf("backfilled ingress type: got %q", spec.Ingress.Type)
+	}
+	var ingress httpHostConfigAPI
+	if err := json.Unmarshal(spec.Ingress.Config, &ingress); err != nil {
+		t.Fatalf("decode backfilled ingress config: %v", err)
+	}
+	if ingress.Domain != "flat.example.com" {
+		t.Fatalf("backfilled ingress domain: got %q", ingress.Domain)
+	}
+	if spec.Target.Type != protocol.TargetTypeTCPService {
+		t.Fatalf("backfilled target type: got %q", spec.Target.Type)
+	}
+	var target serviceConfigAPI
+	if err := json.Unmarshal(spec.Target.Config, &target); err != nil {
+		t.Fatalf("decode backfilled target config: %v", err)
+	}
+	if target.Host != "127.0.0.44" && target.IP != "127.0.0.44" {
+		t.Fatalf("backfilled target host/ip: got %+v", target)
+	}
+	if target.Port != 18044 {
+		t.Fatalf("backfilled target port: got %d", target.Port)
+	}
+}
+
 func TestAPI_UnifiedTunnelHTTPBasicAuthHashesAndRedacts(t *testing.T) {
 	s, handler, token, cleanup := setupTestServerWithStores(t, true)
 	defer cleanup()
@@ -2883,11 +3021,21 @@ func TestAPI_UnifiedTunnelRejectsServerExposeUnsupportedTargetCapability(t *test
 	if err != nil {
 		t.Fatalf("create client: %v", err)
 	}
+	client := &ClientConn{ID: record.ID, generation: 1, state: clientStateLive, proxies: make(map[string]*ProxyTunnel)}
+	client.SetInfo(protocol.ClientInfo{
+		Hostname:     "server-expose-no-tcp",
+		OS:           "linux",
+		Arch:         "amd64",
+		Version:      "0.1.0",
+		Capabilities: &caps,
+	})
+	s.clients.Store(record.ID, client)
 
+	port := reserveTCPPort(t)
 	body := []byte(`{
 		"name":"server-expose-unsupported-target",
 		"topology":"server_expose",
-		"ingress":{"location":"server","type":"tcp_listen","config":{"bind_ip":"0.0.0.0","port":` + strconv.Itoa(reserveTCPPort(t)) + `,"allowed_source_cidrs":["0.0.0.0/0","::/0"]}},
+		"ingress":{"location":"server","type":"tcp_listen","config":{"bind_ip":"0.0.0.0","port":` + strconv.Itoa(port) + `,"allowed_source_cidrs":["0.0.0.0/0","::/0"]}},
 		"target":{"location":"client","client_id":"` + record.ID + `","type":"tcp_service","config":{"ip":"127.0.0.1","port":22}},
 		"transport_policy":"server_relay_only"
 	}`)
@@ -2902,6 +3050,180 @@ func TestAPI_UnifiedTunnelRejectsServerExposeUnsupportedTargetCapability(t *test
 	if bodyResp.ErrorCode != protocol.TunnelMutationErrorCodeCapabilityNotSupported || bodyResp.Field != "target.type" {
 		t.Fatalf("capability error mismatch: %+v", bodyResp)
 	}
+	if _, err := s.store.GetTunnelE(record.ID, "server-expose-unsupported-target"); !errors.Is(err, ErrTunnelNotFound) {
+		t.Fatalf("unsupported capability reject must not persist config, got err=%v", err)
+	}
+	if _, exists := client.proxies["server-expose-unsupported-target"]; exists {
+		t.Fatal("unsupported capability reject must not create server-expose runtime")
+	}
+	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
+	if err != nil {
+		t.Fatalf("unsupported capability reject must not leave tcp listener on port %d: %v", port, err)
+	}
+	mustClose(t, ln)
+}
+
+func TestAPI_UnifiedTunnelRejectsServerExposeUnsupportedIngressTypeWithoutResidualState(t *testing.T) {
+	s, handler, token, cleanup := setupTestServerWithStores(t, true)
+	defer cleanup()
+
+	record, err := s.auth.adminStore.GetOrCreateClient("install-server-expose-unknown-ingress", protocol.ClientInfo{
+		Hostname: "server-expose-unknown-ingress",
+		OS:       "linux",
+		Arch:     "amd64",
+		Version:  "0.1.0",
+	}, "127.0.0.1:12345")
+	if err != nil {
+		t.Fatalf("create client: %v", err)
+	}
+	client := &ClientConn{ID: record.ID, generation: 1, state: clientStateLive, proxies: make(map[string]*ProxyTunnel)}
+	client.SetInfo(protocol.ClientInfo{
+		Hostname: "server-expose-unknown-ingress",
+		OS:       "linux",
+		Arch:     "amd64",
+		Version:  "0.1.0",
+	})
+	s.clients.Store(record.ID, client)
+
+	port := reserveTCPPort(t)
+	body := []byte(`{
+		"name":"server-expose-unsupported-ingress",
+		"topology":"server_expose",
+		"ingress":{"location":"server","type":"future_ingress","config":{"bind_ip":"0.0.0.0","port":` + strconv.Itoa(port) + `,"allowed_source_cidrs":["0.0.0.0/0","::/0"]}},
+		"target":{"location":"client","client_id":"` + record.ID + `","type":"tcp_service","config":{"ip":"127.0.0.1","port":22}},
+		"transport_policy":"server_relay_only"
+	}`)
+	resp := doMuxRequest(t, handler, http.MethodPost, "/api/tunnels", token, body)
+	if resp.Code != http.StatusBadRequest {
+		t.Fatalf("unsupported server-expose ingress type: want 400, got %d body=%s", resp.Code, resp.Body.String())
+	}
+	var bodyResp tunnelMutationErrorResponse
+	if err := mustDecodeJSON(t, resp.Body, &bodyResp); err != nil {
+		t.Fatalf("decode error: %v", err)
+	}
+	if bodyResp.ErrorCode != protocol.TunnelMutationErrorCodeUnsupportedEndpointType || bodyResp.Field != "ingress.type" {
+		t.Fatalf("unsupported ingress error mismatch: %+v", bodyResp)
+	}
+	if _, err := s.store.GetTunnelE(record.ID, "server-expose-unsupported-ingress"); !errors.Is(err, ErrTunnelNotFound) {
+		t.Fatalf("unsupported ingress reject must not persist config, got err=%v", err)
+	}
+	if _, exists := client.proxies["server-expose-unsupported-ingress"]; exists {
+		t.Fatal("unsupported ingress reject must not create server-expose runtime")
+	}
+	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
+	if err != nil {
+		t.Fatalf("unsupported ingress reject must not leave tcp listener on port %d: %v", port, err)
+	}
+	mustClose(t, ln)
+}
+
+func TestAPI_UnifiedTunnelUpdateRejectsServerExposeUnsupportedTargetCapabilityWithoutResidualState(t *testing.T) {
+	s, handler, token, cleanup := setupTestServerWithStores(t, true)
+	defer cleanup()
+
+	caps := protocol.DefaultClientCapabilities()
+	record, err := s.auth.adminStore.GetOrCreateClient("install-server-expose-update-no-tcp", protocol.ClientInfo{
+		Hostname:     "server-expose-update-no-tcp",
+		OS:           "linux",
+		Arch:         "amd64",
+		Version:      "0.1.0",
+		Capabilities: &caps,
+	}, "127.0.0.1:12345")
+	if err != nil {
+		t.Fatalf("create client: %v", err)
+	}
+
+	oldPort := reserveTCPPort(t)
+	create := []byte(`{
+		"name":"server-expose-update-unsupported-target",
+		"topology":"server_expose",
+		"ingress":{"location":"server","type":"tcp_listen","config":{"bind_ip":"0.0.0.0","port":` + strconv.Itoa(oldPort) + `,"allowed_source_cidrs":["0.0.0.0/0","::/0"]}},
+		"target":{"location":"client","client_id":"` + record.ID + `","type":"tcp_service","config":{"ip":"127.0.0.1","port":22}},
+		"transport_policy":"server_relay_only"
+	}`)
+	resp := doMuxRequest(t, handler, http.MethodPost, "/api/tunnels", token, create)
+	if resp.Code != http.StatusCreated {
+		t.Fatalf("create server-expose tunnel: want 201, got %d body=%s", resp.Code, resp.Body.String())
+	}
+	var created tunnelSpecAPI
+	if err := mustDecodeJSON(t, resp.Body, &created); err != nil {
+		t.Fatalf("decode created tunnel: %v", err)
+	}
+	before, err := s.store.GetTunnelByIDE(record.ID, created.ID)
+	if err != nil {
+		t.Fatalf("load created tunnel: %v", err)
+	}
+	client := &ClientConn{ID: record.ID, generation: 1, state: clientStateLive, proxies: make(map[string]*ProxyTunnel)}
+	client.SetInfo(protocol.ClientInfo{
+		Hostname:     "server-expose-update-no-tcp",
+		OS:           "linux",
+		Arch:         "amd64",
+		Version:      "0.1.0",
+		Capabilities: &caps,
+	})
+	s.clients.Store(record.ID, client)
+	client.proxies[before.Name] = &ProxyTunnel{Config: storedTunnelToProxyConfig(before)}
+
+	caps.TargetTypes = []string{protocol.TargetTypeUDPService}
+	client.SetInfo(protocol.ClientInfo{
+		Hostname:     "server-expose-update-no-tcp",
+		OS:           "linux",
+		Arch:         "amd64",
+		Version:      "0.1.0",
+		Capabilities: &caps,
+	})
+	_, err = s.auth.adminStore.GetOrCreateClient("install-server-expose-update-no-tcp", protocol.ClientInfo{
+		Hostname:     "server-expose-update-no-tcp",
+		OS:           "linux",
+		Arch:         "amd64",
+		Version:      "0.1.0",
+		Capabilities: &caps,
+	}, "127.0.0.1:12345")
+	if err != nil {
+		t.Fatalf("update client capabilities: %v", err)
+	}
+
+	newPort := reserveTCPPort(t)
+	update := []byte(`{"expected_revision":` + strconv.FormatInt(created.Revision, 10) + `,"spec":{
+		"name":"server-expose-update-unsupported-target",
+		"topology":"server_expose",
+		"ingress":{"location":"server","type":"tcp_listen","config":{"bind_ip":"0.0.0.0","port":` + strconv.Itoa(newPort) + `,"allowed_source_cidrs":["0.0.0.0/0","::/0"]}},
+		"target":{"location":"client","client_id":"` + record.ID + `","type":"tcp_service","config":{"ip":"127.0.0.1","port":2222}},
+		"transport_policy":"server_relay_only"
+	}}`)
+	resp = doMuxRequest(t, handler, http.MethodPut, "/api/tunnels/"+created.ID, token, update)
+	if resp.Code != http.StatusBadRequest {
+		t.Fatalf("unsupported capability update: want 400, got %d body=%s", resp.Code, resp.Body.String())
+	}
+	var bodyResp tunnelMutationErrorResponse
+	if err := mustDecodeJSON(t, resp.Body, &bodyResp); err != nil {
+		t.Fatalf("decode update error: %v", err)
+	}
+	if bodyResp.ErrorCode != protocol.TunnelMutationErrorCodeCapabilityNotSupported || bodyResp.Field != "target.type" {
+		t.Fatalf("capability update error mismatch: %+v", bodyResp)
+	}
+
+	after, err := s.store.GetTunnelByIDE(record.ID, created.ID)
+	if err != nil {
+		t.Fatalf("reload tunnel after rejected update: %v", err)
+	}
+	if after.Revision != before.Revision || after.LocalPort != before.LocalPort || after.RemotePort != before.RemotePort || after.Name != before.Name {
+		t.Fatalf("rejected update mutated stored tunnel:\n before=%+v\n after=%+v", before, after)
+	}
+	if !bytes.Equal(after.Ingress.Config, before.Ingress.Config) || !bytes.Equal(after.Target.Config, before.Target.Config) {
+		t.Fatalf("rejected update mutated endpoint config:\n before=%+v\n after=%+v", before, after)
+	}
+	if got := len(client.proxies); got != 1 {
+		t.Fatalf("rejected update must not replace or add server-expose runtime, got %d runtime(s)", got)
+	}
+	if runtime, ok := client.proxies[before.Name]; !ok || runtime.Config.RemotePort != oldPort {
+		t.Fatalf("old runtime should remain unchanged after rejected update: %+v", runtime)
+	}
+	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", newPort))
+	if err != nil {
+		t.Fatalf("rejected update must not leave tcp listener on new port %d: %v", newPort, err)
+	}
+	mustClose(t, ln)
 }
 
 func TestUnifiedRuntimeReportIgnoresNonServerRelayTransport(t *testing.T) {

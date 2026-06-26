@@ -54,6 +54,8 @@ type systemHarness struct {
 	adminPass               string
 	targetHostname          string
 	ingressHostname         string
+	serverTCPPort           int
+	serverUDPPort           int
 	serverSOCKS5Port        int
 	c2cSOCKS5Port           int
 	c2cDenyPort             int
@@ -100,6 +102,8 @@ func TestSystemE2E(t *testing.T) {
 	var (
 		httpProxyTunnel  tunnelResponse
 		httpDirectTunnel tunnelResponse
+		serverTCP        tunnelResponse
+		serverUDP        tunnelResponse
 		serverSOCKS5     tunnelResponse
 		c2cSOCKS5        tunnelResponse
 		c2cTCP           tunnelResponse
@@ -111,10 +115,12 @@ func TestSystemE2E(t *testing.T) {
 	t.Run("HTTP server_expose works through reverse proxy and direct server", func(t *testing.T) {
 		httpProxyTunnel = h.createHTTPServerExposeTunnel(t, "system-http-proxy", h.tunnelHost, `{"type":"none"}`)
 		h.waitTunnelState(t, httpProxyTunnel.ID, "active", 90*time.Second)
+		h.expectTunnelNoIssues(t, httpProxyTunnel.ID)
 		h.expectHTTPContainsAt(t, h.baseURL, h.tunnelHost, backendResponse, 60*time.Second)
 
 		httpDirectTunnel = h.createHTTPServerExposeTunnel(t, "system-http-direct", h.directTunnelHost, `{"type":"none"}`)
 		h.waitTunnelState(t, httpDirectTunnel.ID, "active", 90*time.Second)
+		h.expectTunnelNoIssues(t, httpDirectTunnel.ID)
 		h.expectHTTPContainsAt(t, h.directBaseURL, h.directTunnelHost, backendResponse, 60*time.Second)
 
 		h.compose(t, h.composeEnv, "restart", "proxy")
@@ -124,14 +130,27 @@ func TestSystemE2E(t *testing.T) {
 	t.Run("HTTP Basic auth protects server_expose route", func(t *testing.T) {
 		tunnel := h.createHTTPServerExposeTunnel(t, "system-http-basic-auth", h.authTunnelHost, `{"type":"basic","username":"alice","password":"secret"}`)
 		h.waitTunnelState(t, tunnel.ID, "active", 90*time.Second)
+		h.expectTunnelNoIssues(t, tunnel.ID)
 		h.expectHTTPStatusAt(t, h.baseURL, h.authTunnelHost, nil, http.StatusUnauthorized, "", 30*time.Second)
 		h.expectHTTPStatusAt(t, h.baseURL, h.authTunnelHost, &basicAuth{username: "alice", password: "wrong"}, http.StatusUnauthorized, "", 30*time.Second)
 		h.expectHTTPStatusAt(t, h.baseURL, h.authTunnelHost, &basicAuth{username: "alice", password: "secret"}, http.StatusOK, backendResponse, 30*time.Second)
 	})
 
+	t.Run("TCP and UDP server_expose reach target client backends", func(t *testing.T) {
+		serverTCP = h.createTCPServerExposeTunnel(t, "system-tcp-server", h.serverTCPPort, backendHost, backendPort)
+		serverUDP = h.createUDPServerExposeTunnel(t, "system-udp-server", h.serverUDPPort, udpBackendHost, udpBackendPort)
+		h.waitTunnelState(t, serverTCP.ID, "active", 90*time.Second)
+		h.waitTunnelState(t, serverUDP.ID, "active", 90*time.Second)
+		h.expectTunnelNoIssues(t, serverTCP.ID)
+		h.expectTunnelNoIssues(t, serverUDP.ID)
+		h.expectTCPHTTPContains(t, h.serverTCPPort, backendHost, backendResponse)
+		h.expectUDPEcho(t, h.serverUDPPort, []byte("system server udp probe"), 30*time.Second)
+	})
+
 	t.Run("SOCKS5 server_expose CONNECT reaches target client backend", func(t *testing.T) {
 		serverSOCKS5 = h.createSOCKS5ServerExposeTunnel(t, "system-socks5-server", h.serverSOCKS5Port)
 		h.waitTunnelState(t, serverSOCKS5.ID, "active", 90*time.Second)
+		h.expectTunnelNoIssues(t, serverSOCKS5.ID)
 		h.expectSOCKS5HTTPContains(t, h.serverSOCKS5Port, backendHost, backendPort, nil, backendResponse)
 	})
 
@@ -142,6 +161,7 @@ func TestSystemE2E(t *testing.T) {
 		c2cUDP = h.createUDPClientToClientTunnel(t, "system-c2c-udp", h.c2cUDPPort, udpBackendHost, udpBackendPort)
 		for _, tunnel := range []tunnelResponse{c2cTCP, c2cTCPAlt, c2cTCPSlow, c2cUDP} {
 			h.waitTunnelState(t, tunnel.ID, "active", 90*time.Second)
+			h.expectTunnelNoIssues(t, tunnel.ID)
 		}
 
 		h.expectTCPHTTPContains(t, h.c2cTCPPort, backendHost, backendResponse)
@@ -165,6 +185,8 @@ func TestSystemE2E(t *testing.T) {
 		h.targetClientID, h.ingressClientID = h.waitForClientPair(t, 90*time.Second)
 		h.waitTunnelState(t, c2cTCP.ID, "active", 90*time.Second)
 		h.waitTunnelState(t, c2cUDP.ID, "active", 90*time.Second)
+		h.expectTunnelNoIssues(t, c2cTCP.ID)
+		h.expectTunnelNoIssues(t, c2cUDP.ID)
 		h.expectTCPHTTPContains(t, h.c2cTCPPort, backendHost, backendResponse)
 		h.expectUDPEcho(t, h.c2cUDPPort, []byte("system udp after ingress restart"), 30*time.Second)
 	})
@@ -172,6 +194,7 @@ func TestSystemE2E(t *testing.T) {
 	t.Run("SOCKS5 client_to_client auth policy and target restart recovery", func(t *testing.T) {
 		c2cSOCKS5 = h.createSOCKS5ClientToClientTunnel(t, "system-socks5-c2c", h.c2cSOCKS5Port, backendHost, backendPort, `{"type":"none"}`, []string{"0.0.0.0/0", "::/0"}, []string{backendHost}, []int{backendPort})
 		h.waitTunnelState(t, c2cSOCKS5.ID, "active", 90*time.Second)
+		h.expectTunnelNoIssues(t, c2cSOCKS5.ID)
 		h.expectSOCKS5HTTPContains(t, h.c2cSOCKS5Port, backendHost, backendPort, nil, backendResponse)
 		h.expectConcurrent(t, "same SOCKS5 tunnel concurrent CONNECT streams", 12, func(_ int) error {
 			return h.requestSOCKS5HTTP(h.c2cSOCKS5Port, backendHost, backendPort, nil, backendResponse, 8*time.Second)
@@ -179,12 +202,14 @@ func TestSystemE2E(t *testing.T) {
 
 		authTunnel := h.createSOCKS5ClientToClientTunnel(t, "system-socks5-auth", h.c2cSOCKS5AuthPort, backendHost, backendPort, `{"type":"username_password","username":"alice","password":"secret"}`, []string{"0.0.0.0/0", "::/0"}, []string{backendHost}, []int{backendPort})
 		h.waitTunnelState(t, authTunnel.ID, "active", 90*time.Second)
+		h.expectTunnelNoIssues(t, authTunnel.ID)
 		h.expectSOCKS5NoAcceptableMethod(t, h.c2cSOCKS5AuthPort)
 		h.expectSOCKS5AuthFailure(t, h.c2cSOCKS5AuthPort, "alice", "wrong")
 		h.expectSOCKS5HTTPContains(t, h.c2cSOCKS5AuthPort, backendHost, backendPort, &socks5Credentials{username: "alice", password: "secret"}, backendResponse)
 
 		targetDeny := h.createSOCKS5ClientToClientTunnel(t, "system-socks5-target-deny", h.c2cDenyPort, backendHost, backendPort, `{"type":"none"}`, []string{"0.0.0.0/0", "::/0"}, []string{"blocked.example"}, []int{backendPort})
 		h.waitTunnelState(t, targetDeny.ID, "active", 90*time.Second)
+		h.expectTunnelNoIssues(t, targetDeny.ID)
 		rep := h.socks5ConnectReply(t, h.c2cDenyPort, backendHost, backendPort, nil)
 		if rep != socks5wire.RepNotAllowed {
 			t.Fatalf("SOCKS5 target policy deny: want REP %#x, got %#x", socks5wire.RepNotAllowed, rep)
@@ -192,16 +217,18 @@ func TestSystemE2E(t *testing.T) {
 
 		sourceDeny := h.createSOCKS5ClientToClientTunnel(t, "system-socks5-source-deny", h.c2cSOCKS5SourceDenyPort, backendHost, backendPort, `{"type":"none"}`, []string{"192.0.2.0/24"}, []string{backendHost}, []int{backendPort})
 		h.waitTunnelState(t, sourceDeny.ID, "active", 90*time.Second)
+		h.expectTunnelNoIssues(t, sourceDeny.ID)
 		h.expectSOCKS5SourceRejected(t, h.c2cSOCKS5SourceDenyPort)
 
 		h.compose(t, h.composeEnv, "restart", "target-client")
 		h.targetClientID, h.ingressClientID = h.waitForClientPair(t, 90*time.Second)
 		h.waitTunnelState(t, c2cSOCKS5.ID, "active", 90*time.Second)
+		h.expectTunnelNoIssues(t, c2cSOCKS5.ID)
 		h.expectSOCKS5HTTPContains(t, h.c2cSOCKS5Port, backendHost, backendPort, nil, backendResponse)
 	})
 
 	t.Run("server restart restores persisted tunnels and data paths", func(t *testing.T) {
-		requiredTunnels := []tunnelResponse{httpProxyTunnel, httpDirectTunnel, serverSOCKS5, c2cSOCKS5, c2cTCP, c2cUDP}
+		requiredTunnels := []tunnelResponse{httpProxyTunnel, httpDirectTunnel, serverTCP, serverUDP, serverSOCKS5, c2cSOCKS5, c2cTCP, c2cUDP}
 		for _, tunnel := range requiredTunnels {
 			if tunnel.ID == "" {
 				t.Fatalf("required persisted tunnel was not created before restart: %+v", tunnel)
@@ -213,13 +240,114 @@ func TestSystemE2E(t *testing.T) {
 		h.targetClientID, h.ingressClientID = h.waitForClientPair(t, 120*time.Second)
 		for _, tunnel := range requiredTunnels {
 			h.waitTunnelState(t, tunnel.ID, "active", 120*time.Second)
+			h.expectTunnelNoIssues(t, tunnel.ID)
 		}
 		h.expectHTTPContainsAt(t, h.baseURL, h.tunnelHost, backendResponse, 90*time.Second)
 		h.expectHTTPContainsAt(t, h.directBaseURL, h.directTunnelHost, backendResponse, 90*time.Second)
+		h.expectTCPHTTPContains(t, h.serverTCPPort, backendHost, backendResponse)
+		h.expectUDPEcho(t, h.serverUDPPort, []byte("system server udp after server restart"), 60*time.Second)
 		h.expectSOCKS5HTTPContains(t, h.serverSOCKS5Port, backendHost, backendPort, nil, backendResponse)
 		h.expectSOCKS5HTTPContains(t, h.c2cSOCKS5Port, backendHost, backendPort, nil, backendResponse)
 		h.expectTCPHTTPContains(t, h.c2cTCPPort, backendHost, backendResponse)
 		h.expectUDPEcho(t, h.c2cUDPPort, []byte("system udp after server restart"), 60*time.Second)
+	})
+}
+
+func TestSystemSingleTargetClientE2E(t *testing.T) {
+	h := newSystemHarness(t)
+	h.startInfrastructure(t)
+	h.expectAdminLoginRejected(t)
+	h.adminToken = h.waitForAdminToken(t, 90*time.Second)
+	h.expectAdminAPIAuthorization(t)
+	clientKey := h.createAPIKey(t)
+	h.startTargetClient(t, clientKey)
+	h.targetClientID = h.waitForClientOnline(t, h.targetHostname, 90*time.Second)
+
+	httpTunnel := h.createHTTPServerExposeTunnel(t, "single-target-http", h.tunnelHost, `{"type":"none"}`)
+	serverTCP := h.createTCPServerExposeTunnel(t, "single-target-tcp", h.serverTCPPort, backendHost, backendPort)
+	serverUDP := h.createUDPServerExposeTunnel(t, "single-target-udp", h.serverUDPPort, udpBackendHost, udpBackendPort)
+	serverSOCKS5 := h.createSOCKS5ServerExposeTunnel(t, "single-target-socks5", h.serverSOCKS5Port)
+
+	for _, tunnel := range []tunnelResponse{httpTunnel, serverTCP, serverUDP, serverSOCKS5} {
+		h.waitTunnelState(t, tunnel.ID, "active", 90*time.Second)
+		h.expectTunnelNoIssues(t, tunnel.ID)
+	}
+
+	h.expectHTTPContainsAt(t, h.baseURL, h.tunnelHost, backendResponse, 60*time.Second)
+	h.expectTCPHTTPContains(t, h.serverTCPPort, backendHost, backendResponse)
+	h.expectUDPEcho(t, h.serverUDPPort, []byte("single target udp probe"), 30*time.Second)
+	h.expectSOCKS5HTTPContains(t, h.serverSOCKS5Port, backendHost, backendPort, nil, backendResponse)
+
+	t.Run("unsupported target clean reject leaves no server listener", func(t *testing.T) {
+		rejectPort := h.c2cTCPAltPort
+		body := fmt.Sprintf(`{
+			"name":"single-target-clean-reject",
+			"topology":"server_expose",
+			"ingress":{"location":"server","type":"tcp_listen","config":{
+				"bind_ip":"0.0.0.0",
+				"port":%d,
+				"allowed_source_cidrs":["0.0.0.0/0","::/0"]
+			}},
+			"target":{"location":"client","client_id":%q,"type":"future_target","config":{"host":%q,"port":%d}},
+			"transport_policy":"server_relay_only"
+		}`, rejectPort, h.targetClientID, backendHost, backendPort)
+		h.expectTunnelCreateRejected(t, body, http.StatusBadRequest, "unsupported_endpoint_type", "target.type")
+		h.expectNoTunnelNamed(t, "single-target-clean-reject")
+		h.expectServerListenerCount(t, "tcp", rejectPort, 0)
+	})
+
+	t.Run("unsupported server ingress clean reject leaves no server listener", func(t *testing.T) {
+		rejectPort := h.c2cTCPSlowPort
+		body := fmt.Sprintf(`{
+			"name":"single-target-ingress-clean-reject",
+			"topology":"server_expose",
+			"ingress":{"location":"server","type":"future_ingress","config":{
+				"bind_ip":"0.0.0.0",
+				"port":%d,
+				"allowed_source_cidrs":["0.0.0.0/0","::/0"]
+			}},
+			"target":{"location":"client","client_id":%q,"type":"tcp_service","config":{"host":%q,"port":%d}},
+			"transport_policy":"server_relay_only"
+		}`, rejectPort, h.targetClientID, backendHost, backendPort)
+		h.expectTunnelCreateRejected(t, body, http.StatusBadRequest, "unsupported_endpoint_type", "ingress.type")
+		h.expectNoTunnelNamed(t, "single-target-ingress-clean-reject")
+		h.expectServerListenerCount(t, "tcp", rejectPort, 0)
+	})
+}
+
+func TestSystemClientToClientCleanRejectE2E(t *testing.T) {
+	h := newSystemHarness(t)
+	h.startInfrastructure(t)
+	h.expectAdminLoginRejected(t)
+	h.adminToken = h.waitForAdminToken(t, 90*time.Second)
+	h.expectAdminAPIAuthorization(t)
+	clientKey := h.createAPIKey(t)
+	h.startClients(t, clientKey)
+	h.targetClientID, h.ingressClientID = h.waitForClientPair(t, 90*time.Second)
+
+	t.Run("supported client_to_client TCP still works", func(t *testing.T) {
+		tunnel := h.createTCPClientToClientTunnel(t, "c2c-clean-reject-happy-path", h.c2cTCPPort, backendHost, backendPort)
+		h.waitTunnelState(t, tunnel.ID, "active", 90*time.Second)
+		h.expectTunnelNoIssues(t, tunnel.ID)
+		h.expectTCPHTTPContains(t, h.c2cTCPPort, backendHost, backendResponse)
+	})
+
+	t.Run("unsupported client ingress clean reject leaves no ingress listener", func(t *testing.T) {
+		rejectPort := h.c2cTCPAltPort
+		body := fmt.Sprintf(`{
+			"name":"c2c-clean-reject",
+			"topology":"client_to_client",
+			"ingress":{"location":"client","client_id":%q,"type":"future_ingress","config":{
+				"bind_ip":"0.0.0.0",
+				"port":%d,
+				"allowed_source_cidrs":["0.0.0.0/0","::/0"]
+			}},
+			"target":{"location":"client","client_id":%q,"type":"tcp_service","config":{"host":%q,"port":%d}},
+			"transport_policy":"server_relay_only"
+		}`, h.ingressClientID, rejectPort, h.targetClientID, backendHost, backendPort)
+		h.expectTunnelCreateRejected(t, body, http.StatusBadRequest, "unsupported_endpoint_type", "ingress.type")
+		h.expectNoTunnelNamed(t, "c2c-clean-reject")
+		h.expectIngressListenerCount(t, "tcp", rejectPort, 0)
 	})
 }
 
@@ -249,6 +377,8 @@ func newSystemHarness(t *testing.T) *systemHarness {
 		adminPass:               adminPass,
 		targetHostname:          getenvDefault("NETSGO_TARGET_CLIENT_HOSTNAME", defaultTargetHostname),
 		ingressHostname:         getenvDefault("NETSGO_INGRESS_CLIENT_HOSTNAME", defaultIngressHostname),
+		serverTCPPort:           mustAtoi(t, getenvDefault("SERVER_TCP_PORT", "19093")),
+		serverUDPPort:           mustAtoi(t, getenvDefault("SERVER_UDP_PORT", "19094")),
 		serverSOCKS5Port:        mustAtoi(t, getenvDefault("SERVER_SOCKS5_PORT", "19095")),
 		c2cSOCKS5Port:           mustAtoi(t, getenvDefault("C2C_SOCKS5_PORT", "19096")),
 		c2cDenyPort:             mustAtoi(t, getenvDefault("C2C_SOCKS5_DENY_PORT", "19097")),
@@ -288,7 +418,13 @@ func newSystemHarness(t *testing.T) *systemHarness {
 func (h *systemHarness) startInfrastructure(t *testing.T) {
 	t.Helper()
 	h.compose(t, h.composeEnv, "down", "-v", "--remove-orphans")
-	h.compose(t, h.composeEnv, "up", "-d", "--build", "--remove-orphans", "server", "proxy", "tcp-backend", "tcp-backend-alt", "tcp-backend-slow", "udp-backend")
+	buildFlag := "--build"
+	// Cross-version harnesses pass prebuilt images and must not let Compose
+	// rebuild versioned image tags from the current checkout.
+	if v := os.Getenv("NETSGO_E2E_COMPOSE_BUILD"); v == "0" || strings.EqualFold(v, "false") || strings.EqualFold(v, "no") {
+		buildFlag = "--no-build"
+	}
+	h.compose(t, h.composeEnv, "up", "-d", buildFlag, "--remove-orphans", "server", "proxy", "tcp-backend", "tcp-backend-alt", "tcp-backend-slow", "udp-backend")
 }
 
 func (h *systemHarness) startClients(t *testing.T, clientKey string) {
@@ -296,6 +432,13 @@ func (h *systemHarness) startClients(t *testing.T, clientKey string) {
 	env := append([]string{}, h.composeEnv...)
 	env = append(env, "NETSGO_CLIENT_KEY="+clientKey)
 	h.compose(t, env, "up", "-d", "--remove-orphans", "target-client", "ingress-client")
+}
+
+func (h *systemHarness) startTargetClient(t *testing.T, clientKey string) {
+	t.Helper()
+	env := append([]string{}, h.composeEnv...)
+	env = append(env, "NETSGO_CLIENT_KEY="+clientKey)
+	h.compose(t, env, "up", "-d", "--remove-orphans", "target-client")
 }
 
 func (h *systemHarness) compose(t *testing.T, env []string, args ...string) {
@@ -312,6 +455,23 @@ func (h *systemHarness) compose(t *testing.T, env []string, args ...string) {
 	if err != nil {
 		t.Fatalf("docker %v failed: %v\n%s", cmdArgs, err, output)
 	}
+}
+
+func (h *systemHarness) composeOutput(t *testing.T, env []string, args ...string) []byte {
+	t.Helper()
+	cmdArgs := []string{"compose"}
+	for _, file := range h.composeFiles {
+		cmdArgs = append(cmdArgs, "-f", file)
+	}
+	cmdArgs = append(cmdArgs, "-p", h.projectName)
+	cmdArgs = append(cmdArgs, args...)
+	cmd := exec.Command("docker", cmdArgs...)
+	cmd.Env = env
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("docker %v failed: %v\n%s", cmdArgs, err, output)
+	}
+	return output
 }
 
 func (h *systemHarness) dumpCompose(t *testing.T, args ...string) {
@@ -434,6 +594,22 @@ func (h *systemHarness) waitForClientPair(t *testing.T, timeout time.Duration) (
 	return targetID, ingressID
 }
 
+func (h *systemHarness) waitForClientOnline(t *testing.T, hostname string, timeout time.Duration) string {
+	t.Helper()
+	var clientID string
+	h.poll(t, timeout, func() (bool, string) {
+		clients := h.listClients(t)
+		for _, client := range clients {
+			if client.Online && client.Info.Hostname == hostname {
+				clientID = client.ID
+				return true, ""
+			}
+		}
+		return false, fmt.Sprintf("client %q not online", hostname)
+	})
+	return clientID
+}
+
 func (h *systemHarness) listClients(t *testing.T) []apiClient {
 	t.Helper()
 	resp, err := h.apiRequest(http.MethodGet, "/api/clients", h.adminToken, nil)
@@ -473,6 +649,55 @@ func (h *systemHarness) createTunnel(t *testing.T, body string) tunnelResponse {
 	return tunnel
 }
 
+func (h *systemHarness) expectTunnelCreateRejected(t *testing.T, body string, wantStatus int, wantCode, wantField string) {
+	t.Helper()
+	resp, err := h.apiRequest(http.MethodPost, "/api/tunnels", h.adminToken, []byte(body))
+	if err != nil {
+		t.Fatalf("create rejected tunnel request: %v", err)
+	}
+	defer resp.Body.Close()
+	payload, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != wantStatus {
+		t.Fatalf("create rejected tunnel: want status %d, got %d body=%s", wantStatus, resp.StatusCode, payload)
+	}
+	var got struct {
+		Code      string `json:"code"`
+		ErrorCode string `json:"error_code"`
+		Field     string `json:"field"`
+	}
+	if err := json.Unmarshal(payload, &got); err != nil {
+		t.Fatalf("decode rejected tunnel response: %v body=%s", err, payload)
+	}
+	if got.Code != wantCode && got.ErrorCode != wantCode {
+		t.Fatalf("rejected tunnel code: want %q, got %+v body=%s", wantCode, got, payload)
+	}
+	if got.Field != wantField {
+		t.Fatalf("rejected tunnel field: want %q, got %+v body=%s", wantField, got, payload)
+	}
+}
+
+func (h *systemHarness) expectNoTunnelNamed(t *testing.T, name string) {
+	t.Helper()
+	resp, err := h.apiRequest(http.MethodGet, "/api/tunnels", h.adminToken, nil)
+	if err != nil {
+		t.Fatalf("list tunnels: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		payload, _ := io.ReadAll(resp.Body)
+		t.Fatalf("list tunnels: want 200, got %d body=%s", resp.StatusCode, payload)
+	}
+	var tunnels []tunnelResponse
+	if err := json.NewDecoder(resp.Body).Decode(&tunnels); err != nil {
+		t.Fatalf("decode tunnel list: %v", err)
+	}
+	for _, tunnel := range tunnels {
+		if tunnel.Name == name {
+			t.Fatalf("rejected tunnel %q must not be persisted: %+v", name, tunnel)
+		}
+	}
+}
+
 func (h *systemHarness) waitTunnelState(t *testing.T, id, state string, timeout time.Duration) {
 	t.Helper()
 	var last tunnelResponse
@@ -496,6 +721,74 @@ func (h *systemHarness) waitTunnelState(t *testing.T, id, state string, timeout 
 	})
 }
 
+func (h *systemHarness) expectServerListenerCount(t *testing.T, proto string, port int, want int) {
+	t.Helper()
+	h.expectServiceListenerCount(t, "server", proto, port, want)
+}
+
+func (h *systemHarness) expectIngressListenerCount(t *testing.T, proto string, port int, want int) {
+	t.Helper()
+	h.expectServiceListenerCount(t, "ingress-client", proto, port, want)
+}
+
+func (h *systemHarness) expectServiceListenerCount(t *testing.T, service string, proto string, port int, want int) {
+	t.Helper()
+	container := strings.TrimSpace(string(h.composeOutput(t, h.composeEnv, "ps", "-q", service)))
+	if container == "" {
+		t.Fatalf("%s container not found", service)
+	}
+	cmd := "netstat -ltn 2>/dev/null || netstat -ln 2>/dev/null"
+	awkProto := "^tcp"
+	if proto == "udp" {
+		cmd = "netstat -lun 2>/dev/null || netstat -ln 2>/dev/null"
+		awkProto = "^udp"
+	}
+	output, err := exec.Command("docker", "exec", container, "sh", "-c", cmd).CombinedOutput()
+	if err != nil {
+		t.Fatalf("docker exec netstat failed: %v\n%s", err, output)
+	}
+	count := 0
+	portSuffix := ":" + strconv.Itoa(port)
+	for _, line := range strings.Split(string(output), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 4 || !strings.HasPrefix(fields[0], strings.TrimPrefix(awkProto, "^")) {
+			continue
+		}
+		if strings.HasSuffix(fields[3], portSuffix) {
+			count++
+		}
+	}
+	if count != want {
+		t.Fatalf("%s listener count on %s:%d: got %d want %d\n%s", proto, service, port, count, want, output)
+	}
+}
+
+func (h *systemHarness) expectTunnelNoIssues(t *testing.T, id string) {
+	t.Helper()
+	resp, err := h.apiRequest(http.MethodGet, "/api/tunnels/"+id, h.adminToken, nil)
+	if err != nil {
+		t.Fatalf("get tunnel %s: %v", id, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		payload, _ := io.ReadAll(resp.Body)
+		t.Fatalf("GET tunnel %s: want 200, got %d body=%s", id, resp.StatusCode, payload)
+	}
+	var tunnel tunnelResponse
+	if err := json.NewDecoder(resp.Body).Decode(&tunnel); err != nil {
+		t.Fatalf("decode tunnel %s: %v", id, err)
+	}
+	var issues []json.RawMessage
+	if len(tunnel.Issues) > 0 {
+		if err := json.Unmarshal(tunnel.Issues, &issues); err != nil {
+			t.Fatalf("decode tunnel issues for %s: %v raw=%s", id, err, tunnel.Issues)
+		}
+	}
+	if len(issues) != 0 {
+		t.Fatalf("tunnel %s has issues: %s", id, tunnel.Issues)
+	}
+}
+
 func (h *systemHarness) createHTTPServerExposeTunnel(t *testing.T, name, host, authJSON string) tunnelResponse {
 	t.Helper()
 	return h.createTunnel(t, fmt.Sprintf(`{
@@ -509,6 +802,36 @@ func (h *systemHarness) createHTTPServerExposeTunnel(t *testing.T, name, host, a
 		"target":{"location":"client","client_id":%q,"type":"tcp_service","config":{"host":%q,"port":%d}},
 		"transport_policy":"server_relay_only"
 	}`, name, host, authJSON, h.targetClientID, backendHost, backendPort))
+}
+
+func (h *systemHarness) createTCPServerExposeTunnel(t *testing.T, name string, ingressPort int, targetHost string, targetPort int) tunnelResponse {
+	t.Helper()
+	return h.createTunnel(t, fmt.Sprintf(`{
+		"name":%q,
+		"topology":"server_expose",
+		"ingress":{"location":"server","type":"tcp_listen","config":{
+			"bind_ip":"0.0.0.0",
+			"port":%d,
+			"allowed_source_cidrs":["0.0.0.0/0","::/0"]
+		}},
+		"target":{"location":"client","client_id":%q,"type":"tcp_service","config":{"host":%q,"port":%d}},
+		"transport_policy":"server_relay_only"
+	}`, name, ingressPort, h.targetClientID, targetHost, targetPort))
+}
+
+func (h *systemHarness) createUDPServerExposeTunnel(t *testing.T, name string, ingressPort int, targetHost string, targetPort int) tunnelResponse {
+	t.Helper()
+	return h.createTunnel(t, fmt.Sprintf(`{
+		"name":%q,
+		"topology":"server_expose",
+		"ingress":{"location":"server","type":"udp_listen","config":{
+			"bind_ip":"0.0.0.0",
+			"port":%d,
+			"allowed_source_cidrs":["0.0.0.0/0","::/0"]
+		}},
+		"target":{"location":"client","client_id":%q,"type":"udp_service","config":{"host":%q,"port":%d}},
+		"transport_policy":"server_relay_only"
+	}`, name, ingressPort, h.targetClientID, targetHost, targetPort))
 }
 
 func (h *systemHarness) createSOCKS5ServerExposeTunnel(t *testing.T, name string, port int) tunnelResponse {
@@ -657,9 +980,12 @@ func (h *systemHarness) doHTTPHostRequest(baseURL, host string, auth *basicAuth)
 
 func (h *systemHarness) expectTCPHTTPContains(t *testing.T, port int, host, expected string) {
 	t.Helper()
-	if err := h.requestTCPHTTP(port, host, expected, 10*time.Second); err != nil {
-		t.Fatal(err)
-	}
+	h.poll(t, 30*time.Second, func() (bool, string) {
+		if err := h.requestTCPHTTP(port, host, expected, 5*time.Second); err != nil {
+			return false, err.Error()
+		}
+		return true, ""
+	})
 }
 
 func (h *systemHarness) requestTCPHTTP(port int, host, expected string, timeout time.Duration) error {
@@ -808,9 +1134,12 @@ func (h *systemHarness) holdTCPConnection(port int, duration time.Duration) erro
 
 func (h *systemHarness) expectSOCKS5HTTPContains(t *testing.T, proxyPort int, targetHost string, targetPort int, creds *socks5Credentials, expected string) {
 	t.Helper()
-	if err := h.requestSOCKS5HTTP(proxyPort, targetHost, targetPort, creds, expected, 10*time.Second); err != nil {
-		t.Fatal(err)
-	}
+	h.poll(t, 30*time.Second, func() (bool, string) {
+		if err := h.requestSOCKS5HTTP(proxyPort, targetHost, targetPort, creds, expected, 5*time.Second); err != nil {
+			return false, err.Error()
+		}
+		return true, ""
+	})
 }
 
 func (h *systemHarness) requestSOCKS5HTTP(proxyPort int, targetHost string, targetPort int, creds *socks5Credentials, expected string, timeout time.Duration) error {
