@@ -170,8 +170,6 @@ func isDoneReceive(stmt ast.Stmt) bool {
 }
 
 func TestUnifiedReconcileRegistrySerializesSameTunnelAndRerunsDirty(t *testing.T) {
-	requireTDDRed(t)
-
 	registry := newUnifiedTunnelReconcileRegistry()
 	firstEntered := make(chan struct{})
 	secondAttemptDone := make(chan struct{})
@@ -246,8 +244,6 @@ func TestUnifiedReconcileRegistrySerializesSameTunnelAndRerunsDirty(t *testing.T
 }
 
 func TestUnifiedReconcileRegistryCoalescesMultipleDirtyCallsIntoSingleRerun(t *testing.T) {
-	requireTDDRed(t)
-
 	registry := newUnifiedTunnelReconcileRegistry()
 	firstEntered := make(chan struct{})
 	allowFirstReturn := make(chan struct{})
@@ -694,8 +690,6 @@ func TestUnifiedServerExposeProvisionAndDataHeaderUseStoredRevision(t *testing.T
 }
 
 func TestUnifiedServerExposeReconcileRejectsStaleProvisionAckAfterRevisionAdvance(t *testing.T) {
-	requireTDDRed(t)
-
 	s := New(0)
 	s.store = newTestTunnelStore(t)
 
@@ -857,8 +851,6 @@ func TestUnifiedServerExposeReconcileRejectsStaleProvisionAckAfterRevisionAdvanc
 }
 
 func TestUnifiedServerExposeRejectedProvisionLeavesNoListenerOrAckWaiter(t *testing.T) {
-	requireTDDRed(t)
-
 	s := New(0)
 	s.store = newTestTunnelStore(t)
 
@@ -1000,6 +992,258 @@ func TestUnifiedServerExposeRejectedProvisionLeavesNoListenerOrAckWaiter(t *test
 	spec := specFromStoredTunnel(got, s)
 	if len(spec.Issues) != 1 || spec.Issues[0].Code != protocol.TunnelIssueCodeProvisionAckRejected || spec.Issues[0].ClientID != stored.Target.ClientID {
 		t.Fatalf("rejected provision issue mismatch: %+v", spec.Issues)
+	}
+}
+
+func TestUnifiedServerExposeInFlightReconcileShutdownCleansRuntimeAndAckWaiter(t *testing.T) {
+	s := New(0)
+	s.store = newTestTunnelStore(t)
+
+	reservedListener, err := net.Listen("tcp", ":0")
+	if err != nil {
+		t.Fatalf("reserve remote port: %v", err)
+	}
+	remotePort := reservedListener.Addr().(*net.TCPAddr).Port
+	t.Cleanup(func() {
+		if reservedListener != nil {
+			_ = reservedListener.Close()
+		}
+	})
+
+	stored := StoredTunnel{
+		ProxyNewRequest: protocol.ProxyNewRequest{
+			ID:         "server-expose-shutdown-id",
+			Name:       "server-expose-shutdown",
+			Type:       protocol.ProxyTypeTCP,
+			LocalIP:    "127.0.0.1",
+			LocalPort:  65022,
+			RemotePort: remotePort,
+		},
+		ClientID:        "target-client",
+		OwnerClientID:   "target-client",
+		Binding:         TunnelBindingClientID,
+		Revision:        3,
+		Topology:        TunnelTopologyServerExpose,
+		DesiredState:    protocol.ProxyDesiredStateRunning,
+		RuntimeState:    protocol.ProxyRuntimeStateOffline,
+		TransportPolicy: protocol.TransportPolicyServerRelayOnly,
+		ActualTransport: protocol.ActualTransportUnknown,
+		P2P:             P2PState{State: TunnelP2PStateIdle},
+		Ingress: EndpointSpec{
+			Location: protocol.EndpointLocationServer,
+			Type:     protocol.IngressTypeTCPListen,
+			Config:   mustRawJSON(tcpListenConfigAPI{BindIP: "127.0.0.1", Port: remotePort}),
+		},
+		Target: EndpointSpec{
+			Location: protocol.EndpointLocationClient,
+			ClientID: "target-client",
+			Type:     protocol.TargetTypeTCPService,
+			Config:   mustRawJSON(serviceConfigAPI{IP: "127.0.0.1", Port: 65022}),
+		},
+		CreatedAt: time.Now().UTC(),
+		UpdatedAt: time.Now().UTC(),
+	}
+	if err := stored.normalize(); err != nil {
+		t.Fatalf("normalize stored tunnel: %v", err)
+	}
+	mustAddStableTunnel(t, s.store, stored)
+
+	targetWS, targetServerWS := newTestWebSocketPair(t)
+	defer mustClose(t, targetWS)
+	defer mustClose(t, targetServerWS)
+	_, serverSession := newTestClientRelayDataSession(t)
+	caps := protocol.DefaultClientCapabilities()
+	target := &ClientConn{
+		ID:          stored.Target.ClientID,
+		Info:        protocol.ClientInfo{Hostname: "target-client", Capabilities: &caps},
+		conn:        targetServerWS,
+		proxies:     make(map[string]*ProxyTunnel),
+		dataSession: serverSession,
+		generation:  1,
+		state:       clientStateLive,
+	}
+	s.clients.Store(target.ID, target)
+	go s.controlLoop(target)
+	t.Cleanup(func() {
+		_ = s.CloseProxyRuntime(target, stored.Name)
+	})
+
+	restoreDone := make(chan error, 1)
+	go func() {
+		restoreDone <- s.reconcileUnifiedTunnel(stored.ID, "test_shutdown")
+	}()
+
+	msg := readControlMessageOfType(t, targetWS, protocol.MsgTypeTunnelProvision)
+	var provision protocol.TunnelProvisionRequest
+	if err := msg.ParsePayload(&provision); err != nil {
+		t.Fatalf("parse provision payload: %v", err)
+	}
+	if provision.TunnelID != stored.ID || provision.Revision != stored.Revision || provision.Role != protocol.DataStreamRoleTarget {
+		t.Fatalf("provision identity mismatch: %+v", provision)
+	}
+
+	s.tunnels.pendingProvisionAckMu.Lock()
+	pendingBeforeShutdown := len(s.tunnels.pendingProvisionAcks)
+	s.tunnels.pendingProvisionAckMu.Unlock()
+	if pendingBeforeShutdown != 1 {
+		t.Fatalf("expected one pending provision ack waiter before shutdown, got %d", pendingBeforeShutdown)
+	}
+
+	s.closeDone()
+
+	select {
+	case err := <-restoreDone:
+		if !errors.Is(err, errTunnelProvisionAckCancelled) {
+			t.Fatalf("shutdown should cancel in-flight reconcile provision wait, got %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for in-flight reconcile to exit after shutdown")
+	}
+
+	s.tunnels.pendingProvisionAckMu.Lock()
+	pendingAfterShutdown := len(s.tunnels.pendingProvisionAcks)
+	s.tunnels.pendingProvisionAckMu.Unlock()
+	if pendingAfterShutdown != 0 {
+		t.Fatalf("shutdown-cancelled reconcile must release ack waiters, got %d", pendingAfterShutdown)
+	}
+	s.unifiedReconcile.mu.Lock()
+	registryEntries := len(s.unifiedReconcile.entries)
+	s.unifiedReconcile.mu.Unlock()
+	if registryEntries != 0 {
+		t.Fatalf("shutdown-cancelled reconcile must release registry entry, got %d", registryEntries)
+	}
+	if name, tunnel, exists := findTunnelBySelector(target, stored.ID); exists {
+		config, runtimeHeld, stillExists := serverExposeTunnelSnapshot(target, name, tunnel)
+		if stillExists && (runtimeHeld || config.RuntimeState == protocol.ProxyRuntimeStateExposed || config.RuntimeState == protocol.ProxyRuntimeStatePending) {
+			t.Fatalf("shutdown-cancelled reconcile left runtime: name=%s runtime_state=%s", name, config.RuntimeState)
+		}
+	}
+}
+
+func TestUnifiedServerExposeCapabilityLossCleansListenerAndProjectsIssue(t *testing.T) {
+	s := New(0)
+	s.store = newTestTunnelStore(t)
+
+	reservedListener, err := net.Listen("tcp", ":0")
+	if err != nil {
+		t.Fatalf("reserve remote port: %v", err)
+	}
+	remotePort := reservedListener.Addr().(*net.TCPAddr).Port
+	if err := reservedListener.Close(); err != nil {
+		t.Fatalf("release reserved remote port: %v", err)
+	}
+
+	stored := StoredTunnel{
+		ProxyNewRequest: protocol.ProxyNewRequest{
+			ID:         "server-expose-capability-loss-id",
+			Name:       "server-expose-capability-loss",
+			Type:       protocol.ProxyTypeTCP,
+			LocalIP:    "127.0.0.1",
+			LocalPort:  65022,
+			RemotePort: remotePort,
+		},
+		ClientID:        "target-client",
+		OwnerClientID:   "target-client",
+		Binding:         TunnelBindingClientID,
+		Revision:        4,
+		Topology:        TunnelTopologyServerExpose,
+		DesiredState:    protocol.ProxyDesiredStateRunning,
+		RuntimeState:    protocol.ProxyRuntimeStateExposed,
+		TransportPolicy: protocol.TransportPolicyServerRelayOnly,
+		ActualTransport: protocol.ActualTransportServerRelay,
+		P2P:             P2PState{State: TunnelP2PStateIdle},
+		Ingress: EndpointSpec{
+			Location: protocol.EndpointLocationServer,
+			Type:     protocol.IngressTypeTCPListen,
+			Config:   mustRawJSON(tcpListenConfigAPI{BindIP: "127.0.0.1", Port: remotePort}),
+		},
+		Target: EndpointSpec{
+			Location: protocol.EndpointLocationClient,
+			ClientID: "target-client",
+			Type:     protocol.TargetTypeTCPService,
+			Config:   mustRawJSON(serviceConfigAPI{IP: "127.0.0.1", Port: 65022}),
+		},
+		CreatedAt: time.Now().UTC(),
+		UpdatedAt: time.Now().UTC(),
+	}
+	if err := stored.normalize(); err != nil {
+		t.Fatalf("normalize stored tunnel: %v", err)
+	}
+	mustAddStableTunnel(t, s.store, stored)
+
+	caps := protocol.DefaultClientCapabilities()
+	_, serverSession := newTestClientRelayDataSession(t)
+	target := &ClientConn{
+		ID:          stored.Target.ClientID,
+		Info:        protocol.ClientInfo{Hostname: "target-client", Capabilities: &caps},
+		proxies:     make(map[string]*ProxyTunnel),
+		dataSession: serverSession,
+		generation:  1,
+		state:       clientStateLive,
+	}
+	s.clients.Store(target.ID, target)
+	t.Cleanup(func() {
+		_ = s.CloseProxyRuntime(target, stored.Name)
+	})
+
+	runtimeConfig, err := serverExposeRuntimeProxyRequest(stored)
+	if err != nil {
+		t.Fatalf("server expose runtime config: %v", err)
+	}
+	tunnel, err := s.prepareProxyTunnelWithExclusions(
+		target,
+		runtimeConfig,
+		protocol.ProxyDesiredStateRunning,
+		protocol.ProxyRuntimeStatePending,
+		stored.Name,
+		target.ID,
+		stored.CreatedAt,
+	)
+	if err != nil {
+		t.Fatalf("prepare runtime: %v", err)
+	}
+	_ = s.applyStoredServerExposeConfig(target, tunnel, stored, protocol.ProxyRuntimeStatePending, "")
+	if err := s.activatePreparedTunnel(target, tunnel); err != nil {
+		t.Fatalf("activate server-expose runtime: %v", err)
+	}
+	_ = s.applyStoredServerExposeConfig(target, tunnel, stored, protocol.ProxyRuntimeStateExposed, "")
+	if _, runtimeHeld, exists := serverExposeTunnelSnapshot(target, stored.Name, tunnel); !exists || !runtimeHeld {
+		t.Fatal("test setup should start with an active server-expose runtime")
+	}
+
+	noCaps := protocol.ClientCapabilities{}
+	target.SetInfo(protocol.ClientInfo{Hostname: "target-client", Capabilities: &noCaps})
+
+	if err := s.reconcileServerExposeTunnel(stored); err != nil {
+		t.Fatalf("capability loss reconcile should project error without provisioning failure: %v", err)
+	}
+	if name, tunnel, exists := findTunnelBySelector(target, stored.ID); exists {
+		config, runtimeHeld, stillExists := serverExposeTunnelSnapshot(target, name, tunnel)
+		if stillExists && runtimeHeld {
+			t.Fatalf("capability loss must close server listener/runtime: name=%s runtime_state=%s", name, config.RuntimeState)
+		}
+	}
+	probe, err := net.Listen("tcp", "127.0.0.1:"+strconv.Itoa(remotePort))
+	if err != nil {
+		t.Fatalf("capability loss must release tcp listener on port %d: %v", remotePort, err)
+	}
+	_ = probe.Close()
+	s.tunnels.pendingProvisionAckMu.Lock()
+	pendingCount := len(s.tunnels.pendingProvisionAcks)
+	s.tunnels.pendingProvisionAckMu.Unlock()
+	if pendingCount != 0 {
+		t.Fatalf("capability loss must not leave ack waiters, got %d", pendingCount)
+	}
+	reloaded, err := s.store.GetTunnelByIDE(stored.OwnerClientID, stored.ID)
+	if err != nil {
+		t.Fatalf("reload tunnel: %v", err)
+	}
+	spec := specFromStoredTunnel(reloaded, s)
+	if spec.RuntimeState != protocol.ProxyRuntimeStateError {
+		t.Fatalf("capability loss should project runtime error, got %q", spec.RuntimeState)
+	}
+	if len(spec.Issues) != 1 || spec.Issues[0].Code != protocol.TunnelIssueCodeCapabilityNotSupported || spec.Issues[0].ClientID != stored.Target.ClientID {
+		t.Fatalf("capability issue mismatch: %+v", spec.Issues)
 	}
 }
 

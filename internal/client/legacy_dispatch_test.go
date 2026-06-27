@@ -282,8 +282,6 @@ func TestClientControlLoopLegacyProxyCloseFixtureDeletesLegacyProxyStore(t *test
 }
 
 func TestClientControlLoopUnifiedPayloadIgnoresLegacyFlatFields(t *testing.T) {
-	requireTDDRed(t)
-
 	provisionAck := make(chan protocol.TunnelProvisionAck, 1)
 	ackErr := make(chan error, 1)
 	ms := newMockServer(true)

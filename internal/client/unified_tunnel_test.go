@@ -309,8 +309,6 @@ func assertTCPPortClosed(t *testing.T, addr string) {
 }
 
 func TestClientTunnelProvisionFixedTCPTargetDoesNotRegisterLegacyProxy(t *testing.T) {
-	requireTDDRed(t)
-
 	c := New("ws://localhost:8080", "key")
 	req := testTunnelProvisionRequest(t, protocol.DataStreamRoleTarget, reserveClientTCPPort(t))
 
@@ -327,8 +325,6 @@ func TestClientTunnelProvisionFixedTCPTargetDoesNotRegisterLegacyProxy(t *testin
 }
 
 func TestClientTunnelProvisionFixedUDPTargetDoesNotRegisterLegacyProxy(t *testing.T) {
-	requireTDDRed(t)
-
 	c := New("ws://localhost:8080", "key")
 	req := testUDPTunnelProvisionRequest(t, protocol.DataStreamRoleTarget, reserveClientTCPPort(t))
 
@@ -345,8 +341,6 @@ func TestClientTunnelProvisionFixedUDPTargetDoesNotRegisterLegacyProxy(t *testin
 }
 
 func TestClientTunnelProvisionUnsupportedTargetRejectsWithoutRuntime(t *testing.T) {
-	requireTDDRed(t)
-
 	c := New("ws://localhost:8080", "key")
 	req := testTunnelProvisionRequest(t, protocol.DataStreamRoleTarget, reserveClientTCPPort(t))
 	req.Spec.Target.Type = "future_target"

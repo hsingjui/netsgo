@@ -89,6 +89,13 @@ type tunnelResponse struct {
 	Issues       json.RawMessage `json:"issues,omitempty"`
 }
 
+type tunnelIssueResponse struct {
+	Code     string          `json:"code"`
+	Scope    string          `json:"scope"`
+	ClientID string          `json:"client_id,omitempty"`
+	Details  json.RawMessage `json:"details,omitempty"`
+}
+
 func TestSystemE2E(t *testing.T) {
 	h := newSystemHarness(t)
 	h.startInfrastructure(t)
@@ -349,6 +356,35 @@ func TestSystemClientToClientCleanRejectE2E(t *testing.T) {
 		h.expectNoTunnelNamed(t, "c2c-clean-reject")
 		h.expectIngressListenerCount(t, "tcp", rejectPort, 0)
 	})
+}
+
+func TestSystemCapabilityLossReconcileE2E(t *testing.T) {
+	h := newSystemHarness(t)
+	lossImage := os.Getenv("NETSGO_E2E_CAPABILITY_LOSS_IMAGE")
+	if lossImage == "" {
+		t.Skip("NETSGO_E2E_CAPABILITY_LOSS_IMAGE is required")
+	}
+	h.startInfrastructure(t)
+	h.adminToken = h.waitForAdminToken(t, 90*time.Second)
+	clientKey := h.createAPIKey(t)
+	h.startClients(t, clientKey)
+	h.targetClientID, h.ingressClientID = h.waitForClientPair(t, 90*time.Second)
+
+	tunnel := h.createTCPServerExposeTunnel(t, "capability-loss-server-tcp", h.serverTCPPort, backendHost, backendPort)
+	h.waitTunnelState(t, tunnel.ID, "active", 90*time.Second)
+	h.expectTunnelNoIssues(t, tunnel.ID)
+	h.expectServerListenerCount(t, "tcp", h.serverTCPPort, 1)
+	h.expectTCPHTTPContains(t, h.serverTCPPort, backendHost, backendResponse)
+
+	env := append([]string{}, h.composeEnv...)
+	env = append(env, "NETSGO_CLIENT_KEY="+clientKey)
+	env = append(env, "NETSGO_TARGET_CLIENT_IMAGE="+lossImage)
+	h.compose(t, env, "up", "-d", "--force-recreate", "--no-deps", "--no-build", "--remove-orphans", "target-client")
+	h.targetClientID = h.waitForClientOnline(t, h.targetHostname, 90*time.Second)
+
+	h.waitTunnelState(t, tunnel.ID, "error", 120*time.Second)
+	h.expectTunnelIssue(t, tunnel.ID, "capability_not_supported", "target_client")
+	h.expectServerListenerCount(t, "tcp", h.serverTCPPort, 0)
 }
 
 func newSystemHarness(t *testing.T) *systemHarness {
@@ -787,6 +823,33 @@ func (h *systemHarness) expectTunnelNoIssues(t *testing.T, id string) {
 	if len(issues) != 0 {
 		t.Fatalf("tunnel %s has issues: %s", id, tunnel.Issues)
 	}
+}
+
+func (h *systemHarness) expectTunnelIssue(t *testing.T, id, wantCode, wantScope string) {
+	t.Helper()
+	resp, err := h.apiRequest(http.MethodGet, "/api/tunnels/"+id, h.adminToken, nil)
+	if err != nil {
+		t.Fatalf("get tunnel %s: %v", id, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		payload, _ := io.ReadAll(resp.Body)
+		t.Fatalf("GET tunnel %s: want 200, got %d body=%s", id, resp.StatusCode, payload)
+	}
+	var tunnel tunnelResponse
+	if err := json.NewDecoder(resp.Body).Decode(&tunnel); err != nil {
+		t.Fatalf("decode tunnel %s: %v", id, err)
+	}
+	var issues []tunnelIssueResponse
+	if err := json.Unmarshal(tunnel.Issues, &issues); err != nil {
+		t.Fatalf("decode tunnel issues for %s: %v raw=%s", id, err, tunnel.Issues)
+	}
+	for _, issue := range issues {
+		if issue.Code == wantCode && issue.Scope == wantScope {
+			return
+		}
+	}
+	t.Fatalf("tunnel %s missing issue code=%q scope=%q: %s", id, wantCode, wantScope, tunnel.Issues)
 }
 
 func (h *systemHarness) createHTTPServerExposeTunnel(t *testing.T, name, host, authJSON string) tunnelResponse {

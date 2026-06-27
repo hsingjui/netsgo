@@ -352,8 +352,6 @@ func dialWSWithHost(t *testing.T, ts *httptest.Server, host, path string, subpro
 }
 
 func TestUnifiedHTTPHostDispatchRoutesByIngressEndpointDomain(t *testing.T) {
-	requireTDDRed(t)
-
 	s, _ := newDispatchTestServer(t, true, "https://panel.example.com")
 	cleanupTunnel := addUnifiedHTTPDispatchTunnelWithConflictingFlatDomain(t, s)
 	defer cleanupTunnel()

@@ -43,7 +43,7 @@ make test-system-e2e-caddy
 Useful local stack commands:
 
 ```bash
-NETSGO_ADMIN_PASS="$(openssl rand -base64 18)" make system-e2e-up
+NETSGO_ADMIN_PASS="NetsGo1-$(openssl rand -hex 12)" make system-e2e-up
 make system-e2e-logs
 make system-e2e-down
 make system-e2e-clean
@@ -113,9 +113,21 @@ That run reused the local `netsgo-e2e:v0.1.8` image and passed `go test -tags=e2
 
 `test-compat-e2e` starts fresh mixed-version stacks. Default `COMPAT_MODE=full` runs the main `TestSystemE2E` suite with prebuilt images and `--no-build` for each core server/target-client/ingress-client matrix row. It then runs focused rows for `TestSystemSingleTargetClientE2E` and `TestSystemClientToClientCleanRejectE2E`. It intentionally does not run every `TestSystem*E2E` test for every core matrix row; the focused cases are separate matrix rows to keep runtime bounded while still covering old-server/current-target server-expose and mixed-version clean-reject semantics. The single-target case includes unsupported target and unsupported server ingress clean-reject assertions: structured API error, no persisted tunnel, and no server listener on the rejected port. Set `COMPAT_MODE=smoke` only when you explicitly want startup/client-connectivity smoke coverage without tunnel data-path assertions. NetsGo-based helper services use the scenario's server image so the all-stable scenario does not depend on the current image.
 
-`test-upgrade-e2e` starts from a stable running stack, creates real tunnels, verifies data paths, replaces server/client images, and revalidates the same tunnels. It includes server-only, target-client-only, ingress-client-only, clients-only, server rollback, current-write rollback, all-components upgrade, client-first rolling upgrade, and full cold upgrade cases. Server-only and target-only cover server-expose HTTP/TCP/UDP/SOCKS5. The full rolling/cold/current-write-rollback cases cover server-expose HTTP/TCP/UDP/SOCKS5 and client-to-client TCP/UDP/SOCKS5. The narrower ingress-only and clients-only cases currently cover client-to-client TCP/SOCKS5 plus HTTP where relevant. The harness also asserts empty tunnel issues plus listener counts for server-expose TCP/UDP/SOCKS5. The upgrade baseline uses the stable image for NetsGo-based helper services so the pre-upgrade stack is not coupled to the current image. The default reconnect/re-provision recovery window is `UPGRADE_RECOVERY_TIMEOUT_SECONDS=120`, forwarded by `make test-upgrade-e2e`; use the same variable when intentionally changing the upgrade wait budget.
+The local full compat gate has been verified with `make test-compat-e2e COMPAT_BASELINE=v0.1.8 COMPAT_MODE=full COMPAT_ABORT_ON_FAILURE=true` and passed `11/11`. An earlier full compat run rebuilt `netsgo-e2e:v0.1.8` from tag `v0.1.8`, so it also exercised the stable-image rebuild path; the latest full compat run reused local images and verified the current worktree still passes all `11/11` scenarios. The local nginx and caddy system gates have also been verified with `make test-system-e2e-nginx` and `make test-system-e2e-caddy`.
 
-GitHub Actions also provides a manual `Cross-Version E2E` workflow. It is intentionally `workflow_dispatch` only. The workflow first runs the stable-only baseline, then builds the current E2E image, then optionally runs `COMPAT_MODE=full` and the upgrade/rollback matrix. Use it before merging or releasing the payload split implementation when local Docker time is expensive or when an auditable CI run is needed. Each phase tears down its Compose project so the default host ports can be reused by the next matrix.
+`test-upgrade-e2e` starts from a stable running stack, creates real tunnels, verifies data paths, replaces server/client images, and revalidates the same tunnels. It includes server-only, target-client-only, ingress-client-only, clients-only, server rollback, current-write rollback, all-components upgrade, client-first rolling upgrade, and full cold upgrade cases. Server-only and target-only cover server-expose HTTP/TCP/UDP/SOCKS5. The full rolling/cold/current-write-rollback cases cover server-expose HTTP/TCP/UDP/SOCKS5 and client-to-client TCP/UDP/SOCKS5. The clients-only case keeps the stable server running after both clients are upgraded and then creates a new HTTP/TCP/UDP/SOCKS5 server-expose suite against the current target client. The rollback cases also create a new HTTP/TCP/UDP/SOCKS5 server-expose suite after returning to the stable server, then verify active state, empty issues, data paths, and listener counts on dedicated server alt ports. The narrower ingress-only case covers client-to-client TCP/SOCKS5. The harness also asserts empty tunnel issues plus listener counts for server-expose TCP/UDP/SOCKS5. The upgrade baseline uses the stable image for NetsGo-based helper services so the pre-upgrade stack is not coupled to the current image. The default reconnect/re-provision recovery window is `UPGRADE_RECOVERY_TIMEOUT_SECONDS=120`, forwarded by `make test-upgrade-e2e`; use the same variable when intentionally changing the upgrade wait budget.
+
+The local full upgrade/rollback gate has been verified with `make test-upgrade-e2e COMPAT_BASELINE=v0.1.8` and passed `9/9`, including the clients-only old-server/current-clients server-expose creation assertions. TCP-tunnel HTTP backend checks use `curl` against the exposed port instead of `nc`, because BSD/netcat timeout behavior can report false negatives even when the backend returned a valid HTTP response.
+
+Capability-loss reconciliation has a focused Docker E2E target:
+
+```bash
+make test-system-e2e-capability-loss
+```
+
+This target builds the normal current E2E image plus a dedicated `e2e_capability_loss` image. The dedicated image omits `tcp_service` from reported target capabilities at compile time, then `TestSystemCapabilityLossReconcileE2E` replaces a live target client with that image and verifies an existing TCP server-expose tunnel becomes `error`, exposes a `capability_not_supported` issue, and releases the server TCP listener. This is a test image, not a product runtime switch.
+
+GitHub Actions also provides a manual `Cross-Version E2E` workflow. It is intentionally `workflow_dispatch` only. The workflow first runs the stable-only baseline, then builds the current E2E image, then optionally runs `COMPAT_MODE=full`, the upgrade/rollback matrix, and the focused capability-loss reconciliation E2E. Use it before merging or releasing the payload split implementation when local Docker time is expensive or when an auditable CI run is needed. Each phase tears down its Compose project so the default host ports can be reused by the next matrix.
 
 Legacy flat provision compatibility fixtures live under `internal/client/testdata/`:
 
@@ -130,9 +142,11 @@ Legacy flat provision compatibility fixtures live under `internal/client/testdat
 
 They are hand-crafted from the `v0.1.8` `ProxyNewRequest` schema and dual-dispatch code. They intentionally contain no `tunnel_id`, so current clients must route them through the legacy flat fallback. Do not add flat SOCKS5 or close-by-id fixtures for `v0.1.8`; those were not real flat legacy wire shapes.
 
+Legacy managed tunnel behavior is covered by unit/in-process tests, not by the Docker cross-version harness. Current and `v0.1.8` `netsgo client` do not expose `Client.ProxyConfigs` through CLI flags, environment variables, or a config file, and the remaining v1 `/api/clients/{id}/tunnels` API is intentionally outside system E2E mutation coverage. Do not add a test-only product switch just to manufacture a legacy managed mixed-version E2E. Add Docker coverage only after a real product configuration surface or v1/v2 write-path unification exists.
+
 CI syntax-checks these scripts and runs a cross-version smoke gate: stable-only baseline smoke followed by mixed-version compatibility smoke. Full cross-version execution is still intended for release or manual validation because it builds stable/current images and runs multiple Docker Compose stacks. PR CI should not be treated as proof of full cross-version data-path compatibility unless the manual `Cross-Version E2E` workflow or equivalent local commands have also passed.
 
-System E2E and cross-version harnesses never set `NETSGO_TDD_RED`. The expected-red TDD guard applies only to `internal/client` and `internal/server` unit tests through `make test-tdd-red-client` and `make test-tdd-red-server`.
+System E2E and cross-version harnesses never set `NETSGO_TDD_RED`. The payload-split focused targets `make test-tdd-red-client` and `make test-tdd-red-server` are now ordinary regression targets kept for historical command compatibility.
 
 ## Playwright UI E2E
 

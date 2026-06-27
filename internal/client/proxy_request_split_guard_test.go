@@ -11,8 +11,6 @@ import (
 )
 
 func TestUnifiedClientRuntimeDoesNotCallProxyRequestFromTunnelSpec(t *testing.T) {
-	requireTDDRed(t)
-
 	dirEntries, err := os.ReadDir(".")
 	if err != nil {
 		t.Fatalf("read client package dir: %v", err)
@@ -64,8 +62,6 @@ func TestUnifiedClientRuntimeDoesNotCallProxyRequestFromTunnelSpec(t *testing.T)
 }
 
 func TestUnifiedClientRuntimeDefinesFixedTargetStore(t *testing.T) {
-	requireTDDRed(t)
-
 	dirEntries, err := os.ReadDir(".")
 	if err != nil {
 		t.Fatalf("read client package dir: %v", err)
@@ -108,8 +104,6 @@ func TestUnifiedClientRuntimeDefinesFixedTargetStore(t *testing.T) {
 }
 
 func TestClientCleanupClearsFixedTargetRuntimes(t *testing.T) {
-	requireTDDRed(t)
-
 	fset := token.NewFileSet()
 	file, err := parser.ParseFile(fset, "client.go", nil, 0)
 	if err != nil {
@@ -156,8 +150,6 @@ func TestClientCleanupClearsFixedTargetRuntimes(t *testing.T) {
 }
 
 func TestClientHandleStreamUsesFixedTargetRuntimes(t *testing.T) {
-	requireTDDRed(t)
-
 	fset := token.NewFileSet()
 	file, err := parser.ParseFile(fset, "client.go", nil, 0)
 	if err != nil {
@@ -179,26 +171,13 @@ func TestClientHandleStreamUsesFixedTargetRuntimes(t *testing.T) {
 		t.Fatal("Client.handleStream method not found")
 	}
 
-	found := false
-	ast.Inspect(handleStreamFn, func(node ast.Node) bool {
-		sel, ok := node.(*ast.SelectorExpr)
-		if !ok || sel.Sel == nil {
-			return true
-		}
-		if sel.Sel.Name == "fixedTargetRuntimes" {
-			found = true
-			return false
-		}
-		return true
-	})
-	if !found {
+	methods := clientMethods(file)
+	if !clientMethodReferencesSelector(handleStreamFn, methods, "fixedTargetRuntimes") {
 		t.Fatal("Client.handleStream must dispatch fixed TCP/UDP/HTTP target streams via fixedTargetRuntimes before falling back to legacy c.proxies")
 	}
 }
 
 func TestClientHandleTunnelUnprovisionUsesFixedTargetRuntimes(t *testing.T) {
-	requireTDDRed(t)
-
 	fset := token.NewFileSet()
 	file, err := parser.ParseFile(fset, "unified_tunnel.go", nil, 0)
 	if err != nil {

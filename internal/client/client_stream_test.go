@@ -373,8 +373,6 @@ func TestClient_HandleStream_FallbackIDScanResolvesNameKeyedLegacyProxy(t *testi
 }
 
 func TestClient_HandleStream_FixedTCPTargetDialsEndpointHostPort(t *testing.T) {
-	requireTDDRed(t)
-
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Fixed-Target", "ok")
 		w.WriteHeader(http.StatusOK)
@@ -398,12 +396,6 @@ func TestClient_HandleStream_FixedTCPTargetDialsEndpointHostPort(t *testing.T) {
 	if !ack.Accepted {
 		t.Fatalf("fixed target provision rejected: %s", ack.Message)
 	}
-	// TODO(split-plan): remove this red-test shim once fixedTargetRuntimes is
-	// registered by provision; production must not simulate runtime state by
-	// deleting legacy c.proxies entries.
-	c.proxies.Delete(req.TunnelID)
-	c.proxies.Delete(req.Spec.Name)
-
 	header := testDataStreamHeader(req.TunnelID)
 	header.Revision = req.Revision
 	response, err := requestClientTargetHTTPStream(t, c, header, "127.0.0.1", 2*time.Second)
@@ -416,8 +408,6 @@ func TestClient_HandleStream_FixedTCPTargetDialsEndpointHostPort(t *testing.T) {
 }
 
 func TestClient_HandleStream_FixedUDPTargetRelaysFrames(t *testing.T) {
-	requireTDDRed(t)
-
 	packetConn, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen udp echo backend: %v", err)
@@ -448,12 +438,6 @@ func TestClient_HandleStream_FixedUDPTargetRelaysFrames(t *testing.T) {
 	if !ack.Accepted {
 		t.Fatalf("fixed UDP target provision rejected: %s", ack.Message)
 	}
-	// TODO(split-plan): remove this red-test shim once fixedTargetRuntimes is
-	// registered by provision; production must not simulate runtime state by
-	// deleting legacy c.proxies entries.
-	c.proxies.Delete(req.TunnelID)
-	c.proxies.Delete(req.Spec.Name)
-
 	clientConn, serverConn := net.Pipe()
 	defer mustClose(t, clientConn)
 	defer mustClose(t, serverConn)
@@ -522,8 +506,6 @@ func TestClient_HandleStream_FixedUDPTargetRelaysFrames(t *testing.T) {
 }
 
 func TestClient_HandleStream_FixedHTTPTargetDoesNotMatchByDomain(t *testing.T) {
-	requireTDDRed(t)
-
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Fixed-HTTP-Target", "ok")
 		w.WriteHeader(http.StatusOK)
@@ -555,12 +537,6 @@ func TestClient_HandleStream_FixedHTTPTargetDoesNotMatchByDomain(t *testing.T) {
 	if !ack.Accepted {
 		t.Fatalf("fixed HTTP target provision rejected: %s", ack.Message)
 	}
-	// TODO(split-plan): remove this red-test shim once fixedTargetRuntimes is
-	// registered by provision; production must not simulate runtime state by
-	// deleting legacy c.proxies entries.
-	c.proxies.Delete(req.TunnelID)
-	c.proxies.Delete(req.Spec.Name)
-
 	header := testDataStreamHeader(req.TunnelID)
 	header.Revision = req.Revision
 	response, err := requestClientTargetHTTPStream(t, c, header, "flat-field.example.com", 2*time.Second)

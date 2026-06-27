@@ -31,23 +31,23 @@ func (r *unifiedTunnelReconcileRegistry) run(tunnelID string, reconcile func() e
 	if r == nil {
 		return reconcile()
 	}
+	r.mu.Lock()
+	entry := r.entries[tunnelID]
+	if entry == nil {
+		entry = &unifiedTunnelReconcileEntry{}
+		r.entries[tunnelID] = entry
+	}
+	if entry.running {
+		entry.dirty = true
+		r.mu.Unlock()
+		return nil
+	}
+	entry.running = true
+	entry.dirty = false
+	r.mu.Unlock()
+
 	var lastErr error
 	for {
-		r.mu.Lock()
-		entry := r.entries[tunnelID]
-		if entry == nil {
-			entry = &unifiedTunnelReconcileEntry{}
-			r.entries[tunnelID] = entry
-		}
-		if entry.running {
-			entry.dirty = true
-			r.mu.Unlock()
-			return nil
-		}
-		entry.running = true
-		entry.dirty = false
-		r.mu.Unlock()
-
 		if err := reconcile(); err != nil {
 			lastErr = err
 		} else {

@@ -30,6 +30,10 @@ NETSGO_E2E_DIR="${NETSGO_E2E_DIR:-.}"
 
 log() { echo "[compat] $*"; }
 
+random_admin_password() {
+	printf 'NetsGo1-%s' "$(openssl rand -hex 12 2>/dev/null || uuidgen)"
+}
+
 for cmd in docker jq curl; do
 	command -v "${cmd}" >/dev/null 2>&1 || { log "ERROR: ${cmd} is required"; exit 1; }
 done
@@ -61,14 +65,14 @@ export NETSGO_E2E_TOOLS_IMAGE
 run_smoke() {
 	local project="$1"
 	SMOKE_PROJECT="${project}" \
-	SMOKE_ADMIN_PASS="$(openssl rand -base64 18 2>/dev/null || uuidgen)" \
+	SMOKE_ADMIN_PASS="$(random_admin_password)" \
 	bash "${NETSGO_E2E_DIR}/test/e2e/scripts/smoke-system.sh"
 }
 
 run_main_system_e2e() {
 	local project="$1"
 	local admin_pass
-	admin_pass="$(openssl rand -base64 18 2>/dev/null || uuidgen)"
+	admin_pass="$(random_admin_password)"
 	(cd "${NETSGO_E2E_DIR}" && \
 	NETSGO_E2E_COMPOSE_PROJECT="${project}" \
 	NETSGO_E2E_COMPOSE_FILES="${E2E_BASE_COMPOSE},${E2E_PROXY_COMPOSE}" \
@@ -93,7 +97,7 @@ run_main_system_e2e() {
 run_single_target_e2e() {
 	local project="$1"
 	local admin_pass
-	admin_pass="$(openssl rand -base64 18 2>/dev/null || uuidgen)"
+	admin_pass="$(random_admin_password)"
 	(cd "${NETSGO_E2E_DIR}" && \
 	NETSGO_E2E_COMPOSE_PROJECT="${project}" \
 	NETSGO_E2E_COMPOSE_FILES="${E2E_BASE_COMPOSE},${E2E_PROXY_COMPOSE}" \
@@ -110,7 +114,7 @@ run_single_target_e2e() {
 run_c2c_clean_reject_e2e() {
 	local project="$1"
 	local admin_pass
-	admin_pass="$(openssl rand -base64 18 2>/dev/null || uuidgen)"
+	admin_pass="$(random_admin_password)"
 	(cd "${NETSGO_E2E_DIR}" && \
 	NETSGO_E2E_COMPOSE_PROJECT="${project}" \
 	NETSGO_E2E_COMPOSE_FILES="${E2E_BASE_COMPOSE},${E2E_PROXY_COMPOSE}" \

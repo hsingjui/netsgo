@@ -23,6 +23,14 @@ on:
         options:
           - "true"
           - "false"
+      run_capability_loss:
+        description: Run focused capability-loss reconciliation E2E
+        required: true
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
 
 permissions:
   contents: read
@@ -60,6 +68,7 @@ jobs:
           set -euo pipefail
           make test-baseline-e2e \
             COMPAT_BASELINE="${{ inputs.baseline }}" \
+            BASELINE_MODE=full \
             BASELINE_REBUILD_IMAGE=true
 
       - name: Build current E2E image
@@ -87,3 +96,12 @@ jobs:
           make test-upgrade-e2e \
             COMPAT_BASELINE="${{ inputs.baseline }}" \
             E2E_CURRENT_IMAGE=netsgo-e2e:current
+
+      - name: Run capability-loss reconciliation E2E
+        if: ${{ inputs.run_capability_loss == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          make test-system-e2e-capability-loss \
+            E2E_CURRENT_IMAGE=netsgo-e2e:current \
+            E2E_CAPABILITY_LOSS_IMAGE=netsgo-e2e:capability-loss

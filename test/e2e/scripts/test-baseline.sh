@@ -24,6 +24,10 @@ REBUILD_IMAGE="${BASELINE_REBUILD_IMAGE:-false}"
 
 log() { echo "[baseline] $*"; }
 
+random_admin_password() {
+	printf 'NetsGo1-%s' "$(openssl rand -hex 12 2>/dev/null || uuidgen)"
+}
+
 compose() {
 	docker compose -f "${E2E_BASE_COMPOSE}" -f "${E2E_PROXY_COMPOSE}" -p "${project}" "$@"
 }
@@ -80,7 +84,7 @@ export C2C_SOCKS5_AUTH_PORT="${C2C_SOCKS5_AUTH_PORT:-19102}"
 export C2C_SOCKS5_SOURCE_DENY_PORT="${C2C_SOCKS5_SOURCE_DENY_PORT:-19103}"
 
 project="${E2E_PROJECT_BASE}-stable-only"
-admin_pass="$(openssl rand -base64 18 2>/dev/null || uuidgen)"
+admin_pass="$(random_admin_password)"
 
 log "============================================="
 log "STABLE-ONLY BASELINE E2E"

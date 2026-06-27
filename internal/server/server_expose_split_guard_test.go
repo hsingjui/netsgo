@@ -11,8 +11,6 @@ import (
 )
 
 func TestUnifiedServerExposeRuntimeDoesNotReadStoredProxyNewRequest(t *testing.T) {
-	requireTDDRed(t)
-
 	fset := token.NewFileSet()
 	// Curated list of runtime/reconcile files that must derive server-expose
 	// runtime config from stored endpoint/spec fields, not from the embedded

@@ -34,6 +34,9 @@ UPSTREAM_PORT="${UPSTREAM_PORT:-19081}"
 SERVER_TCP_PORT="${SERVER_TCP_PORT:-19093}"
 SERVER_UDP_PORT="${SERVER_UDP_PORT:-19094}"
 SERVER_SOCKS5_PORT="${SERVER_SOCKS5_PORT:-19095}"
+SERVER_TCP_ALT_PORT="${SERVER_TCP_ALT_PORT:-19104}"
+SERVER_UDP_ALT_PORT="${SERVER_UDP_ALT_PORT:-19105}"
+SERVER_SOCKS5_ALT_PORT="${SERVER_SOCKS5_ALT_PORT:-19106}"
 C2C_SOCKS5_PORT="${C2C_SOCKS5_PORT:-19096}"
 C2C_SOCKS5_DENY_PORT="${C2C_SOCKS5_DENY_PORT:-19097}"
 C2C_TCP_PORT="${C2C_TCP_PORT:-19098}"
@@ -48,7 +51,7 @@ E2E_STABLE_IMAGE="${E2E_STABLE_IMAGE:-netsgo-e2e:${COMPAT_BASELINE}}"
 NETSGO_E2E_TOOLS_IMAGE="${NETSGO_E2E_TOOLS_IMAGE:-${E2E_STABLE_IMAGE}}"
 NETSGO_E2E_DIR="${NETSGO_E2E_DIR:-.}"
 RECOVERY_TIMEOUT_SECONDS="${UPGRADE_RECOVERY_TIMEOUT_SECONDS:-120}"
-export SERVER_TCP_PORT SERVER_UDP_PORT SERVER_SOCKS5_PORT
+export SERVER_TCP_PORT SERVER_UDP_PORT SERVER_SOCKS5_PORT SERVER_TCP_ALT_PORT SERVER_UDP_ALT_PORT SERVER_SOCKS5_ALT_PORT
 export C2C_SOCKS5_PORT C2C_SOCKS5_DENY_PORT C2C_TCP_PORT C2C_TCP_ALT_PORT C2C_TCP_SLOW_PORT C2C_UDP_PORT C2C_SOCKS5_AUTH_PORT C2C_SOCKS5_SOURCE_DENY_PORT
 
 ADMIN_USER="admin"
@@ -62,6 +65,11 @@ UDP_BACKEND_HOST="udp-backend"
 UDP_BACKEND_PORT=18084
 
 log() { echo "[upgrade] $*"; }
+
+random_admin_password() {
+	printf 'NetsGo1-%s' "$(openssl rand -hex 12 2>/dev/null || uuidgen)"
+}
+
 for cmd in docker jq curl nc; do
 	command -v "${cmd}" >/dev/null 2>&1 || { log "ERROR: ${cmd} is required"; exit 1; }
 done
@@ -466,10 +474,9 @@ verify_tcp_http() {
 	local end_ts="$(($(date +%s) + timeout))"
 	while [ "$(date +%s)" -lt "${end_ts}" ]; do
 		local resp=""
-		if resp="$(printf 'GET / HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n' "${host}" | nc -w 5 127.0.0.1 "${port}" 2>/dev/null)"; then
-			if echo "${resp}" | grep -qF "${expected}" 2>/dev/null; then
-				return 0
-			fi
+		resp="$(curl -sS --max-time 5 -H "Host: ${host}" "http://127.0.0.1:${port}/" 2>/dev/null || true)"
+		if echo "${resp}" | grep -qF "${expected}" 2>/dev/null; then
+			return 0
 		fi
 		sleep 2
 	done
@@ -515,14 +522,26 @@ verify_server_expose_suite() {
 	assert_server_expose_tcp_listeners "${phase}" || return 1
 }
 
-assert_new_http_tunnel_works() {
-	local token="$1" phase="$2" name="$3" host="$4" target_cid="$5"
-	local tid
-	tid="$(create_server_expose_http "${token}" "${name}" "${host}" "${target_cid}")"
-	[ -z "${tid}" ] && { log "FAIL: ${phase} failed to create new HTTP tunnel"; return 1; }
-	wait_tunnel_active "${token}" "${tid}" "${RECOVERY_TIMEOUT_SECONDS}" || { log "FAIL: ${phase} new HTTP tunnel not active"; return 1; }
-	assert_tunnel_no_issues "${token}" "${tid}" "${phase} new HTTP" || return 1
+assert_new_server_expose_suite_works() {
+	local token="$1" phase="$2" name_prefix="$3" host="$4" target_cid="$5"
+	local http_tid tcp_tid udp_tid socks5_tid
+	http_tid="$(create_server_expose_http "${token}" "${name_prefix}-http" "${host}" "${target_cid}")"
+	[ -z "${http_tid}" ] && { log "FAIL: ${phase} failed to create new HTTP tunnel"; return 1; }
+	tcp_tid="$(create_server_expose_tcp "${token}" "${name_prefix}-tcp" "${SERVER_TCP_ALT_PORT}" "${target_cid}")"
+	[ -z "${tcp_tid}" ] && { log "FAIL: ${phase} failed to create new server_expose TCP tunnel"; return 1; }
+	udp_tid="$(create_server_expose_udp "${token}" "${name_prefix}-udp" "${SERVER_UDP_ALT_PORT}" "${target_cid}")"
+	[ -z "${udp_tid}" ] && { log "FAIL: ${phase} failed to create new server_expose UDP tunnel"; return 1; }
+	socks5_tid="$(create_server_expose_socks5 "${token}" "${name_prefix}-socks5" "${SERVER_SOCKS5_ALT_PORT}" "${target_cid}")"
+	[ -z "${socks5_tid}" ] && { log "FAIL: ${phase} failed to create new server_expose SOCKS5 tunnel"; return 1; }
+
+	wait_server_expose_suite_active "${token}" "${phase} new server_expose suite" "${http_tid}" "${tcp_tid}" "${udp_tid}" "${socks5_tid}" || return 1
 	verify_http "${host}" "${BACKEND_RESPONSE}" 60 || { log "FAIL: ${phase} new HTTP data path failed"; return 1; }
+	verify_tcp_http "${SERVER_TCP_ALT_PORT}" "${BACKEND_HOST}" "${BACKEND_RESPONSE}" 30 || { log "FAIL: ${phase} new server_expose TCP data path failed"; return 1; }
+	verify_udp_echo "${SERVER_UDP_ALT_PORT}" "${phase} new server udp" 30 || { log "FAIL: ${phase} new server_expose UDP data path failed"; return 1; }
+	verify_socks5_http "${SERVER_SOCKS5_ALT_PORT}" "${BACKEND_HOST}" "${BACKEND_RESPONSE}" 30 || { log "FAIL: ${phase} new server_expose SOCKS5 data path failed"; return 1; }
+	assert_tcp_listener_count "server" "${SERVER_TCP_ALT_PORT}" 1 "${phase} new server_expose TCP" || return 1
+	assert_listener_count "server" "${SERVER_UDP_ALT_PORT}" "udp" 1 "${phase} new server_expose UDP" || return 1
+	assert_tcp_listener_count "server" "${SERVER_SOCKS5_ALT_PORT}" 1 "${phase} new server_expose SOCKS5" || return 1
 }
 
 # ---------- Image upgrade helper ----------
@@ -594,7 +613,7 @@ TUNNEL_HOST="upgrade-test.system.local"
 case_server_only() {
 	local project="${E2E_PROJECT_BASE}-server-only"
 	local admin_pass tunnel_host
-	admin_pass="$(openssl rand -base64 18 2>/dev/null || uuidgen)"
+	admin_pass="$(random_admin_password)"
 	tunnel_host="srv-up.${TUNNEL_HOST}"
 
 	set_project "${project}"
@@ -669,7 +688,7 @@ case_server_only() {
 case_target_only() {
 	local project="${E2E_PROJECT_BASE}-target-only"
 	local admin_pass tunnel_host
-	admin_pass="$(openssl rand -base64 18 2>/dev/null || uuidgen)"
+	admin_pass="$(random_admin_password)"
 	tunnel_host="tgt-up.${TUNNEL_HOST}"
 
 	set_project "${project}"
@@ -740,7 +759,7 @@ case_target_only() {
 case_ingress_only() {
 	local project="${E2E_PROJECT_BASE}-ingress-only"
 	local admin_pass
-	admin_pass="$(openssl rand -base64 18 2>/dev/null || uuidgen)"
+	admin_pass="$(random_admin_password)"
 
 	set_project "${project}"
 	log ""
@@ -815,7 +834,7 @@ case_ingress_only() {
 case_clients_only() {
 	local project="${E2E_PROJECT_BASE}-clients-only"
 	local admin_pass tunnel_host
-	admin_pass="$(openssl rand -base64 18 2>/dev/null || uuidgen)"
+	admin_pass="$(random_admin_password)"
 	tunnel_host="clients-up.${TUNNEL_HOST}"
 
 	set_project "${project}"
@@ -892,8 +911,9 @@ case_clients_only() {
 	verify_tcp_http "${C2C_TCP_PORT}" "${BACKEND_HOST}" "${BACKEND_RESPONSE}" 30 || { log "FAIL: c2c TCP data path broken after clients upgrade"; return 1; }
 	verify_socks5_http "${C2C_SOCKS5_PORT}" "${BACKEND_HOST}" "${BACKEND_RESPONSE}" 30 || { log "FAIL: c2c SOCKS5 data path broken after clients upgrade"; return 1; }
 	assert_c2c_clean_reject "${token}" "after-clients-upgrade" "${_ingress_cid}" "${_target_cid}" "${C2C_TCP_ALT_PORT}" || return 1
+	assert_new_server_expose_suite_works "${token}" "after-clients-upgrade" "clients-up-new" "new.${tunnel_host}" "${_target_cid}" || return 1
 
-	log "PASS: clients-only upgrade (old server + current clients, HTTP + c2c TCP/SOCKS5)"
+	log "PASS: clients-only upgrade (old server + current clients, existing HTTP + c2c TCP/SOCKS5 and new server_expose HTTP/TCP/UDP/SOCKS5)"
 	return 0
 }
 
@@ -904,7 +924,7 @@ case_clients_only() {
 case_server_rollback() {
 	local project="${E2E_PROJECT_BASE}-server-rollback"
 	local admin_pass tunnel_host
-	admin_pass="$(openssl rand -base64 18 2>/dev/null || uuidgen)"
+	admin_pass="$(random_admin_password)"
 	tunnel_host="rollback.${TUNNEL_HOST}"
 
 	set_project "${project}"
@@ -981,7 +1001,7 @@ case_server_rollback() {
 	wait_server_expose_suite_active "${token}" "after server rollback" "${http_tid}" "${server_tcp_tid}" "${server_udp_tid}" "${server_socks5_tid}" || return 1
 	verify_server_expose_suite "${tunnel_host}" "rollback udp after server rollback" "after server rollback" || return 1
 	assert_c2c_clean_reject "${token}" "after-server-rollback" "${_ingress_cid}" "${_target_cid}" "${C2C_TCP_ALT_PORT}" || return 1
-	assert_new_http_tunnel_works "${token}" "after-server-rollback" "rollback-new-http" "new.${tunnel_host}" "${_target_cid}" || return 1
+	assert_new_server_expose_suite_works "${token}" "after-server-rollback" "rollback-new" "new.${tunnel_host}" "${_target_cid}" || return 1
 
 	log "PASS: server rollback (stable reads same data dir after current server, HTTP + server TCP/UDP/SOCKS5)"
 	return 0
@@ -995,7 +1015,7 @@ case_server_rollback() {
 case_current_write_rollback() {
 	local project="${E2E_PROJECT_BASE}-current-write-rollback"
 	local admin_pass tunnel_host
-	admin_pass="$(openssl rand -base64 18 2>/dev/null || uuidgen)"
+	admin_pass="$(random_admin_password)"
 	tunnel_host="current-write-rollback.${TUNNEL_HOST}"
 
 	set_project "${project}"
@@ -1091,7 +1111,7 @@ case_current_write_rollback() {
 	verify_udp_echo "${C2C_UDP_PORT}" "current write c2c udp after rollback" 30 || { log "FAIL: current-created c2c UDP data path broken after rollback"; return 1; }
 	verify_socks5_http "${C2C_SOCKS5_PORT}" "${BACKEND_HOST}" "${BACKEND_RESPONSE}" 30 || { log "FAIL: current-created c2c SOCKS5 data path broken after rollback"; return 1; }
 	assert_c2c_clean_reject "${token}" "after-current-write-rollback" "${_ingress_cid}" "${_target_cid}" "${C2C_TCP_ALT_PORT}" || return 1
-	assert_new_http_tunnel_works "${token}" "after-current-write-rollback" "current-write-rollback-new-http" "new.${tunnel_host}" "${_target_cid}" || return 1
+	assert_new_server_expose_suite_works "${token}" "after-current-write-rollback" "current-write-rollback-new" "new.${tunnel_host}" "${_target_cid}" || return 1
 
 	log "PASS: current-write rollback (stable reads current-created HTTP + server TCP/UDP/SOCKS5 + c2c TCP/UDP/SOCKS5 tunnels)"
 	return 0
@@ -1104,7 +1124,7 @@ case_current_write_rollback() {
 case_all_upgrade() {
 	local project="${E2E_PROJECT_BASE}-all-upgrade"
 	local admin_pass tunnel_host
-	admin_pass="$(openssl rand -base64 18 2>/dev/null || uuidgen)"
+	admin_pass="$(random_admin_password)"
 	tunnel_host="all-up.${TUNNEL_HOST}"
 
 	set_project "${project}"
@@ -1225,7 +1245,7 @@ case_all_upgrade() {
 case_client_first_rolling() {
 	local project="${E2E_PROJECT_BASE}-client-first-rolling"
 	local admin_pass tunnel_host
-	admin_pass="$(openssl rand -base64 18 2>/dev/null || uuidgen)"
+	admin_pass="$(random_admin_password)"
 	tunnel_host="client-first.${TUNNEL_HOST}"
 
 	set_project "${project}"
@@ -1339,7 +1359,7 @@ case_client_first_rolling() {
 case_full_cold_upgrade() {
 	local project="${E2E_PROJECT_BASE}-full-cold-upgrade"
 	local admin_pass tunnel_host
-	admin_pass="$(openssl rand -base64 18 2>/dev/null || uuidgen)"
+	admin_pass="$(random_admin_password)"
 	tunnel_host="cold-up.${TUNNEL_HOST}"
 
 	set_project "${project}"

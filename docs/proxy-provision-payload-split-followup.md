@@ -7,17 +7,10 @@ stay stable while remaining work is tracked explicitly.
 
 ## Current scope
 
-Do not start the production payload-split implementation unless the user
-explicitly changes the scope. The immediate scope is:
-
-- finish the remaining test-plan hardening;
-- run or delegate the expensive cross-version tests;
-- update the plan documents with exact evidence after those tests pass or fail.
-
-The current work is test-driven. Expected-red tests are allowed only behind
-`NETSGO_TDD_RED=1` and the `make test-tdd-red-*` targets. Default CI and default
-`go test ./...` must not require expected-red tests to pass before the production
-implementation exists.
+The initial handoff scope was test-plan hardening only. The user later asked to
+continue, so production payload-split implementation has started. The historical
+`make test-tdd-red-*` targets are now ordinary focused regression targets; the
+client/server `requireTDDRed(t)` guards have been removed.
 
 ## What has landed
 
@@ -44,97 +37,118 @@ make test-baseline-e2e COMPAT_BASELINE=v0.1.8 BASELINE_MODE=full
 That run reused an existing local `netsgo-e2e:v0.1.8` image. It proves the
 v0.1.8 runtime baseline, not the tag-to-image rebuild path.
 
-## Remaining work before calling the test plan complete
+## Landed after the initial handoff
 
-### 1. Strengthen rollback "old server continues service" coverage
+### Rollback "old server continues service" coverage strengthened
 
 Current state:
 
 - `server-rollback` and `current-write-rollback` revalidate existing
   HTTP/TCP/UDP/SOCKS5 server-expose tunnels after stable server rollback;
-- they also create and verify a new HTTP server-expose tunnel after rollback.
+- they also create and verify a new HTTP/TCP/UDP/SOCKS5 server-expose suite
+  after rollback;
+- each new tunnel must reach `active`;
+- each new tunnel must have empty `issues`;
+- HTTP/TCP/UDP/SOCKS5 data paths must work;
+- server listener counts must be `1` for the new TCP/UDP/SOCKS5 ports.
 
-Gap:
+Implementation evidence:
 
-- the post-rollback "new tunnel can still be created" proof is HTTP-only.
-
-Required next step:
-
-- extend post-rollback creation to a full server-expose suite:
-  HTTP, TCP, UDP, and SOCKS5;
-- verify each new tunnel reaches `active`;
-- verify each new tunnel has empty `issues`;
-- verify HTTP/TCP/UDP/SOCKS5 data paths;
-- verify server listener counts for the new TCP/UDP/SOCKS5 ports.
-
-Likely implementation shape:
-
-- add dedicated server alt port variables, for example:
+- dedicated server alt port variables were added:
   `E2E_SERVER_TCP_ALT_PORT`, `E2E_SERVER_UDP_ALT_PORT`,
   `E2E_SERVER_SOCKS5_ALT_PORT`;
-- pass them from `Makefile` to `test-upgrade.sh`;
-- add the corresponding server port mappings to
+- `Makefile` passes them to `test-upgrade.sh`;
+- corresponding server port mappings were added to
   `test/e2e/docker-compose.system.yml`;
-- add an `assert_new_server_expose_suite_works` helper in
+- `assert_new_server_expose_suite_works` was added in
   `test/e2e/scripts/test-upgrade.sh`;
-- call that helper from `case_server_rollback` and
-  `case_current_write_rollback`;
-- update `docs/e2e-testing.md` and
-  `docs/proxy-provision-payload-split-plan.md`.
+- that helper is called from `case_server_rollback` and
+  `case_current_write_rollback`.
 
-Do not reuse `C2C_*` host ports for this. Those ports are mapped on the
-`ingress-client` service, not the `server` service, so they are the wrong proof
+These tests intentionally use server alt ports, not `C2C_*` host ports.
+`C2C_*` ports are mapped on `ingress-client`, so they are the wrong proof
 surface for server-expose rollback creation.
 
-### 2. Run a final external review
+## Remaining work before calling the test plan complete
 
-Ask qoder to review the remaining test strategy after the rollback suite is
-strengthened.
+### 1. External review result
 
-Suggested command:
+Qoder review has been run after the rollback suite was strengthened. Its
+conclusion:
+
+- no hidden design blocker in the test strategy;
+- the initial hard blocker was that full cross-version gates had not been
+  executed on the current worktree;
+- important non-blockers to track:
+  - capability-loss / reconcile-stage clean reject now has in-process
+    server-expose and client-to-client coverage, while Docker E2E remains
+    absent;
+  - client-side unknown target provision reject has since been implemented and
+    converted to a normal regression;
+  - stable server with already-upgraded current clients now creates and
+    verifies a new server-expose HTTP/TCP/UDP/SOCKS5 suite in `clients-only`;
+  - stable server mutation of current-written rows after rollback is not
+    covered;
+  - legacy managed tunnel cross-version E2E is absent. It is now explicitly
+    scoped as unit/in-process coverage only, because neither current nor
+    `v0.1.8` `netsgo client` exposes `Client.ProxyConfigs` through a real
+    CLI/env/config product surface, and system E2E is intentionally scoped to
+    `/api/tunnels` mutations rather than legacy APIs.
+
+Command used:
 
 ```bash
 qodercli --yolo "请严肃审查 NetsGo 的 proxy provision payload split 测试规划。重点看 docs/proxy-provision-payload-split-plan.md、docs/proxy-provision-payload-split-followup.md、test/e2e/scripts/test-upgrade.sh、test/e2e/scripts/test-compat.sh、Makefile、.github/workflows/cross-version-e2e.yml。请只评价测试规划和兼容验收，不要实现生产代码。请明确指出 blocker、非 blocker、以及是否还存在 old server/current client、old client/current server、server rollback/current-write rollback 的覆盖缺口。"
 ```
 
-The user previously requested long-running qoder calls to be polled about every
-three minutes instead of being interrupted or narrowed prematurely.
+Workflow follow-up from the review: `.github/workflows/cross-version-e2e.yml`
+now passes `BASELINE_MODE=full` explicitly instead of relying on the Makefile
+default.
 
-### 3. Run full cross-version tests
+### 2. Full cross-version tests
 
-Minimum commands before the test plan is considered closed:
+The required full cross-version gates have been run on the current worktree:
 
 ```bash
 make test-compat-e2e COMPAT_BASELINE=v0.1.8 COMPAT_MODE=full COMPAT_ABORT_ON_FAILURE=true
 make test-upgrade-e2e COMPAT_BASELINE=v0.1.8
 ```
 
-Optional but useful when validating the baseline image path:
+Evidence:
 
-```bash
-make test-baseline-e2e COMPAT_BASELINE=v0.1.8 BASELINE_MODE=full BASELINE_REBUILD_IMAGE=true
-```
+- `test-compat-e2e`: passed `11/11`.
+- `test-upgrade-e2e`: passed `9/9`.
+- The full compat run rebuilt `netsgo-e2e:v0.1.8` from tag `v0.1.8`, so the
+  stable-image rebuild path has also been exercised.
+- While closing the gate, `verify_tcp_http` was changed from `nc` to `curl`
+  because BSD/netcat timeout semantics produced false negatives after the HTTP
+  backend had already returned a valid response.
+- While closing the gate, unified resume was fixed to clear stale server-expose
+  runtime state before scheduling reconcile; otherwise current server could
+  report an HTTP tunnel active after stop/resume while the route still returned
+  502.
 
-If local Docker runtime is too expensive, use the manual `Cross-Version E2E`
-GitHub workflow. Do not treat the PR CI smoke job as proof that full compat or
-upgrade/rollback passed.
+### 3. Status labels after evidence exists
 
-### 4. Update status labels after evidence exists
+After the full test runs, the coverage matrix has been updated:
 
-After the full test runs:
+- legacy managed tunnel create/provision is `[GREEN]` within its explicit
+  unit/in-process compatibility scope;
+- capability-loss / reconcile-stage clean reject now has in-process
+  server-expose and client-to-client coverage, plus a focused Docker E2E via
+  the dedicated `e2e_capability_loss` test image and
+  `TestSystemCapabilityLossReconcileE2E`;
+- keep converted red guards as normal regressions instead of deleting them.
 
-- update the coverage matrix status and evidence in
-  `docs/proxy-provision-payload-split-plan.md`;
-- keep production-dependent rows as `[RED]`, `[PARTIAL]`, or `[PENDING]` until
-  the production implementation exists;
-- do not mark expected-red rows complete just because they are present;
-- if a red guard becomes green during implementation, remove `requireTDDRed(t)`
-  or replace the guard with a stronger normal regression test.
+Do not add test-only production APIs to turn scoped rows into Docker E2E. The
+capability-loss Docker proof uses a dedicated build-tagged test image instead
+of a runtime product switch; `make test-system-e2e-capability-loss` has passed
+and the matrix row is now `[GREEN]`.
 
-## Production implementation is still separate
+## Production implementation status
 
-After the test plan is closed, the implementation PR still has to do the actual
-payload split work. Expected implementation themes are:
+The production payload split work has now been implemented in this worktree.
+The completed implementation themes are:
 
 - fixed TCP/UDP/HTTP target runtime must stop relying on legacy `c.proxies`;
 - SOCKS5 target runtime must remain endpoint-specific;
@@ -144,9 +158,10 @@ payload split work. Expected implementation themes are:
 - stale provision ACKs must not activate old revisions;
 - rejected provision must leave no listener, runtime, or ack waiter;
 - reconcile registry dirty rerun/coalescing must be fixed;
-- shutdown and in-flight reconcile cleanup need runtime-store-level tests;
-- capability-loss / reconcile-stage clean reject needs an implementation-time
-  test hook or production capability path before Docker E2E can fully cover it.
+- shutdown and in-flight reconcile cleanup have runtime-store-level tests;
+- capability-loss / reconcile-stage clean reject now has in-process runtime
+  cleanup coverage and a passing focused Docker E2E using a dedicated
+  build-tagged test image.
 
-Those implementation tasks should be done only after the user asks to proceed
-from test planning into production code.
+Keep this section as a compact handoff summary of the runtime invariants that
+the current tests are protecting.
