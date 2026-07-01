@@ -35,11 +35,12 @@ test('client-to-client TCP tunnel can stop, edit, resume, and delete from the UI
   await expectHTTPContains(page, e2eConfig.lifecycleTCPHostPort, 'playwright tcp c2c response');
 
   let row = tunnelRow(page, name);
-  await expect(row).toContainText('Client ↔ Client');
-  await expect(row).toContainText('Ingress');
-  await expect(row).toContainText('Target');
-  await expect(row).toContainText('Server relay');
-  await expect(row).toContainText('Ingress binds to a wildcard address');
+  await expect(row).toContainText(ingress.info.hostname);
+  await expect(row).toContainText('0.0.0.0:18092');
+  await expect(row).toContainText(source.info.hostname);
+  await expect(row).toContainText('tcp-backend:18083');
+  await expect(row.getByLabel('Unlimited bandwidth')).toBeVisible();
+  await expect(row).toContainText('Active');
   await captureArtifact(row, testInfo, 'client-to-client-active-row');
 
   await clickTunnelAction(page, name, 'Stop');

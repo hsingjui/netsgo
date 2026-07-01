@@ -200,10 +200,14 @@ func (s *Server) handleUnifiedTunnelAction(w http.ResponseWriter, r *http.Reques
 }
 
 func (s *Server) resumeUnifiedTunnel(w http.ResponseWriter, current tunnelSpecAPI) {
-	stored, err := s.loadOfflineManagedTunnelBySelector(current.OwnerClientID, current.ID)
+	stored, err := s.loadOfflineTunnelBySelector(current.OwnerClientID, current.ID)
 	if err != nil {
 		status, payload := tunnelMutationErrorStatusAndBody(err)
 		encodeJSON(w, status, payload)
+		return
+	}
+	if !canResumeTunnel(storedTunnelToProxyConfig(stored)) {
+		writeAPIError(w, http.StatusConflict, protocol.TunnelMutationErrorCodeTunnelResumeNotAllowed, "only stopped or error tunnels can be resumed")
 		return
 	}
 	if err := s.store.UpdateStates(current.OwnerClientID, stored.Name, protocol.ProxyDesiredStateRunning, protocol.ProxyRuntimeStateOffline, ""); err != nil {
@@ -227,13 +231,13 @@ func (s *Server) resumeUnifiedTunnel(w http.ResponseWriter, current tunnelSpecAP
 }
 
 func (s *Server) stopUnifiedTunnel(w http.ResponseWriter, current tunnelSpecAPI) {
-	stored, err := s.loadOfflineManagedTunnelBySelector(current.OwnerClientID, current.ID)
+	stored, err := s.loadOfflineTunnelBySelector(current.OwnerClientID, current.ID)
 	if err != nil {
 		status, payload := tunnelMutationErrorStatusAndBody(err)
 		encodeJSON(w, status, payload)
 		return
 	}
-	config, err := s.stopOfflineManagedTunnel(current.OwnerClientID, current.ID)
+	config, err := s.stopOfflineTunnel(current.OwnerClientID, current.ID)
 	if err != nil {
 		status, payload := tunnelMutationErrorStatusAndBody(err)
 		encodeJSON(w, status, payload)
@@ -408,7 +412,7 @@ func (s *Server) handleDeleteUnifiedTunnel(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	stored, err := s.loadOfflineManagedTunnelBySelector(current.OwnerClientID, current.ID)
+	stored, err := s.loadOfflineTunnelBySelector(current.OwnerClientID, current.ID)
 	if err != nil {
 		status, payload := tunnelMutationErrorStatusAndBody(err)
 		encodeJSON(w, status, payload)
@@ -834,6 +838,16 @@ func (s *Server) storedTunnelFromUnifiedRequest(req tunnelCreateRequestAPI, exis
 	}
 	if strings.TrimSpace(req.Name) == "" {
 		return StoredTunnel{}, newProxyRequestValidationError(fmt.Errorf("tunnel name is required"), protocol.TunnelMutationFieldName, "", http.StatusBadRequest)
+	}
+	if err := validateBandwidthSettings(req.BandwidthSettings); err != nil {
+		switch {
+		case req.BandwidthSettings.IngressBPS < 0:
+			return StoredTunnel{}, newProxyRequestValidationError(err, "bandwidth_settings."+protocol.TunnelMutationFieldIngressBPS, "", http.StatusBadRequest)
+		case req.BandwidthSettings.EgressBPS < 0:
+			return StoredTunnel{}, newProxyRequestValidationError(err, "bandwidth_settings."+protocol.TunnelMutationFieldEgressBPS, "", http.StatusBadRequest)
+		default:
+			return StoredTunnel{}, newProxyRequestValidationError(err, "bandwidth_settings", "", http.StatusBadRequest)
+		}
 	}
 	if req.TransportPolicy == "" {
 		req.TransportPolicy = tunnelTransportPolicyServerRelayOnly

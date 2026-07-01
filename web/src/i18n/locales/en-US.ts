@@ -462,7 +462,6 @@ export const enUS = {
     tunnel_resume_failed: 'Failed to resume tunnel.',
     tunnel_stop_failed: 'Failed to stop tunnel.',
     tunnel_delete_failed: 'Failed to delete tunnel.',
-    tunnel_busy: 'This tunnel is busy. Try again after it stops processing.',
     tunnel_lookup_failed: 'Failed to look up tunnel.',
     tunnel_list_failed: 'Failed to list tunnels.',
     unknown_tunnel_action: 'Unknown tunnel action.',

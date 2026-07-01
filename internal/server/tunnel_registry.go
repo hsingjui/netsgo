@@ -149,42 +149,6 @@ func (tr *TunnelRegistry) cancelProvisionAckWaiters(clientID string, generation 
 	}
 }
 
-func (tr *TunnelRegistry) waitForProvisionAck(s *Server, client *ClientConn, req protocol.ProxyNewRequest) (provisionAckResult, error) {
-	if req.ProvisionRevision == 0 {
-		return provisionAckResult{}, fmt.Errorf("tunnel %q missing provisioning revision", req.Name)
-	}
-	ch, err := tr.registerProvisionAckWaiter(client, req.Name, req.ProvisionRevision, "")
-	if err != nil {
-		return provisionAckResult{}, err
-	}
-
-	if err := s.notifyClientProxyProvision(client, req); err != nil {
-		tr.unregisterProvisionAckWaiter(client, req.Name, req.ProvisionRevision, "")
-		return provisionAckResult{}, err
-	}
-
-	timeout := tr.tunnelReadyTimeout
-	if timeout <= 0 {
-		timeout = 5 * time.Second
-	}
-	timer := time.NewTimer(timeout)
-	defer timer.Stop()
-
-	select {
-	case resp, ok := <-ch:
-		if !ok {
-			return provisionAckResult{}, errTunnelProvisionAckCancelled
-		}
-		if !resp.accepted {
-			return resp, &tunnelProvisionRejectedError{name: req.Name, message: resp.message}
-		}
-		return resp, nil
-	case <-timer.C:
-		tr.unregisterProvisionAckWaiter(client, req.Name, req.ProvisionRevision, "")
-		return provisionAckResult{}, errTunnelProvisionAckTimeout
-	}
-}
-
 func (tr *TunnelRegistry) registerPreflightWaiter(client *ClientConn, requestID string) (<-chan protocol.TunnelPreflightResponse, error) {
 	if requestID == "" {
 		return nil, fmt.Errorf("preflight request missing request_id")

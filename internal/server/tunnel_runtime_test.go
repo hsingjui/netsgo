@@ -138,42 +138,6 @@ func TestTunnelPreflightResponseRequiresTunnelRevisionAndRoleMatch(t *testing.T)
 	}
 }
 
-func TestPrepareTunnelProvisionRequestAssignsRevisionAndPendingRuntime(t *testing.T) {
-	s := New(0)
-	client := &ClientConn{
-		ID:      "client-runtime",
-		proxies: make(map[string]*ProxyTunnel),
-	}
-	tunnel := &ProxyTunnel{
-		Config: protocol.ProxyConfig{
-			Name:         "runtime-tunnel",
-			Type:         protocol.ProxyTypeTCP,
-			RemotePort:   18080,
-			DesiredState: protocol.ProxyDesiredStateRunning,
-			RuntimeState: protocol.ProxyRuntimeStatePending,
-		},
-		done: make(chan struct{}),
-	}
-	client.proxies[tunnel.Config.Name] = tunnel
-
-	req := s.prepareTunnelProvisionRequest(client, tunnel)
-	if req.Name != tunnel.Config.Name {
-		t.Fatalf("provision request name = %q, want %q", req.Name, tunnel.Config.Name)
-	}
-	if req.ProvisionRevision == 0 {
-		t.Fatal("provision request should carry a non-zero revision")
-	}
-	if tunnel.runtime.Revision != req.ProvisionRevision {
-		t.Fatalf("runtime revision = %d, request revision = %d", tunnel.runtime.Revision, req.ProvisionRevision)
-	}
-	if tunnel.runtime.Target.ClientID != client.ID {
-		t.Fatalf("target runtime client_id = %q, want %q", tunnel.runtime.Target.ClientID, client.ID)
-	}
-	if got := aggregateTunnelRuntimeState(tunnel.runtime); got != protocol.ProxyRuntimeStatePending {
-		t.Fatalf("aggregate runtime state = %q, want pending", got)
-	}
-}
-
 func TestTunnelRuntimeActiveDoesNotRequireTargetHealth(t *testing.T) {
 	tunnel := &ProxyTunnel{
 		Config: protocol.ProxyConfig{

@@ -35,7 +35,7 @@ Medium
 
 ## Recommended direction
 
-如果 endpoint type 会继续增长，应把 endpoint type 与 topology 组合校验集中到 Go 层，并决定 DB 是否只保留 shape-level 约束。完全放松 CHECK 会移除 DB 兜底，必须同时审计 legacy/v1、v2、restore、测试辅助和 migration 写路径。
+如果 endpoint type 会继续增长，应把 endpoint type 与 topology 组合校验集中到 Go 层，并决定 DB 是否只保留 shape-level 约束。完全放松 CHECK 会移除 DB 兜底，必须同时审计 legacy storage projection、restore、测试辅助和 migration 写路径。
 
 ## Validation needed
 

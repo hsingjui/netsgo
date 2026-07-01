@@ -1,8 +1,6 @@
 package server
 
 import (
-	"fmt"
-	"net/http"
 	"testing"
 	"time"
 
@@ -28,7 +26,7 @@ func registerOfflineHTTPTestClient(t *testing.T, s *Server, hostname string) str
 	return record.ID
 }
 
-func TestLoadOfflineManagedTunnelBySelectorPrefersNameOverID(t *testing.T) {
+func TestLoadOfflineTunnelBySelectorPrefersNameOverID(t *testing.T) {
 	s, _, _, cleanup := setupTestServerWithStores(t, true)
 	defer cleanup()
 
@@ -46,205 +44,12 @@ func TestLoadOfflineManagedTunnelBySelectorPrefersNameOverID(t *testing.T) {
 		RemotePort: 18082,
 	}, protocol.ProxyStatusStopped)
 
-	stored, err := s.loadOfflineManagedTunnelBySelector(clientID, "id-of-other")
+	stored, err := s.loadOfflineTunnelBySelector(clientID, "id-of-other")
 	if err != nil {
-		t.Fatalf("loadOfflineManagedTunnelBySelector failed: %v", err)
+		t.Fatalf("loadOfflineTunnelBySelector failed: %v", err)
 	}
 	if stored.Name != "id-of-other" || stored.ID != "name-tunnel-id" {
 		t.Fatalf("selector should prefer exact name matches over ID matches, got name=%q id=%q", stored.Name, stored.ID)
-	}
-}
-
-func TestOfflineHTTPTunnel_Update_StoreFirst(t *testing.T) {
-	s, handler, token, cleanup := setupTestServerWithStores(t, true)
-	defer cleanup()
-
-	clientID := registerOfflineHTTPTestClient(t, s, "offline-update")
-	seedStoredTunnel(t, s, clientID, protocol.ProxyNewRequest{
-		Name:      "offline-http",
-		Type:      protocol.ProxyTypeHTTP,
-		LocalIP:   "127.0.0.1",
-		LocalPort: 3000,
-		Domain:    "old.example.com",
-	}, protocol.ProxyStatusActive)
-
-	if err := checkDomainConflict("old.example.com", "", "", s); err == nil {
-		t.Fatal("before update, old.example.com should be claimed by the existing HTTP tunnel")
-	}
-
-	body := []byte(`{"local_ip":"192.168.1.50","local_port":8080,"remote_port":19090,"domain":"new.example.com"}`)
-	resp := doMuxRequest(t, handler, http.MethodPut, fmt.Sprintf("/api/clients/%s/tunnels/offline-http", clientID), token, body)
-	if resp.Code != http.StatusOK {
-		t.Fatalf("offline HTTP update: want 200, got %d, body=%s", resp.Code, resp.Body.String())
-	}
-
-	var payload map[string]any
-	if err := mustDecodeJSON(t, resp.Body, &payload); err != nil {
-		t.Fatalf("failed to parse update response: %v", err)
-	}
-	if success, _ := payload["success"].(bool); !success {
-		t.Fatalf("update response should return success=true, got %v", payload)
-	}
-	tunnel, ok := payload["tunnel"].(map[string]any)
-	if !ok {
-		t.Fatalf("update response should include tunnel payload, got %v", payload["tunnel"])
-	}
-	capabilities, ok := tunnel["capabilities"].(map[string]any)
-	if !ok {
-		t.Fatalf("update response should include capabilities, got %v", tunnel["capabilities"])
-	}
-	for key, want := range map[string]bool{
-		"can_resume": false,
-		"can_stop":   true,
-		"can_edit":   true,
-		"can_delete": true,
-	} {
-		if capabilities[key] != want {
-			t.Fatalf("%s: want %v, got %v", key, want, capabilities[key])
-		}
-	}
-
-	stored, exists := s.store.GetTunnel(clientID, "offline-http")
-	if !exists {
-		t.Fatal("HTTP tunnel should still exist in the store after update")
-	}
-	if stored.LocalIP != "192.168.1.50" {
-		t.Fatalf("LocalIP after update: want 192.168.1.50, got %s", stored.LocalIP)
-	}
-	if stored.LocalPort != 8080 {
-		t.Fatalf("LocalPort after update: want 8080, got %d", stored.LocalPort)
-	}
-	if stored.RemotePort != 0 {
-		t.Fatalf("RemotePort should be zeroed after HTTP tunnel update, got %d", stored.RemotePort)
-	}
-	if stored.Domain != "new.example.com" {
-		t.Fatalf("Domain after update: want new.example.com, got %s", stored.Domain)
-	}
-	if stored.DesiredState != protocol.ProxyDesiredStateRunning || stored.RuntimeState != protocol.ProxyRuntimeStateOffline {
-		t.Fatalf("offline running HTTP tunnel should remain running/offline after update, got %s/%s", stored.DesiredState, stored.RuntimeState)
-	}
-
-	if err := checkDomainConflict("old.example.com", "", "", s); err != nil {
-		t.Fatalf("old domain should be released after update, got %v", err)
-	}
-	if err := checkDomainConflict("new.example.com", "", "", s); err == nil {
-		t.Fatal("new domain should be claimed after update")
-	}
-}
-
-func TestOfflineHTTPTunnel_Stop_StoreFirstUsesStoppedState(t *testing.T) {
-	s, handler, token, cleanup := setupTestServerWithStores(t, true)
-	defer cleanup()
-
-	clientID := registerOfflineHTTPTestClient(t, s, "offline-stop")
-	seedStoredTunnel(t, s, clientID, protocol.ProxyNewRequest{
-		Name:      "offline-http",
-		Type:      protocol.ProxyTypeHTTP,
-		LocalIP:   "127.0.0.1",
-		LocalPort: 3000,
-		Domain:    "stop.example.com",
-	}, protocol.ProxyStatusActive)
-
-	resp := doMuxRequest(t, handler, http.MethodPut, fmt.Sprintf("/api/clients/%s/tunnels/offline-http/stop", clientID), token, []byte(`{}`))
-	if resp.Code != http.StatusOK {
-		t.Fatalf("offline HTTP stop: want 200, got %d, body=%s", resp.Code, resp.Body.String())
-	}
-
-	stored, exists := s.store.GetTunnel(clientID, "offline-http")
-	if !exists {
-		t.Fatal("HTTP tunnel should still exist in the store after stop")
-	}
-	if stored.DesiredState != protocol.ProxyDesiredStateStopped || stored.RuntimeState != protocol.ProxyRuntimeStateIdle {
-		t.Fatalf("store state after stop: want stopped/idle, got %s/%s", stored.DesiredState, stored.RuntimeState)
-	}
-	if stored.Domain != "stop.example.com" {
-		t.Fatalf("domain should be preserved after stop, got %s", stored.Domain)
-	}
-}
-
-func TestOfflineHTTPTunnel_Delete_StoreFirst(t *testing.T) {
-	s, handler, token, cleanup := setupTestServerWithStores(t, true)
-	defer cleanup()
-
-	clientID := registerOfflineHTTPTestClient(t, s, "offline-delete")
-	seedStoredTunnel(t, s, clientID, protocol.ProxyNewRequest{
-		Name:      "offline-http",
-		Type:      protocol.ProxyTypeHTTP,
-		LocalIP:   "127.0.0.1",
-		LocalPort: 3000,
-		Domain:    "delete.example.com",
-	}, protocol.ProxyStatusActive)
-
-	resp := doMuxRequest(t, handler, http.MethodDelete, fmt.Sprintf("/api/clients/%s/tunnels/offline-http", clientID), token, nil)
-	if resp.Code != http.StatusNoContent {
-		t.Fatalf("offline HTTP delete: want 204, got %d, body=%s", resp.Code, resp.Body.String())
-	}
-
-	if _, exists := s.store.GetTunnel(clientID, "offline-http"); exists {
-		t.Fatal("HTTP tunnel should be removed from the store after delete")
-	}
-	if err := checkDomainConflict("delete.example.com", "", "", s); err != nil {
-		t.Fatalf("domain should be released after delete, got %v", err)
-	}
-}
-
-func TestOfflineHTTPTunnel_Resume_StoreFirst(t *testing.T) {
-	s, handler, token, cleanup := setupTestServerWithStores(t, true)
-	defer cleanup()
-
-	clientID := registerOfflineHTTPTestClient(t, s, "offline-resume")
-	seedStoredTunnel(t, s, clientID, protocol.ProxyNewRequest{
-		Name:      "offline-http",
-		Type:      protocol.ProxyTypeHTTP,
-		LocalIP:   "127.0.0.1",
-		LocalPort: 3000,
-		Domain:    "resume.example.com",
-	}, protocol.ProxyStatusStopped)
-
-	resp := doMuxRequest(t, handler, http.MethodPut, fmt.Sprintf("/api/clients/%s/tunnels/offline-http/resume", clientID), token, []byte(`{}`))
-	if resp.Code != http.StatusOK {
-		t.Fatalf("offline HTTP resume: want 200, got %d, body=%s", resp.Code, resp.Body.String())
-	}
-
-	stored, exists := s.store.GetTunnel(clientID, "offline-http")
-	if !exists {
-		t.Fatal("store record should still exist after offline resume")
-	}
-	if stored.DesiredState != protocol.ProxyDesiredStateRunning {
-		t.Fatalf("desired_state after offline resume: want running, got %s", stored.DesiredState)
-	}
-	if stored.RuntimeState != protocol.ProxyRuntimeStateOffline {
-		t.Fatalf("runtime_state after offline resume: want offline, got %s", stored.RuntimeState)
-	}
-}
-
-func TestOfflineHTTPTunnel_Stop_StoreFirst(t *testing.T) {
-	s, handler, token, cleanup := setupTestServerWithStores(t, true)
-	defer cleanup()
-
-	clientID := registerOfflineHTTPTestClient(t, s, "offline-stop")
-	seedStoredTunnel(t, s, clientID, protocol.ProxyNewRequest{
-		Name:      "offline-http",
-		Type:      protocol.ProxyTypeHTTP,
-		LocalIP:   "127.0.0.1",
-		LocalPort: 3000,
-		Domain:    "stop.example.com",
-	}, protocol.ProxyStatusActive)
-
-	resp := doMuxRequest(t, handler, http.MethodPut, fmt.Sprintf("/api/clients/%s/tunnels/offline-http/stop", clientID), token, []byte(`{}`))
-	if resp.Code != http.StatusOK {
-		t.Fatalf("offline HTTP stop: want 200, got %d, body=%s", resp.Code, resp.Body.String())
-	}
-
-	stored, exists := s.store.GetTunnel(clientID, "offline-http")
-	if !exists {
-		t.Fatal("store record should still exist after offline stop")
-	}
-	if stored.DesiredState != protocol.ProxyDesiredStateStopped {
-		t.Fatalf("desired_state after offline stop: want stopped, got %s", stored.DesiredState)
-	}
-	if stored.RuntimeState != protocol.ProxyRuntimeStateIdle {
-		t.Fatalf("runtime_state after offline stop: want idle, got %s", stored.RuntimeState)
 	}
 }
 

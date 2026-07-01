@@ -627,7 +627,7 @@ function TunnelDialogForm({
         )}
       </DialogHeader>
 
-      <form onSubmit={handleSubmit} className="flex min-h-0 flex-1 flex-col gap-4">
+      <form noValidate onSubmit={handleSubmit} className="flex min-h-0 flex-1 flex-col gap-4">
         <div className="min-h-0 flex-1 space-y-4 overflow-y-auto -mr-4 pr-4 pl-0.5">
         {/* 隧道名称 */}
         <div className="space-y-1.5">

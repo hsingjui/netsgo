@@ -132,7 +132,7 @@ export function TunnelListTable({
     );
   }, [clientNameById, orderedTunnels, searchQuery]);
 
-  const args = (clientId: string, id: string) => ({ clientId, tunnelId: id });
+  const actionArgs = (id: string) => ({ tunnelId: id });
 
   /** 根据隧道状态渲染操作按钮 */
   const renderActionButtons = (tunnel: TunnelEntry) => {
@@ -170,7 +170,7 @@ export function TunnelListTable({
             className="p-1.5 hover:bg-emerald-500/10 rounded text-emerald-500"
             title={t('tunnels.resume')}
             aria-label={t('tunnels.resume')}
-            onClick={() => resumeTunnel.mutate(args(tunnel.clientId, tunnel.id), {
+            onClick={() => resumeTunnel.mutate(actionArgs(tunnel.id), {
               onSuccess: () => toast.success(t('tunnels.started', { name: tunnel.name })),
               onError: (err) => toast.error((err as Error).message),
             })}
@@ -183,7 +183,7 @@ export function TunnelListTable({
             className="p-1.5 hover:bg-slate-500/10 rounded text-slate-500"
             title={t('tunnels.stop')}
             aria-label={t('tunnels.stop')}
-            onClick={() => stopTunnel.mutate(args(tunnel.clientId, tunnel.id), {
+            onClick={() => stopTunnel.mutate(actionArgs(tunnel.id), {
               onSuccess: () => toast.success(t('tunnels.stopped', { name: tunnel.name })),
               onError: (err) => toast.error((err as Error).message),
             })}
@@ -304,7 +304,7 @@ export function TunnelListTable({
             variant="destructive"
             onConfirm={() => {
               if (deleteTarget) {
-                deleteTunnel.mutate(args(deleteTarget.clientId, deleteTarget.id), {
+                deleteTunnel.mutate(actionArgs(deleteTarget.id), {
                   onSuccess: () => toast.success(t('tunnels.deleted', { name: deleteTarget.name })),
                   onError: (err) => toast.error((err as Error).message),
                 });

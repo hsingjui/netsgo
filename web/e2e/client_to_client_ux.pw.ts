@@ -45,7 +45,11 @@ test('client-to-client form keeps invalid input local and surfaces field errors 
   const dialog = await openCreateTunnelDialog(page, source.id);
   const createButton = dialog.getByRole('button', { name: 'Create tunnel' });
 
-  await expect(createButton).toBeDisabled();
+  await expect(createButton).toBeEnabled();
+  await createButton.click();
+  await expect(dialog).toBeVisible();
+  await expect(dialog.getByText('Tunnel name is required.')).toBeVisible();
+
   await fillClientToClientTunnel(dialog, {
     sourceClientID: source.id,
     sourceClientName: source.info.hostname,
@@ -60,17 +64,23 @@ test('client-to-client form keeps invalid input local and surfaces field errors 
   });
   await expect(createButton).toBeEnabled();
 
+  await dialog.getByRole('button', { name: 'Advanced settings' }).click();
   await dialog.getByLabel('Ingress limit').fill('-1');
-  await expect(createButton).toBeDisabled();
+  await createButton.click();
+  await expect(dialog).toBeVisible();
+  await expect(dialog.getByText('Bandwidth limit must be non-negative.')).toBeVisible();
+
   await dialog.getByLabel('Ingress limit').fill('');
   await dialog.getByLabel('Ingress bind address').fill('');
-  await expect(createButton).toBeDisabled();
+  await createButton.click();
+  await expect(dialog).toBeVisible();
+  await expect(dialog.getByText('Ingress bind address is required.')).toBeVisible();
 
   await dialog.getByLabel('Ingress bind address').fill('not-an-ip');
   await expect(createButton).toBeEnabled();
   await createButton.click();
   await expect(dialog).toBeVisible();
-  await expect(dialog.getByText(/bind_ip must be a valid IPv4 address|IPv4/).first()).toBeVisible();
+  await expect(dialog.getByText('Ingress bind address must be a valid IP address.').first()).toBeVisible();
   await captureArtifact(dialog, testInfo, 'client-to-client-invalid-bind-ip');
 });
 

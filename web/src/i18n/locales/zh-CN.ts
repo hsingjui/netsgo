@@ -464,7 +464,6 @@ export const zhCN = {
     tunnel_resume_failed: '启动隧道失败。',
     tunnel_stop_failed: '停止隧道失败。',
     tunnel_delete_failed: '删除隧道失败。',
-    tunnel_busy: '当前隧道正在处理，请稍后再试。',
     tunnel_lookup_failed: '查询隧道失败。',
     tunnel_list_failed: '获取隧道列表失败。',
     unknown_tunnel_action: '未知隧道操作。',

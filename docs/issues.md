@@ -10,7 +10,6 @@
 | [`endpoint-type-extensibility`](./issue/endpoint-type-extensibility.md) | Medium | Open for CHECK relaxation | CHECK 已扩展至 `socks5_listen` / `socks5_connect_handler`；剩余是是否移除 DB enum CHECK |
 | [`runtime-state-active-exposed`](./issue/runtime-state-active-exposed.md) | Low | Open | `active` / `exposed` 是同一运行态的双命名；可作为低风险命名收口 |
 | [`tunnel-resource-locks-hardening`](./issue/tunnel-resource-locks-hardening.md) | Low | Open for optional DB constraints | 运行时互斥已完成；剩余是可选 DB FK/CHECK 硬化 |
-| [`v1-v2-api-unification`](./issue/v1-v2-api-unification.md) | Low | Partially fixed | unified runtime/provision 已脱离 legacy flat payload；剩余是 legacy v1 mutation/fallback 是否继续保留 |
 
 ## 原则
 
