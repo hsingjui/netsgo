@@ -1,13 +1,18 @@
 import { createRoute, useParams, useNavigate } from '@tanstack/react-router';
-import { useEffect } from 'react';
+import { useEffect, useState } from 'react';
 import { motion } from 'motion/react';
 import { dashboardRoute } from '@/routes/dashboard';
 import { ClientHeader } from '@/components/custom/client/ClientHeader';
 import { ClientInfoCard } from '@/components/custom/client/ClientInfoCard';
 import { TunnelTable } from '@/components/custom/tunnel/TunnelTable';
 import { TrafficChart } from '@/components/custom/chart/TrafficChart';
-import { useClients } from '@/hooks/use-clients';
+import { useClients, useDeleteClient } from '@/hooks/use-clients';
 import { Skeleton } from '@/components/ui/skeleton';
+import { ConfirmDialog } from '@/components/custom/common/ConfirmDialog';
+import type { Client } from '@/types';
+import { getClientDisplayName } from '@/lib/client-utils';
+import toast from 'react-hot-toast';
+import { useTranslation } from 'react-i18next';
 
 const stagger = {
   hidden: {},
@@ -20,9 +25,12 @@ const fadeUp = {
 };
 
 function ClientDetailPage() {
+  const { t } = useTranslation();
   const { clientId } = useParams({ from: '/dashboard/clients/$clientId' });
   const navigate = useNavigate();
   const { data: clients, isLoading, isFetching } = useClients();
+  const deleteClient = useDeleteClient();
+  const [deleteTarget, setDeleteTarget] = useState<Client | null>(null);
 
   const client = clients?.find((a) => a.id === clientId);
 
@@ -55,11 +63,31 @@ function ClientDetailPage() {
       animate="show"
     >
       <motion.div variants={fadeUp}><ClientHeader client={client} /></motion.div>
-      <motion.div variants={fadeUp}><ClientInfoCard client={client} /></motion.div>
+      <motion.div variants={fadeUp}><ClientInfoCard client={client} onRequestDelete={setDeleteTarget} /></motion.div>
       <motion.div variants={fadeUp}><TunnelTable client={client} clients={clients ?? []} /></motion.div>
       <motion.div variants={fadeUp}>
         <TrafficChart clientId={clientId} tunnels={client.proxies ?? []} />
       </motion.div>
+      <ConfirmDialog
+        open={deleteTarget !== null}
+        title={t('dashboard.deleteOfflineNode')}
+        description={t('dashboard.deleteOfflineNodeDescription', { name: deleteTarget ? getClientDisplayName(deleteTarget) : '' })}
+        confirmLabel={t('common.delete')}
+        variant="destructive"
+        onConfirm={() => {
+          if (!deleteTarget) return;
+          const target = deleteTarget;
+          deleteClient.mutate(target.id, {
+            onSuccess: () => {
+              toast.success(t('dashboard.nodeDeleted', { name: getClientDisplayName(target) }));
+              navigate({ to: '/dashboard' });
+            },
+            onError: (err) => toast.error((err as Error).message),
+          });
+          setDeleteTarget(null);
+        }}
+        onCancel={() => setDeleteTarget(null)}
+      />
     </motion.div>
   );
 }

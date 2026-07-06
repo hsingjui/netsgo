@@ -2,7 +2,7 @@ import { useState } from 'react';
 import {
   Monitor, Network, Clock, Cpu, HardDrive, Database,
   Box, CircleHelp, Globe, Wifi, ArrowDownCircle, ArrowUpCircle,
-  Pencil,
+  Pencil, Trash2,
 } from 'lucide-react';
 import { formatBytes, formatUptime, formatNetSpeed, formatBandwidthLimit } from '@/lib/format';
 import {
@@ -20,6 +20,7 @@ import { useTranslation } from 'react-i18next';
 
 interface ClientInfoCardProps {
   client: Client;
+  onRequestDelete?: (client: Client) => void;
 }
 
 const osLabels: Record<string, string> = {
@@ -42,7 +43,7 @@ function ProgressBar({ value, label, total, colorClass = 'bg-primary' }: { value
   );
 }
 
-export function ClientInfoCard({ client }: ClientInfoCardProps) {
+export function ClientInfoCard({ client, onRequestDelete }: ClientInfoCardProps) {
   const { t } = useTranslation();
   const stats = client.stats;
   const info = client.info;
@@ -78,11 +79,25 @@ export function ClientInfoCard({ client }: ClientInfoCardProps) {
             <span className="text-xs text-muted-foreground font-normal">({info.hostname})</span>
           )}
         </div>
-        <div className="flex items-center gap-2 text-sm">
-          <div className={`w-2 h-2 rounded-full ${isOnline ? 'bg-emerald-500' : 'bg-destructive'}`} />
-          <div className="flex flex-col items-end leading-tight">
-            <span className="font-medium text-muted-foreground">{isOnline ? t('clients.online') : t('clients.offline')}</span>
+        <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2 text-sm">
+            <div className={`w-2 h-2 rounded-full ${isOnline ? 'bg-emerald-500' : 'bg-destructive'}`} />
+            <div className="flex flex-col items-end leading-tight">
+              <span className="font-medium text-muted-foreground">{isOnline ? t('clients.online') : t('clients.offline')}</span>
+            </div>
           </div>
+          {!isOnline && onRequestDelete && (
+            <Button
+              type="button"
+              variant="destructive"
+              size="icon-xs"
+              title={t('dashboard.deleteOfflineNode')}
+              aria-label={t('dashboard.deleteOfflineNode')}
+              onClick={() => onRequestDelete(client)}
+            >
+              <Trash2 className="h-3.5 w-3.5" />
+            </Button>
+          )}
         </div>
       </div>
 

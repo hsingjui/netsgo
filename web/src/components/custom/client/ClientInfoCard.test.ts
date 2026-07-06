@@ -66,4 +66,33 @@ describe('ClientInfoCard', () => {
     expect(markup).not.toContain('磁盘');
     expect(markup).not.toContain('网络 I/O');
   });
+
+  test('shows delete action only for offline clients when requested', () => {
+    const offlineQueryClient = new QueryClient();
+    const offlineMarkup = renderToStaticMarkup(
+      createElement(
+        QueryClientProvider,
+        { client: offlineQueryClient },
+        createElement(ClientInfoCard, {
+          client: createClient({ online: false }),
+          onRequestDelete: () => {},
+        }),
+      ),
+    );
+
+    const onlineQueryClient = new QueryClient();
+    const onlineMarkup = renderToStaticMarkup(
+      createElement(
+        QueryClientProvider,
+        { client: onlineQueryClient },
+        createElement(ClientInfoCard, {
+          client: createClient({ online: true }),
+          onRequestDelete: () => {},
+        }),
+      ),
+    );
+
+    expect(offlineMarkup).toContain('Delete offline node');
+    expect(onlineMarkup).not.toContain('Delete offline node');
+  });
 });
