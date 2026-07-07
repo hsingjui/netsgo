@@ -2,8 +2,6 @@ package manage
 
 import (
 	"errors"
-	"fmt"
-	"os"
 	"path/filepath"
 
 	clientstate "netsgo/internal/client"
@@ -13,19 +11,21 @@ import (
 )
 
 type clientDeps struct {
-	UI             uiProvider
-	Inspect        func() svcmgr.InstallInspection
-	IsActive       func() (bool, error)
-	IsEnabled      func() (bool, error)
-	Logs           func() error
-	RunInstall     func() error
-	ReadClientEnv  func() (svcmgr.ClientEnv, error)
-	DisableAndStop func() error
-	EnableAndStart func() error
-	DaemonReload   func() error
-	RemovePaths    func(paths ...string) error
-	RemoveBinary   func() error
-	DetectServer   func() svcmgr.InstallState
+	UI               uiProvider
+	Inspect          func() svcmgr.InstallInspection
+	IsActive         func() (bool, error)
+	IsEnabled        func() (bool, error)
+	Logs             func() error
+	RunInstall       func() error
+	ReadClientEnv    func() (svcmgr.ClientEnv, error)
+	DisableAndStop   func() error
+	UpdateClientKey  func(string) error
+	ClearClientToken func() (clientstate.ClientIdentity, bool, error)
+	EnableAndStart   func() error
+	DaemonReload     func() error
+	RemovePaths      func(paths ...string) error
+	RemoveBinary     func() error
+	DetectServer     func() svcmgr.InstallState
 }
 
 func ManageClient() error {
@@ -51,12 +51,27 @@ func ManageClientWith(deps clientDeps) error {
 			Uninstall: func() (bool, error) {
 				return uninstallClient(deps)
 			},
+			Extra: clientServiceMenuActions(deps),
 		})
 	case svcmgr.StateBroken:
 		return runBrokenClientMenu(deps)
 	default:
 		deps.UI.PrintSummary("Client 未安装", [][2]string{{"下一步", "运行 netsgo install 安装 client"}})
 		return errReturnToSelection
+	}
+}
+
+func clientServiceMenuActions(deps clientDeps) []serviceMenuAction {
+	return []serviceMenuAction{
+		{
+			Option: tui.SelectOption{
+				Label:       "重新认证",
+				Description: "输入新的 client key，清空本地 token 并重启 client 服务。",
+			},
+			Run: func() error {
+				return reauthenticateClient(deps)
+			},
+		},
 	}
 }
 
@@ -82,6 +97,23 @@ func defaultClientDeps() clientDeps {
 			return svcmgr.ReadClientEnv(svcmgr.NewLayout(svcmgr.RoleClient))
 		},
 		DisableAndStop: func() error { return svcmgr.DisableAndStop(svcmgr.UnitName(svcmgr.RoleClient)) },
+		UpdateClientKey: func(key string) error {
+			return svcmgr.UpdateClientKey(svcmgr.NewLayout(svcmgr.RoleClient), key)
+		},
+		ClearClientToken: func() (clientstate.ClientIdentity, bool, error) {
+			layout := svcmgr.NewLayout(svcmgr.RoleClient)
+			if err := svcmgr.RepairClientRuntimeOwnership(layout); err != nil {
+				return clientstate.ClientIdentity{}, false, err
+			}
+			identity, ok, err := clientstate.ClearClientToken(filepath.Join(clientDataPath(layout), clientstate.ClientDBFileName))
+			if err != nil {
+				return clientstate.ClientIdentity{}, false, err
+			}
+			if err := svcmgr.RepairClientRuntimeOwnership(layout); err != nil {
+				return clientstate.ClientIdentity{}, false, err
+			}
+			return identity, ok, nil
+		},
 		EnableAndStart: func() error { return svcmgr.EnableAndStart(svcmgr.UnitName(svcmgr.RoleClient)) },
 		DaemonReload:   svcmgr.DaemonReload,
 		RemovePaths:    removePaths,
@@ -90,40 +122,6 @@ func defaultClientDeps() clientDeps {
 			return svcmgr.Detect(svcmgr.RoleServer)
 		},
 	}
-}
-
-func showClientDetails(deps clientDeps) error {
-	inspection := deps.Inspect()
-	layout := svcmgr.NewLayout(svcmgr.RoleClient)
-	env, envErr := loadClientEnv(deps)
-	localStateSummary, localStateErr := clientLocalStateSummary(layout)
-
-	rows := [][2]string{
-		{"服务", layout.ServiceName},
-		{"角色", string(svcmgr.RoleClient)},
-		{"状态", lifecycleStateLabel(inspection.State)},
-		{"已安装", boolLabel(inspection.State == svcmgr.StateInstalled)},
-		{"运行中", boolStateLabel(inspection.State == svcmgr.StateInstalled, deps.IsActive)},
-		{"已启用", boolStateLabel(inspection.State == svcmgr.StateInstalled, deps.IsEnabled)},
-		{"二进制路径", layout.BinaryPath},
-		{"数据目录", layout.DataDir},
-		{"数据路径", clientDataPath(layout)},
-		{"锁路径", lockPath(layout.DataDir)},
-		{"日志目标", "journald"},
-		{"Unit 路径", layout.UnitPath},
-		{"Env 路径", layout.EnvPath},
-		{"运行用户", layout.RunAsUser},
-		{"服务地址", stringOrUnavailable(env.Server, envErr)},
-		{"跳过 TLS 校验", boolOrUnavailable(env.TLSSkipVerify, envErr)},
-		{"TLS 指纹", stringOrUnavailable(env.TLSFingerprint, envErr)},
-		{"Client 本地状态", stringOrUnavailable(localStateSummary, localStateErr)},
-	}
-	if envErr != nil {
-		rows = append(rows, [2]string{"Env 状态", fmt.Sprintf("不可用（%v）", envErr)})
-	}
-	rows = appendProblemRows(rows, inspection.Problems)
-	deps.UI.PrintSummary("Client 检查", rows)
-	return nil
 }
 
 func uninstallClient(deps clientDeps) (bool, error) {
@@ -229,41 +227,4 @@ func cleanupBrokenClient(deps clientDeps) (bool, error) {
 	}
 	deps.UI.PrintSummary("异常 client 清理完成", [][2]string{{"状态", "已清理"}, {"下一步", "需要时运行 netsgo install 重新安装 client"}})
 	return true, nil
-}
-
-func loadClientEnv(deps clientDeps) (svcmgr.ClientEnv, error) {
-	if deps.ReadClientEnv == nil {
-		return svcmgr.ClientEnv{}, nil
-	}
-	return deps.ReadClientEnv()
-}
-
-func clientDataPath(layout svcmgr.ServiceLayout) string {
-	return layout.RuntimeDir
-}
-
-func clientLocalStateSummary(layout svcmgr.ServiceLayout) (string, error) {
-	path := filepath.Join(clientDataPath(layout), clientstate.ClientDBFileName)
-	state, ok, err := clientstate.LoadClientIdentity(path)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return "本地状态文件未发现", nil
-		}
-		return "", err
-	}
-	if !ok {
-		return "本地状态文件存在，但内容不可用", nil
-	}
-
-	if state.InstallID == "" && state.Token == "" && state.TLSFingerprint == "" {
-		return "本地状态文件存在，但内容不可用", nil
-	}
-	return "已保存本地连接状态", nil
-}
-
-func boolOrUnavailable(value bool, err error) string {
-	if err != nil {
-		return fmt.Sprintf("不可用（%v）", err)
-	}
-	return boolLabel(value)
 }

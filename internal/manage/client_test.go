@@ -4,6 +4,7 @@ import (
 	"strings"
 	"testing"
 
+	clientstate "netsgo/internal/client"
 	"netsgo/internal/svcmgr"
 )
 
@@ -32,6 +33,12 @@ func newInstalledClientDeps(t *testing.T, ui *fakeUI) (clientDeps, svcmgr.Servic
 			}, nil
 		},
 		DisableAndStop: func() error { return nil },
+		UpdateClientKey: func(string) error {
+			return nil
+		},
+		ClearClientToken: func() (clientstate.ClientIdentity, bool, error) {
+			return clientstate.ClientIdentity{}, false, nil
+		},
 		EnableAndStart: func() error { return nil },
 		DaemonReload:   func() error { return nil },
 		RemovePaths:    func(paths ...string) error { return nil },
@@ -43,7 +50,7 @@ func newInstalledClientDeps(t *testing.T, ui *fakeUI) (clientDeps, svcmgr.Servic
 }
 
 func TestManageClientInspectRedactsKey(t *testing.T) {
-	ui := &fakeUI{selects: []int{1, 7}}
+	ui := &fakeUI{selects: []int{1, 8}}
 	deps, _ := newInstalledClientDeps(t, ui)
 
 	err := ManageClientWith(deps)
@@ -97,7 +104,7 @@ func TestManageClientUninstallRemovesData(t *testing.T) {
 }
 
 func TestManageClientRestart(t *testing.T) {
-	ui := &fakeUI{selects: []int{5, 7}}
+	ui := &fakeUI{selects: []int{5, 8}}
 	stopped := false
 	started := false
 	deps, _ := newInstalledClientDeps(t, ui)
@@ -134,7 +141,7 @@ func TestManageClientLogs(t *testing.T) {
 }
 
 func TestManageClientStartPrintsSuccess(t *testing.T) {
-	ui := &fakeUI{selects: []int{3, 7}}
+	ui := &fakeUI{selects: []int{3, 8}}
 	deps, _ := newInstalledClientDeps(t, ui)
 
 	err := ManageClientWith(deps)
@@ -146,7 +153,7 @@ func TestManageClientStartPrintsSuccess(t *testing.T) {
 }
 
 func TestManageClientUninstallCancelPrintsCancelled(t *testing.T) {
-	ui := &fakeUI{selects: []int{6, 7}, confirms: []bool{false}}
+	ui := &fakeUI{selects: []int{6, 8}, confirms: []bool{false}}
 	deps, _ := newInstalledClientDeps(t, ui)
 
 	err := ManageClientWith(deps)

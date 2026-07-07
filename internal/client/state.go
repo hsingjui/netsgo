@@ -24,7 +24,7 @@ func (c *Client) legacyStatePath() string {
 	if root == "" {
 		root = datadir.DefaultDataDir()
 	}
-	return filepath.Join(root, "client", "client.json")
+	return filepath.Join(root, "client", legacyClientJSONFileName)
 }
 
 func (c *Client) ensureInstallID() error {
