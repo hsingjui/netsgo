@@ -45,6 +45,48 @@ func TestClearClientTokenPreservesIdentityAndFingerprint(t *testing.T) {
 	}
 }
 
+func TestClearClientTokenIgnoresMalformedLegacyJSONWhenDatabaseIdentityExists(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "client", clientDBFileName)
+	store, err := newClientStateStore(path)
+	if err != nil {
+		t.Fatalf("newClientStateStore() error = %v", err)
+	}
+	if err := store.Save(persistedState{
+		InstallID:      "client-install",
+		Token:          "tk-old",
+		TLSFingerprint: "AA:BB",
+	}); err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	legacyPath := filepath.Join(dir, "client", "client.json")
+	if err := os.WriteFile(legacyPath, []byte("{not-json"), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	got, ok, err := ClearClientToken(path)
+	if err != nil {
+		t.Fatalf("ClearClientToken() error = %v", err)
+	}
+	if !ok {
+		t.Fatal("ClearClientToken should report the SQLite identity")
+	}
+	if got.InstallID != "client-install" || got.Token != "" || got.TLSFingerprint != "AA:BB" {
+		t.Fatalf("ClearClientToken() = %+v", got)
+	}
+
+	reloaded, ok, err := LoadClientIdentity(path)
+	if err != nil {
+		t.Fatalf("LoadClientIdentity() error = %v", err)
+	}
+	if !ok || reloaded != got {
+		t.Fatalf("reloaded identity = %+v ok=%v, want %+v", reloaded, ok, got)
+	}
+}
+
 func TestClearClientTokenDoesNotCreateMissingDatabase(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "client", clientDBFileName)
 	if _, ok, err := ClearClientToken(path); err != nil || ok {
@@ -151,6 +193,38 @@ func TestClearClientTokenRejectsSymlinkedLegacyJSON(t *testing.T) {
 	got := readLegacyClientState(t, target)
 	if got.Token != "tk-target" {
 		t.Fatalf("symlink target token changed, state=%+v", got)
+	}
+}
+
+func TestClearClientTokenRejectsSymlinkedLegacyJSONBeforeDatabaseClear(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "client", clientDBFileName)
+	store, err := newClientStateStore(dbPath)
+	if err != nil {
+		t.Fatalf("newClientStateStore() error = %v", err)
+	}
+	if err := store.Save(persistedState{InstallID: "client-install", Token: "tk-old"}); err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	target := filepath.Join(dir, "target.json")
+	writeLegacyClientState(t, target, persistedState{InstallID: "client-target", Token: "tk-target"})
+	legacyPath := filepath.Join(dir, "client", "client.json")
+	if err := os.Symlink(target, legacyPath); err != nil {
+		t.Fatalf("Symlink() error = %v", err)
+	}
+
+	if _, _, err := ClearClientToken(dbPath); err == nil || !strings.Contains(err.Error(), "symlink") {
+		t.Fatalf("ClearClientToken() error = %v, want symlink rejection", err)
+	}
+	got, ok, err := LoadClientIdentity(dbPath)
+	if err != nil {
+		t.Fatalf("LoadClientIdentity() error = %v", err)
+	}
+	if !ok || got.Token != "tk-old" {
+		t.Fatalf("SQLite token should not be cleared after legacy symlink rejection, state=%+v ok=%v", got, ok)
 	}
 }
 

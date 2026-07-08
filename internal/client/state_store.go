@@ -118,12 +118,19 @@ func LoadClientIdentity(path string) (ClientIdentity, bool, error) {
 }
 
 func ClearClientToken(path string) (ClientIdentity, bool, error) {
+	legacyPath := legacyClientStatePath(path)
+	if _, err := usableClientStateFile(legacyPath, "legacy client identity"); err != nil {
+		return ClientIdentity{}, false, err
+	}
 	state, found, err := clearClientDBToken(path)
 	if err != nil {
 		return ClientIdentity{}, false, err
 	}
-	legacyState, legacyFound, err := clearLegacyClientToken(legacyClientStatePath(path))
+	legacyState, legacyFound, err := clearLegacyClientToken(legacyPath)
 	if err != nil {
+		if found {
+			return state, true, nil
+		}
 		return ClientIdentity{}, false, err
 	}
 	if found {

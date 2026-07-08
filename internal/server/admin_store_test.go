@@ -1281,6 +1281,84 @@ func TestAdminStore_Token_ReuseExistingToken(t *testing.T) {
 	}
 }
 
+func TestAdminStore_Token_ExchangeWithDifferentKeyForSameInstallCreatesNewToken(t *testing.T) {
+	store := newTestAdminStore(t)
+	oldRawKey := "sk-old-key"
+	oldKey, err := store.AddAPIKey("old", oldRawKey, []string{"connect"}, nil)
+	if err != nil {
+		t.Fatalf("AddAPIKey old failed: %v", err)
+	}
+	newRawKey := "sk-new-key"
+	newKey, err := store.AddAPIKey("new", newRawKey, []string{"connect"}, nil)
+	if err != nil {
+		t.Fatalf("AddAPIKey new failed: %v", err)
+	}
+
+	firstTokenStr, oldToken, err := store.ExchangeToken(oldRawKey, "install-rotate", "client-1", "1.2.3.4:5678")
+	if err != nil {
+		t.Fatalf("first ExchangeToken failed: %v", err)
+	}
+	if firstTokenStr == "" || oldToken == nil {
+		t.Fatal("first exchange should return a token")
+	}
+	if oldToken.KeyID != oldKey.ID {
+		t.Fatalf("first token KeyID = %q, want %q", oldToken.KeyID, oldKey.ID)
+	}
+
+	secondTokenStr, newToken, err := store.ExchangeToken(newRawKey, "install-rotate", "client-1", "1.2.3.4:5678")
+	if err != nil {
+		t.Fatalf("second ExchangeToken failed: %v", err)
+	}
+	if secondTokenStr == "" || newToken == nil {
+		t.Fatal("second exchange should return a token")
+	}
+	if newToken.ID == oldToken.ID {
+		t.Fatalf("different key should create a new token row, reused id %q", newToken.ID)
+	}
+	if newToken.KeyID != newKey.ID {
+		t.Fatalf("second token KeyID = %q, want %q", newToken.KeyID, newKey.ID)
+	}
+
+	active := store.GetClientTokenByInstallID("install-rotate")
+	if active == nil {
+		t.Fatal("expected an active token for install-rotate")
+	}
+	if active.ID != newToken.ID || active.KeyID != newKey.ID {
+		t.Fatalf("active token = %+v, want id %q key %q", active, newToken.ID, newKey.ID)
+	}
+	tokens, err := loadClientTokens(store.db, `WHERE install_id = ? ORDER BY created_at, id`, "install-rotate")
+	if err != nil {
+		t.Fatalf("load client tokens: %v", err)
+	}
+	if len(tokens) != 2 {
+		t.Fatalf("token rows = %d, want 2", len(tokens))
+	}
+	seenOldRevoked := false
+	seenNewActive := false
+	for _, token := range tokens {
+		if token.ID == oldToken.ID && token.KeyID == oldKey.ID && token.IsRevoked {
+			seenOldRevoked = true
+		}
+		if token.ID == newToken.ID && token.KeyID == newKey.ID && !token.IsRevoked {
+			seenNewActive = true
+		}
+	}
+	if !seenOldRevoked || !seenNewActive {
+		t.Fatalf("token rotation rows = %+v, want old revoked and new active", tokens)
+	}
+
+	useCountByID := map[string]int{}
+	for _, key := range store.GetAPIKeys() {
+		useCountByID[key.ID] = key.UseCount
+	}
+	if useCountByID[oldKey.ID] != 1 {
+		t.Fatalf("old key use_count = %d, want 1", useCountByID[oldKey.ID])
+	}
+	if useCountByID[newKey.ID] != 1 {
+		t.Fatalf("new key use_count = %d, want 1", useCountByID[newKey.ID])
+	}
+}
+
 func TestAdminStore_Token_ReuseRequiresValidKey(t *testing.T) {
 	store := newTestAdminStore(t)
 	rawKey := "sk-reuse-key-guard"

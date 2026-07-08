@@ -1885,7 +1885,7 @@ func loadClientTokens(q dbQuerier, where string, args ...any) (tokens []ClientTo
 }
 
 // ExchangeToken exchanges a Key for a client token.
-// If the given install_id already has a valid token, the existing token is refreshed
+// If the given install_id already has a valid token for the same key, the existing token is refreshed
 // and returned without consuming a key use count.
 // Otherwise the key is validated, a use count is consumed, and a new token is issued.
 func (s *AdminStore) ExchangeToken(key, installID, clientID, remoteAddr string) (string, *ClientToken, error) {
@@ -1922,12 +1922,21 @@ func (s *AdminStore) ExchangeToken(key, installID, clientID, remoteAddr string) 
 }
 
 func exchangeTokenInTx(tx *sql.Tx, key, installID, clientID, ip string, now time.Time) (string, *ClientToken, error) {
+	apiKey, err := findKeyByRawLocked(tx, key)
+	if err != nil {
+		return "", nil, err
+	}
+	keyID := ""
+	if apiKey != nil {
+		keyID = apiKey.ID
+	}
+
 	tokens, err := loadClientTokens(tx, `WHERE install_id = ? AND is_revoked = 0 ORDER BY created_at, id`, installID)
 	if err != nil {
 		return "", nil, err
 	}
 	for _, t := range tokens {
-		if now.Sub(t.LastActiveAt) < tokenExpiryDuration {
+		if now.Sub(t.LastActiveAt) < tokenExpiryDuration && t.KeyID == keyID {
 			newToken, err := generateToken()
 			if err != nil {
 				return "", nil, err
@@ -1940,14 +1949,9 @@ func exchangeTokenInTx(tx *sql.Tx, key, installID, clientID, ip string, now time
 				t.TokenHash, formatTime(t.LastActiveAt), t.LastIP, t.ClientID, t.ID); err != nil {
 				return "", nil, err
 			}
-			log.Printf("🔑 Token refreshed [install_id=%s]: reused existing valid token without consuming key", installID)
+			log.Printf("🔑 Token refreshed [install_id=%s, key_id=%s]: reused existing valid token without consuming key", installID, keyID)
 			return newToken, &t, nil
 		}
-	}
-
-	apiKey, err := findKeyByRawLocked(tx, key)
-	if err != nil {
-		return "", nil, err
 	}
 
 	newToken, err := generateToken()
@@ -1955,9 +1959,7 @@ func exchangeTokenInTx(tx *sql.Tx, key, installID, clientID, ip string, now time
 		return "", nil, err
 	}
 
-	keyID := ""
 	if apiKey != nil {
-		keyID = apiKey.ID
 		if _, err := tx.Exec(`UPDATE api_keys SET use_count = use_count + 1 WHERE id = ?`, apiKey.ID); err != nil {
 			return "", nil, err
 		}
