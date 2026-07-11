@@ -623,9 +623,13 @@ func (s *Server) markTunnelPortNotAllowedRevision(affected affectedTunnel, runCl
 		s.portPolicyAfterRuntimeCleanupHook(affected)
 	}
 
-	if s.store == nil || ownerClientID == "" || config.ID == "" || config.Revision <= 0 {
+	if s.store == nil || config.ID == "" {
 		log.Printf("⚠️ skipped persisting port policy error for tunnel %s: stable identity is incomplete", config.Name)
 		return false, false
+	}
+	if ownerClientID == "" || config.Revision <= 0 {
+		log.Printf("⚠️ retrying port policy error for tunnel %s from its persisted identity", config.Name)
+		return false, true
 	}
 
 	updated, err := s.store.UpdateStatesIfCurrent(
