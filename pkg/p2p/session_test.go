@@ -190,8 +190,8 @@ func TestSessionOpensYamuxStreamOverDetachedDataChannel(t *testing.T) {
 			t.Fatalf("concurrent accept stream: %v", err)
 		}
 	}
-	offerer.Close()
-	answerer.Close()
+	_ = offerer.Close()
+	_ = answerer.Close()
 	close(stopCandidates)
 	<-done
 }

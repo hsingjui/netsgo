@@ -271,7 +271,7 @@ func TestUnifiedClientToClientDirectPreferredTCPEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
 	payload := []byte("peer-direct payload")
 	if _, err := conn.Write(payload); err != nil {
@@ -353,7 +353,7 @@ func TestUnifiedClientToClientP2PFailurePolicyBehavior(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
 	if _, err := conn.Write([]byte("must not relay")); err != nil {
 		t.Fatal(err)
@@ -568,7 +568,7 @@ func TestUnifiedClientToClientSharedLimitServesReverseTrafficWhileForwardBacklog
 	waitForUnifiedP2PConnected(t, s, created.ID)
 
 	conn := dialUnifiedTCP(t, ingressPort)
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	forward := bytes.Repeat([]byte{0x6d}, 8*1024*1024)
 	writeDone := make(chan error, 1)
 	go func() {
@@ -828,7 +828,7 @@ func startBidirectionalLimitProbeService(t *testing.T, threshold int, marker []b
 			result <- err
 			return
 		}
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 		if err := conn.SetDeadline(time.Now().Add(15 * time.Second)); err != nil {
 			result <- err
 			return

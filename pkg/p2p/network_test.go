@@ -229,7 +229,7 @@ func assertSessionsConnectAcrossVNet(t *testing.T, network *p2pVNet, servers []p
 			accepted <- err
 			return
 		}
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 		payload := make([]byte, 4)
 		_, err = io.ReadFull(conn, payload)
 		if err == nil {
@@ -241,7 +241,7 @@ func assertSessionsConnectAcrossVNet(t *testing.T, network *p2pVNet, servers []p
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	if _, err := conn.Write([]byte("vnet")); err != nil {
 		t.Fatal(err)
 	}

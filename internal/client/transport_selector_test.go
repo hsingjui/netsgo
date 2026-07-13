@@ -80,7 +80,7 @@ func TestIngressTransportSelectorNeverOpensBothAfterDirectSuccess(t *testing.T) 
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	if actual != protocol.ActualTransportPeerDirect || direct.opens != 1 || relay.opens != 0 {
 		t.Fatalf("selector duplicated open: actual=%s direct=%d relay=%d", actual, direct.opens, relay.opens)
 	}
