@@ -7,6 +7,7 @@ import (
 	"netsgo/internal/svcmgr"
 	"netsgo/pkg/fileutil"
 	"os"
+	"path/filepath"
 )
 
 type Orchestrator struct {
@@ -147,7 +148,18 @@ func (o *Orchestrator) StartServices(units []string, started *[]string) error {
 }
 
 func replaceBinary(srcPath, dstPath string) error {
-	tmpPath := dstPath + ".tmp"
+	src, err := os.Open(srcPath)
+	if err != nil {
+		return fmt.Errorf("open source: %w", err)
+	}
+	defer func() { _ = src.Close() }()
+
+	dstDir := filepath.Dir(dstPath)
+	tmp, err := os.CreateTemp(dstDir, "."+filepath.Base(dstPath)+".tmp-*")
+	if err != nil {
+		return fmt.Errorf("create temp: %w", err)
+	}
+	tmpPath := tmp.Name()
 	cleanupTmp := true
 	defer func() {
 		if cleanupTmp {
@@ -155,27 +167,29 @@ func replaceBinary(srcPath, dstPath string) error {
 		}
 	}()
 
-	src, err := os.Open(srcPath)
-	if err != nil {
-		return fmt.Errorf("open source: %w", err)
+	if err := tmp.Chmod(0o755); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("chmod temp: %w", err)
 	}
-	defer func() { _ = src.Close() }()
-
-	dst, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o755)
-	if err != nil {
-		return fmt.Errorf("create temp: %w", err)
-	}
-	if _, err := io.Copy(dst, src); err != nil {
-		_ = dst.Close()
+	if _, err := io.Copy(tmp, src); err != nil {
+		_ = tmp.Close()
 		return fmt.Errorf("copy: %w", err)
 	}
-	if err := dst.Close(); err != nil {
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("sync temp: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
 		return fmt.Errorf("close temp: %w", err)
 	}
 	if err := os.Rename(tmpPath, dstPath); err != nil {
 		return fmt.Errorf("rename: %w", err)
 	}
 	cleanupTmp = false
+
+	if err := syncDirectory(dstDir); err != nil {
+		return err
+	}
 	return nil
 }
 

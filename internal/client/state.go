@@ -2,6 +2,7 @@ package client
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -27,6 +28,21 @@ func (c *Client) legacyStatePath() string {
 	return filepath.Join(root, "client", legacyClientJSONFileName)
 }
 
+func clientKeyFingerprint(key string) string {
+	digest := sha256.Sum256([]byte("netsgo-client-key-fingerprint:" + key))
+	return hex.EncodeToString(digest[:])
+}
+
+func (c *Client) prepareAuthentication() error {
+	if c.Key == "" || c.Token == "" || c.keyFingerprint == "" || c.keyFingerprint == clientKeyFingerprint(c.Key) {
+		return nil
+	}
+	if err := c.clearToken(); err != nil {
+		return fmt.Errorf("clear token after client key change: %w", err)
+	}
+	return nil
+}
+
 func (c *Client) ensureInstallID() error {
 	if c.InstallID != "" {
 		return nil
@@ -48,6 +64,9 @@ func (c *Client) ensureInstallID() error {
 		if state.TLSFingerprint != "" && c.TLSFingerprint == "" {
 			c.TLSFingerprint = state.TLSFingerprint
 		}
+		if state.KeyFingerprint != "" && c.keyFingerprint == "" {
+			c.keyFingerprint = state.KeyFingerprint
+		}
 		return nil
 	}
 
@@ -60,10 +79,14 @@ func (c *Client) ensureInstallID() error {
 		if c.TLSFingerprint == "" {
 			c.TLSFingerprint = legacyState.TLSFingerprint
 		}
+		if c.keyFingerprint == "" {
+			c.keyFingerprint = legacyState.KeyFingerprint
+		}
 		if err := store.Save(persistedState{
 			InstallID:      legacyState.InstallID,
 			Token:          c.Token,
 			TLSFingerprint: c.TLSFingerprint,
+			KeyFingerprint: c.keyFingerprint,
 		}); err != nil {
 			return err
 		}
@@ -79,6 +102,7 @@ func (c *Client) ensureInstallID() error {
 		InstallID:      installID,
 		Token:          c.Token,
 		TLSFingerprint: c.TLSFingerprint,
+		KeyFingerprint: c.keyFingerprint,
 	}
 	if err := store.Save(state); err != nil {
 		return err
@@ -126,6 +150,9 @@ func (c *Client) saveState(update func(*persistedState)) error {
 	if state.TLSFingerprint == "" {
 		state.TLSFingerprint = c.TLSFingerprint
 	}
+	if state.KeyFingerprint == "" {
+		state.KeyFingerprint = c.keyFingerprint
+	}
 	update(&state)
 	return store.Save(state)
 }
@@ -134,6 +161,13 @@ func (c *Client) saveState(update func(*persistedState)) error {
 func (c *Client) saveToken(token string) error {
 	return c.saveState(func(state *persistedState) {
 		state.Token = token
+	})
+}
+
+func (c *Client) saveKeyAuthenticatedState(token, keyFingerprint string) error {
+	return c.saveState(func(state *persistedState) {
+		state.Token = token
+		state.KeyFingerprint = keyFingerprint
 	})
 }
 

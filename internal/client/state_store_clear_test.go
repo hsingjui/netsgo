@@ -17,6 +17,7 @@ func TestClearClientTokenPreservesIdentityAndFingerprint(t *testing.T) {
 		InstallID:      "client-install",
 		Token:          "tk-old",
 		TLSFingerprint: "AA:BB",
+		KeyFingerprint: "key-fingerprint",
 	}); err != nil {
 		t.Fatalf("Save() error = %v", err)
 	}
@@ -31,7 +32,7 @@ func TestClearClientTokenPreservesIdentityAndFingerprint(t *testing.T) {
 	if !ok {
 		t.Fatal("ClearClientToken should report a saved identity")
 	}
-	if got.InstallID != "client-install" || got.Token != "" || got.TLSFingerprint != "AA:BB" {
+	if got.InstallID != "client-install" || got.Token != "" || got.TLSFingerprint != "AA:BB" || got.KeyFingerprint != "key-fingerprint" {
 		t.Fatalf("ClearClientToken() = %+v", got)
 	}
 
@@ -55,6 +56,7 @@ func TestClearClientTokenIgnoresMalformedLegacyJSONWhenDatabaseIdentityExists(t 
 		InstallID:      "client-install",
 		Token:          "tk-old",
 		TLSFingerprint: "AA:BB",
+		KeyFingerprint: "key-fingerprint",
 	}); err != nil {
 		t.Fatalf("Save() error = %v", err)
 	}
@@ -73,7 +75,7 @@ func TestClearClientTokenIgnoresMalformedLegacyJSONWhenDatabaseIdentityExists(t 
 	if !ok {
 		t.Fatal("ClearClientToken should report the SQLite identity")
 	}
-	if got.InstallID != "client-install" || got.Token != "" || got.TLSFingerprint != "AA:BB" {
+	if got.InstallID != "client-install" || got.Token != "" || got.TLSFingerprint != "AA:BB" || got.KeyFingerprint != "key-fingerprint" {
 		t.Fatalf("ClearClientToken() = %+v", got)
 	}
 
@@ -104,6 +106,7 @@ func TestClearClientTokenClearsLegacyJSONWhenDatabaseMissing(t *testing.T) {
 		InstallID:      "client-legacy",
 		Token:          "legacy-token",
 		TLSFingerprint: "AA:BB:CC",
+		KeyFingerprint: "legacy-key-fingerprint",
 	})
 
 	got, ok, err := ClearClientToken(dbPath)
@@ -113,7 +116,7 @@ func TestClearClientTokenClearsLegacyJSONWhenDatabaseMissing(t *testing.T) {
 	if !ok {
 		t.Fatal("ClearClientToken should report legacy identity")
 	}
-	if got.InstallID != "client-legacy" || got.Token != "" || got.TLSFingerprint != "AA:BB:CC" {
+	if got.InstallID != "client-legacy" || got.Token != "" || got.TLSFingerprint != "AA:BB:CC" || got.KeyFingerprint != "legacy-key-fingerprint" {
 		t.Fatalf("ClearClientToken() = %+v", got)
 	}
 	reloadedLegacy := readLegacyClientState(t, legacyPath)
@@ -137,6 +140,9 @@ func TestClearClientTokenClearsLegacyJSONWhenDatabaseMissing(t *testing.T) {
 	}
 	if c.TLSFingerprint != "AA:BB:CC" {
 		t.Fatalf("TLSFingerprint = %q, want AA:BB:CC", c.TLSFingerprint)
+	}
+	if c.keyFingerprint != "legacy-key-fingerprint" {
+		t.Fatalf("keyFingerprint = %q, want legacy-key-fingerprint", c.keyFingerprint)
 	}
 }
 

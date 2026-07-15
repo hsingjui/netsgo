@@ -15,7 +15,7 @@ func TestClientStateStoreRoundTrip(t *testing.T) {
 	}
 	defer func() { _ = store.Close() }()
 
-	state := persistedState{InstallID: "client-install", Token: "tk-test", TLSFingerprint: "AA:BB"}
+	state := persistedState{InstallID: "client-install", Token: "tk-test", TLSFingerprint: "AA:BB", KeyFingerprint: "key-fingerprint"}
 	if err := store.Save(state); err != nil {
 		t.Fatalf("Save() error = %v", err)
 	}
@@ -66,7 +66,7 @@ func TestLoadClientIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newClientStateStore() error = %v", err)
 	}
-	if err := store.Save(persistedState{InstallID: "client-install", Token: "tk-test", TLSFingerprint: "AA:BB"}); err != nil {
+	if err := store.Save(persistedState{InstallID: "client-install", Token: "tk-test", TLSFingerprint: "AA:BB", KeyFingerprint: "key-fingerprint"}); err != nil {
 		t.Fatalf("Save() error = %v", err)
 	}
 	if err := store.Close(); err != nil {
@@ -80,7 +80,7 @@ func TestLoadClientIdentity(t *testing.T) {
 	if !ok {
 		t.Fatal("expected saved identity")
 	}
-	if got.InstallID != "client-install" || got.Token != "tk-test" || got.TLSFingerprint != "AA:BB" {
+	if got.InstallID != "client-install" || got.Token != "tk-test" || got.TLSFingerprint != "AA:BB" || got.KeyFingerprint != "key-fingerprint" {
 		t.Fatalf("LoadClientIdentity() = %+v", got)
 	}
 }
@@ -107,5 +107,37 @@ func TestLoadClientIdentityTreatsMissingTableAsAbsent(t *testing.T) {
 
 	if _, ok, err := LoadClientIdentity(path); err != nil || ok {
 		t.Fatalf("LoadClientIdentity() error = %v, ok = %v; want absent identity without error", err, ok)
+	}
+}
+
+func TestClientStateStoreMigratesKeyFingerprint(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "client", clientDBFileName)
+	legacyMigrations := clientMigrations()[:1]
+	db, err := storage.Open(path, legacyMigrations)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO client_identity (id, install_id, token, tls_fingerprint) VALUES (1, ?, ?, ?)`, "client-legacy", "tk-legacy", "AA:BB"); err != nil {
+		t.Fatalf("insert legacy identity: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	store, err := newClientStateStore(path)
+	if err != nil {
+		t.Fatalf("newClientStateStore() error = %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	got, ok, err := store.Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if !ok {
+		t.Fatal("expected migrated identity")
+	}
+	if got.InstallID != "client-legacy" || got.Token != "tk-legacy" || got.TLSFingerprint != "AA:BB" || got.KeyFingerprint != "" {
+		t.Fatalf("migrated state = %+v", got)
 	}
 }

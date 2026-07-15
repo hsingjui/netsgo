@@ -55,6 +55,7 @@ type Client struct {
 	TLSSkipVerify          bool
 	TLSFingerprint         string
 	TLSFingerprintExplicit bool
+	keyFingerprint         string
 	dataToken              string
 	conn                   *websocket.Conn
 	mu                     sync.Mutex // Protects the current runtime and mirrored fields
@@ -540,6 +541,9 @@ func (c *Client) connectAndRun() error {
 	if err := c.ensureInstallID(); err != nil {
 		return fmt.Errorf("failed to initialize client identity: %w", err)
 	}
+	if err := c.prepareAuthentication(); err != nil {
+		return fmt.Errorf("failed to prepare client authentication: %w", err)
+	}
 
 	c.normalizeServerAddr()
 	rt := c.beginRuntime()
@@ -657,7 +661,7 @@ func (c *Client) authenticateRuntime(rt *sessionRuntime) error {
 			return fmt.Errorf("connection failed during authentication: %w", err)
 		}
 		if authResp.Success {
-			c.applyAuthSuccess(authResp)
+			c.applyAuthSuccess(authResp, false)
 			c.logger().Info("client.token_auth_succeeded", "Token authentication succeeded", nil)
 			return nil
 		}
@@ -673,8 +677,7 @@ func (c *Client) authenticateRuntime(rt *sessionRuntime) error {
 	if !authResp.Success {
 		return c.handleAuthFailure(authResp, false)
 	}
-
-	c.applyAuthSuccess(authResp)
+	c.applyAuthSuccess(authResp, true)
 	return nil
 }
 
@@ -709,23 +712,35 @@ func (c *Client) sendAuthRequestRuntime(rt *sessionRuntime, authReq protocol.Aut
 	}
 	return authResp, nil
 }
-
-func (c *Client) applyAuthSuccess(authResp protocol.AuthResponse) {
+func (c *Client) applyAuthSuccess(authResp protocol.AuthResponse, authenticatedWithKey bool) {
 	c.mu.Lock()
 	c.ClientID = authResp.ClientID
 	c.dataToken = authResp.DataToken
 	if authResp.Token != "" {
 		c.Token = authResp.Token
 	}
+	keyFingerprint := ""
+	if authenticatedWithKey {
+		keyFingerprint = clientKeyFingerprint(c.Key)
+		c.keyFingerprint = keyFingerprint
+	}
 	c.mu.Unlock()
 
-	if authResp.Token != "" {
-		if err := c.saveToken(authResp.Token); err != nil {
-			c.logger().Warn("client.token_save_failed", "Failed to save token", map[string]any{"error": err.Error()})
-		} else {
-			c.logger().Info("client.token_saved", "Token saved and will be reused for future reconnects", nil)
-		}
+	if authResp.Token == "" {
+		return
 	}
+
+	var err error
+	if authenticatedWithKey {
+		err = c.saveKeyAuthenticatedState(authResp.Token, keyFingerprint)
+	} else {
+		err = c.saveToken(authResp.Token)
+	}
+	if err != nil {
+		c.logger().Warn("client.token_save_failed", "Failed to save token", map[string]any{"error": err.Error()})
+		return
+	}
+	c.logger().Info("client.token_saved", "Token saved and will be reused for future reconnects", nil)
 }
 
 func (c *Client) handleAuthFailure(authResp protocol.AuthResponse, attemptedWithToken bool) error {

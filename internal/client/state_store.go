@@ -21,6 +21,7 @@ type ClientIdentity struct {
 	InstallID      string `json:"install_id"`
 	Token          string `json:"token,omitempty"`
 	TLSFingerprint string `json:"tls_fingerprint,omitempty"`
+	KeyFingerprint string `json:"key_fingerprint,omitempty"`
 }
 
 type persistedState = ClientIdentity
@@ -41,9 +42,10 @@ func newClientStateStore(path string) (*clientStateStore, error) {
 }
 
 func clientMigrations() []storage.Migration {
-	return []storage.Migration{{
-		Name: "001_client_identity",
-		Up: `
+	return []storage.Migration{
+		{
+			Name: "001_client_identity",
+			Up: `
 CREATE TABLE client_identity (
 	id INTEGER PRIMARY KEY CHECK (id = 1),
 	install_id TEXT NOT NULL,
@@ -51,7 +53,12 @@ CREATE TABLE client_identity (
 	tls_fingerprint TEXT NOT NULL DEFAULT ''
 );
 `,
-	}}
+		},
+		{
+			Name: "002_client_key_fingerprint",
+			Up:   "ALTER TABLE client_identity ADD COLUMN key_fingerprint TEXT NOT NULL DEFAULT '';",
+		},
+	}
 }
 
 func (s *clientStateStore) Close() error {
@@ -66,10 +73,11 @@ func (s *clientStateStore) Close() error {
 
 func (s *clientStateStore) Load() (persistedState, bool, error) {
 	var state persistedState
-	err := s.db.QueryRow(`SELECT install_id, token, tls_fingerprint FROM client_identity WHERE id = 1`).Scan(
+	err := s.db.QueryRow(`SELECT install_id, token, tls_fingerprint, key_fingerprint FROM client_identity WHERE id = 1`).Scan(
 		&state.InstallID,
 		&state.Token,
 		&state.TLSFingerprint,
+		&state.KeyFingerprint,
 	)
 	if err == sql.ErrNoRows {
 		return persistedState{}, false, nil
@@ -84,15 +92,17 @@ func (s *clientStateStore) Save(state persistedState) error {
 	if state.InstallID == "" {
 		return fmt.Errorf("install_id must not be empty")
 	}
-	_, err := s.db.Exec(`INSERT INTO client_identity (id, install_id, token, tls_fingerprint)
-VALUES (1, ?, ?, ?)
+	_, err := s.db.Exec(`INSERT INTO client_identity (id, install_id, token, tls_fingerprint, key_fingerprint)
+VALUES (1, ?, ?, ?, ?)
 ON CONFLICT(id) DO UPDATE SET
 	install_id = excluded.install_id,
 	token = excluded.token,
-	tls_fingerprint = excluded.tls_fingerprint`,
+	tls_fingerprint = excluded.tls_fingerprint,
+	key_fingerprint = excluded.key_fingerprint`,
 		state.InstallID,
 		state.Token,
 		state.TLSFingerprint,
+		state.KeyFingerprint,
 	)
 	if err != nil {
 		return fmt.Errorf("save client identity: %w", err)

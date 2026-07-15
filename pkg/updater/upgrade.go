@@ -3,15 +3,22 @@ package updater
 import (
 	"errors"
 	"fmt"
+	"netsgo/pkg/flock"
 	"os"
 	"path/filepath"
 )
 
 var osMkdirTempFunc = os.MkdirTemp
+var upgradeLockPath = "/run/netsgo-upgrade.lock"
+var upgradeLockPathFor = func() string { return upgradeLockPath }
 
 func Upgrade(srcPath, oldVersion, newVersion string) (*Result, error) {
 	result := &Result{OldVersion: oldVersion, NewVersion: newVersion}
-	var err error
+	unlock, err := flock.TryLock(upgradeLockPathFor())
+	if err != nil {
+		return result, fmt.Errorf("another upgrade is already running: %w", err)
+	}
+	defer unlock()
 
 	units := detectInstalledUnitsFunc()
 	if len(units) == 0 {
@@ -35,7 +42,7 @@ func Upgrade(srcPath, oldVersion, newVersion string) (*Result, error) {
 	}
 	result.Stopped = stopped
 
-	tmpDir, err := osMkdirTempFunc("", "netsgo-upgrade-*")
+	tmpDir, err := osMkdirTempFunc(filepath.Dir(installedBinaryPath), ".netsgo-upgrade-*")
 	if err != nil {
 		if rollbackErr := orch.RestartStoppedServices(stopped); rollbackErr != nil {
 			return result, errors.Join(fmt.Errorf("temp dir: %w", err), rollbackErr)

@@ -29,6 +29,16 @@ warn() {
   printf 'WARN: %s\n' "$*" >&2
 }
 
+is_tty_path() {
+  exec 8<"$1"
+  if tty -s <&8 2>/dev/null; then
+    exec 8<&-
+    return 0
+  fi
+  exec 8<&-
+  return 1
+}
+
 require_linux_systemd() {
   log "检查 Linux + systemd 环境"
   [ "$(uname -s)" = "Linux" ] || die "此脚本只支持 Linux + systemd。请前往 GitHub Releases 手动下载。"
@@ -38,7 +48,7 @@ require_linux_systemd() {
 
 require_tools() {
   log "检查依赖工具"
-  for tool in curl tar sha256sum jq awk sed sort grep head dirname rm mv mkdir mktemp chmod id stat; do
+  for tool in curl tar sha256sum jq awk sed sort grep head dirname rm mv mkdir mktemp chmod id stat cp tee tty; do
     command -v "$tool" >/dev/null 2>&1 || die "缺少依赖: $tool"
   done
 }
@@ -183,7 +193,7 @@ download_official() {
   tmp_out="${out}.part.$$"
   rm -f "$tmp_out"
   log "下载 $url"
-  if curl -fL --progress-bar "$url" -o "$tmp_out"; then
+  if curl -fL --silent --show-error "$url" -o "$tmp_out"; then
     reject_symlink_path "$out"
     mv "$tmp_out" "$out"
     chmod 600 "$out" 2>/dev/null || true
@@ -267,7 +277,7 @@ verify_signature_openssl() {
   sig="$2"
   [ -n "$NETSGO_RELEASE_PUBLIC_KEY_PEM" ] || return 1
   command -v openssl >/dev/null 2>&1 || return 1
-  pub="$(mktemp)"
+  pub="$(private_temp_file netsgo-release-public-key)"
   printf '%s\n' "$NETSGO_RELEASE_PUBLIC_KEY_PEM" > "$pub"
   if openssl pkeyutl -verify -pubin -inkey "$pub" -rawin -in "$checksums" -sigfile "$sig" >/dev/null 2>&1; then
     rm -f "$pub"
@@ -282,7 +292,7 @@ verify_signature_sshsig() {
   sshsig="$2"
   [ -n "$NETSGO_RELEASE_ALLOWED_SIGNERS" ] || return 1
   command -v ssh-keygen >/dev/null 2>&1 || return 1
-  allowed="$(mktemp)"
+  allowed="$(private_temp_file netsgo-release-allowed-signers)"
   printf '%s\n' "$NETSGO_RELEASE_ALLOWED_SIGNERS" > "$allowed"
   if ssh-keygen -Y verify -f "$allowed" -I netsgo-release -n file -s "$sshsig" < "$checksums" >/dev/null 2>&1; then
     rm -f "$allowed"
@@ -338,6 +348,7 @@ extract_netsgo() {
   mkdir -p "$(dirname "$dest")"
   tar -xzf "$archive" -C "$(dirname "$dest")" --strip-components=1 --wildcards '*/netsgo' 2>/dev/null ||
     tar -xzf "$archive" -C "$(dirname "$dest")" netsgo
+  [ -f "$dest" ] && [ ! -L "$dest" ] || die "release archive 中的 netsgo 不是普通文件"
   chmod +x "$dest"
 }
 
@@ -353,11 +364,129 @@ reject_symlink_path() {
   [ ! -L "$1" ] || die "拒绝使用符号链接更新缓存路径: $1"
 }
 
+system_tmp_root="${TMPDIR:-/tmp}"
+
+mode_group_or_world_writable() {
+  case "$1" in
+    ?????w*|????????w*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+mode_has_sticky_bit() {
+  case "$1" in
+    d????????t|d????????T) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+validate_system_tmp_root() {
+  netsgo_tmp_root="$system_tmp_root"
+  case "$netsgo_tmp_root" in
+    /*) ;;
+    *) die "系统临时目录必须是绝对路径: $netsgo_tmp_root" ;;
+  esac
+  [ -d "$netsgo_tmp_root" ] || die "系统临时目录不存在: $netsgo_tmp_root"
+  case "$netsgo_tmp_root" in
+    /) ;;
+    */) netsgo_tmp_root="${netsgo_tmp_root%/}" ;;
+  esac
+  netsgo_tmp_root="$(physical_directory "$netsgo_tmp_root")" || die "无法解析系统临时目录物理路径: $netsgo_tmp_root"
+  [ ! -L "$netsgo_tmp_root" ] || die "系统临时目录不得是符号链接: $netsgo_tmp_root"
+
+  netsgo_tmp_owner="$(stat_owner_uid "$netsgo_tmp_root")" || die "无法读取系统临时目录属主: $netsgo_tmp_root"
+  netsgo_tmp_mode="$(stat_mode_text "$netsgo_tmp_root")" || die "无法读取系统临时目录权限: $netsgo_tmp_root"
+  netsgo_tmp_uid="$(id -u)"
+  if mode_group_or_world_writable "$netsgo_tmp_mode"; then
+    if [ "$netsgo_tmp_owner" != "0" ] || ! mode_has_sticky_bit "$netsgo_tmp_mode"; then
+      die "系统临时目录可被其他用户替换文件且未受 root sticky bit 保护: $netsgo_tmp_root"
+    fi
+  elif [ "$netsgo_tmp_owner" != "$netsgo_tmp_uid" ] && [ "$netsgo_tmp_owner" != "0" ]; then
+    die "系统临时目录属主不可信: $netsgo_tmp_root"
+  fi
+  validate_private_path_ancestors "$netsgo_tmp_root"
+  system_tmp_root="$netsgo_tmp_root"
+}
+
+private_temp_dir() {
+  netsgo_tmp_prefix="$1"
+  validate_system_tmp_root
+  old_umask="$(umask)"
+  umask 077
+  netsgo_tmp_path="$(mktemp -d "$system_tmp_root/$netsgo_tmp_prefix.XXXXXXXXXX")" || {
+    umask "$old_umask"
+    die "无法创建私有临时目录"
+  }
+  umask "$old_umask"
+  chmod 700 "$netsgo_tmp_path" || die "无法保护私有临时目录: $netsgo_tmp_path"
+  printf '%s\n' "$netsgo_tmp_path"
+}
+
+can_execute_file() {
+  "$1" >/dev/null 2>&1
+}
+
+private_executable_temp_dir() {
+  netsgo_tmp_prefix="$1"
+  original_system_tmp_root="$system_tmp_root"
+  for candidate in "${NETSGO_EXEC_TMPDIR:-}" "$original_system_tmp_root" /var/tmp /tmp; do
+    [ -n "$candidate" ] || continue
+    system_tmp_root="$candidate"
+    if ! netsgo_exec_tmp_path="$(private_temp_dir "$netsgo_tmp_prefix")" 2>/dev/null; then
+      continue
+    fi
+    netsgo_exec_probe="$netsgo_exec_tmp_path/.netsgo-exec-probe"
+    if printf '%s\n' '#!/bin/sh' 'exit 0' >"$netsgo_exec_probe" && chmod 700 "$netsgo_exec_probe" && can_execute_file "$netsgo_exec_probe"; then
+      rm -f "$netsgo_exec_probe"
+      system_tmp_root="$original_system_tmp_root"
+      printf '%s\n' "$netsgo_exec_tmp_path"
+      return 0
+    fi
+    rm -rf "$netsgo_exec_tmp_path"
+  done
+  system_tmp_root="$original_system_tmp_root"
+  die "未找到可执行且安全的临时目录；请设置 NETSGO_EXEC_TMPDIR 指向可执行目录"
+}
+
+private_temp_file() {
+  netsgo_tmp_prefix="$1"
+  validate_system_tmp_root
+  old_umask="$(umask)"
+  umask 077
+  netsgo_tmp_path="$(mktemp "$system_tmp_root/$netsgo_tmp_prefix.XXXXXXXXXX")" || {
+    umask "$old_umask"
+    die "无法创建私有临时文件"
+  }
+  umask "$old_umask"
+  chmod 600 "$netsgo_tmp_path" || die "无法保护私有临时文件: $netsgo_tmp_path"
+  printf '%s\n' "$netsgo_tmp_path"
+}
+
+validate_private_path_ancestors() {
+  netsgo_ancestor_path="$1"
+  while [ "$netsgo_ancestor_path" != "/" ]; do
+    netsgo_ancestor_path="$(dirname "$netsgo_ancestor_path")"
+    [ -d "$netsgo_ancestor_path" ] || die "更新缓存父路径不是目录: $netsgo_ancestor_path"
+    netsgo_ancestor_owner="$(stat_owner_uid "$netsgo_ancestor_path")" || die "无法读取更新缓存父路径属主: $netsgo_ancestor_path"
+    netsgo_ancestor_uid="$(id -u)"
+    if [ "$netsgo_ancestor_owner" != "$netsgo_ancestor_uid" ] && [ "$netsgo_ancestor_owner" != "0" ]; then
+      die "更新缓存父路径属主不可信: $netsgo_ancestor_path"
+    fi
+    netsgo_ancestor_mode="$(stat_mode_text "$netsgo_ancestor_path")" || die "无法读取更新缓存父路径权限: $netsgo_ancestor_path"
+    if mode_group_or_world_writable "$netsgo_ancestor_mode"; then
+      if [ "$netsgo_ancestor_owner" != "0" ] || ! mode_has_sticky_bit "$netsgo_ancestor_mode"; then
+        die "更新缓存父路径可被其他用户替换子路径: $netsgo_ancestor_path"
+      fi
+    fi
+  done
+}
+
+physical_directory() {
+  CDPATH='' cd -- "$1" 2>/dev/null && pwd -P
+}
+
 default_cache_root() {
-  base="${TMPDIR:-/tmp}"
-  root="$(mktemp -d "$base/netsgo-update-cache.XXXXXXXXXX")" || die "无法创建私有更新缓存目录"
-  chmod 700 "$root" || die "无法保护私有更新缓存目录: $root"
-  printf '%s\n' "$root"
+  private_temp_dir netsgo-update-cache
 }
 
 validate_cache_root() {
@@ -376,6 +505,8 @@ validate_cache_root() {
     mkdir -p "$root" || { umask "$old_umask"; die "无法创建更新缓存目录: $root"; }
     umask "$old_umask"
   fi
+  physical_root="$(physical_directory "$root")" || die "无法解析更新缓存物理路径: $root"
+  root="$physical_root"
   reject_symlink_path "$root"
   [ -d "$root" ] || die "更新缓存路径不是目录: $root"
 
@@ -389,12 +520,14 @@ validate_cache_root() {
   case "$mode_text" in
     ?????w*|????????w*) die "更新缓存目录不得 group/world 可写: $root" ;;
   esac
+  validate_private_path_ancestors "$root"
+  validated_cache_root="$root"
 }
 
 cache_root() {
   if [ -n "${NETSGO_UPDATE_CACHE_DIR:-}" ]; then
     validate_cache_root "$NETSGO_UPDATE_CACHE_DIR"
-    printf '%s\n' "$NETSGO_UPDATE_CACHE_DIR"
+    printf '%s\n' "$validated_cache_root"
     return 0
   fi
   default_cache_root
@@ -403,7 +536,7 @@ cache_root() {
 cache_dir_for() {
   if [ -n "${NETSGO_UPDATE_CACHE_DIR:-}" ]; then
     validate_cache_root "$NETSGO_UPDATE_CACHE_DIR"
-    root="$NETSGO_UPDATE_CACHE_DIR"
+    root="$validated_cache_root"
   else
     root="$(default_cache_root)"
   fi
@@ -565,6 +698,7 @@ channel_for_target() {
 cleanup_paths=""
 cache_dir=""
 completed=0
+cancelled=0
 cleanup() {
   for path in $cleanup_paths; do
     [ -n "$path" ] && rm -rf "$path"
@@ -578,26 +712,133 @@ cleanup() {
         warn "升级已完成，但清理下载缓存失败: $cache_dir"
       fi
     fi
+  elif [ "$cancelled" -eq 1 ]; then
+    [ -z "$cache_dir" ] || log "升级已取消，保留已验证下载缓存: $cache_dir"
   elif [ -n "$cache_dir" ]; then
     warn "升级未完成，已保留下载缓存以便下次重试: $cache_dir"
   fi
 }
 trap cleanup EXIT
+trap 'exit 1' HUP INT TERM
+
+sudo_bin=""
+env_bin=""
+sudo_candidates="/usr/bin/sudo /bin/sudo"
+env_candidates="/usr/bin/env /bin/env"
+trusted_root_path="/usr/sbin:/usr/bin:/sbin:/bin"
+
+ensure_root_access() {
+  if [ "$(id -u)" -eq 0 ]; then
+    return 0
+  fi
+  for candidate in $sudo_candidates; do
+    if [ -x "$candidate" ]; then
+      sudo_bin="$candidate"
+      break
+    fi
+  done
+  for candidate in $env_candidates; do
+    if [ -x "$candidate" ]; then
+      env_bin="$candidate"
+      break
+    fi
+  done
+  [ -n "$env_bin" ] || die "升级需要 env"
+  [ -n "$sudo_bin" ] || die "升级需要 sudo"
+  "$sudo_bin" -v || die "无法获取 sudo 权限，升级未启动"
+  "$sudo_bin" -n -v || die "无法无交互获取 sudo 权限，升级未启动"
+}
+
+run_as_root() {
+  if [ "$(id -u)" -eq 0 ]; then
+    PATH="$trusted_root_path" "$@"
+  else
+    "$sudo_bin" -n "$env_bin" PATH="$trusted_root_path" "$@"
+  fi
+}
+
+trusted_upgrade_root="/var/lib/netsgo-upgrade"
+trusted_root_owner="root:root"
+prepared_upgrade_dir=""
+
+prepare_trusted_upgrade_dir() {
+  source_bin="$1"
+  command -v cp >/dev/null 2>&1 || die "缺少依赖: cp"
+  ensure_root_access
+
+  trusted_root="$trusted_upgrade_root"
+  run_as_root mkdir -p "$trusted_root" || die "无法创建可信升级目录: $trusted_root"
+  run_as_root chown "$trusted_root_owner" "$trusted_root" || die "无法保护可信升级目录: $trusted_root"
+  run_as_root chmod 700 "$trusted_root" || die "无法保护可信升级目录: $trusted_root"
+  trusted_dir="$(run_as_root mktemp -d "$trusted_root/run.XXXXXXXXXX")" || die "无法创建可信升级工作目录"
+  run_as_root chown "$trusted_root_owner" "$trusted_dir" || die "无法保护可信升级工作目录: $trusted_dir"
+  run_as_root chmod 700 "$trusted_dir" || die "无法保护可信升级工作目录: $trusted_dir"
+  run_as_root cp "$source_bin" "$trusted_dir/netsgo" || {
+    run_as_root rm -rf "$trusted_dir" || true
+    die "无法准备可信升级二进制"
+  }
+  run_as_root chown "$trusted_root_owner" "$trusted_dir/netsgo" || die "无法保护可信升级二进制"
+  run_as_root chmod 700 "$trusted_dir/netsgo" || die "无法保护可信升级二进制"
+  command -v tee >/dev/null 2>&1 || die "缺少依赖: tee"
+  run_as_root tee "$trusted_dir/run.sh" >/dev/null <<'EOF'
+#!/bin/sh
+set -eu
+trusted_dir="$1"
+force_arg="$2"
+trap 'rm -rf "$trusted_dir"' EXIT
+status=0
+if [ "$force_arg" -eq 1 ]; then
+  TERM=dumb "$trusted_dir/netsgo" upgrade -f -y || status=$?
+else
+  TERM=dumb "$trusted_dir/netsgo" upgrade -y || status=$?
+fi
+exit "$status"
+EOF
+  run_as_root chown "$trusted_root_owner" "$trusted_dir/run.sh" || die "无法保护可信升级 runner"
+  run_as_root chmod 700 "$trusted_dir/run.sh" || die "无法保护可信升级 runner"
+  prepared_upgrade_dir="$trusted_dir"
+}
 
 run_upgrade_binary() {
-  bin="$1"
+  source_bin="$1"
   force_arg="$2"
-  yes_arg="$3"
-  args="upgrade"
-  [ "$force_arg" -eq 1 ] && args="$args -f"
-  [ "$yes_arg" -eq 1 ] && args="$args -y"
-  tty_path="${NETSGO_UPGRADE_TTY:-/dev/tty}"
-  if [ -r "$tty_path" ] && [ -w "$tty_path" ]; then
-    "$bin" $args <"$tty_path" >"$tty_path" 2>&1
-    return $?
+  command -v systemd-run >/dev/null 2>&1 || die "缺少依赖: systemd-run"
+
+  prepare_trusted_upgrade_dir "$source_bin"
+  trusted_dir="$prepared_upgrade_dir"
+  unit="netsgo-upgrade-${trusted_dir##*.}.service"
+  log "执行升级并等待结果（unit=${unit}）"
+  status=0
+  run_as_root systemd-run --quiet --wait --service-type=exec --unit="$unit" \
+    "$trusted_dir/run.sh" "$trusted_dir" "$force_arg" || status=$?
+  if [ "$status" -eq 0 ]; then
+    log "升级完成"
+    return 0
   fi
-  [ "$yes_arg" -eq 1 ] || die "upgrade without -y/--yes must be run from an interactive TTY"
-  "$bin" $args
+  die "升级失败（退出码 ${status}）；请运行 journalctl -u ${unit} 查看日志。"
+}
+
+apply_upgrade_confirmation() {
+  answer="$1"
+  case "$answer" in
+    y|Y|yes|YES|Yes) yes=1 ;;
+    n|N|no|NO|No)
+      cancelled=1
+      printf '升级已取消，未进行任何修改。\n'
+      return 1
+      ;;
+    *) die "请输入 yes 或 no" ;;
+  esac
+}
+
+confirm_upgrade() {
+  [ "$yes" -eq 1 ] && return 0
+  tty_path="${NETSGO_UPGRADE_TTY:-/dev/tty}"
+  is_tty_path "$tty_path" || die "upgrade without -y/--yes must be run from an interactive TTY"
+  printf '用本次下载的 NetsGo 文件替换已安装版本？输入 yes 继续，或输入 no 取消。\n' >"$tty_path"
+  answer=""
+  IFS= read -r answer <"$tty_path" || die "无法读取升级确认"
+  apply_upgrade_confirmation "$answer"
 }
 
 source="auto"
@@ -644,10 +885,10 @@ fi
 installed_bin="${NETSGO_INSTALLED_BIN:-/usr/local/bin/netsgo}"
 [ -x "$installed_bin" ] || die "未找到已安装二进制 $installed_bin"
 log "读取已安装版本: $installed_bin"
-installed_version="$("$installed_bin" --version || true)"
+installed_version="$(TERM=dumb "$installed_bin" --version || true)"
 installed_base="$(extract_comparable_version "$installed_version" || true)"
 
-tmp="$(mktemp -d)"
+tmp="$(private_temp_dir netsgo-upgrade-download)"
 cleanup_paths="$cleanup_paths $tmp"
 
 log "获取 release index（source=${source}, channel=${channel}）"
@@ -667,7 +908,9 @@ if [ "$target_channel" = "auto-beta" ]; then
 else
   target="$(json_get_channel_latest "$tmp/latest.json" "$target_channel")"
 fi
-[ -n "$target" ] && valid_release_tag "$target" || die "release index 中缺少有效 $target_channel 版本"
+if [ -z "$target" ] || ! valid_release_tag "$target"; then
+  die "release index 中缺少有效 $target_channel 版本"
+fi
 log "目标版本: $target"
 
 if [ "$force" -ne 1 ]; then
@@ -677,7 +920,7 @@ if [ "$force" -ne 1 ]; then
     exit 0
   fi
   if semver_gt "$installed_base" "$target"; then
-    die "目标版本 $target 低于当前版本 $installed_base；如需强制降级，请使用 -f。"
+    die "目标版本 ${target} 低于当前版本 ${installed_base}；如需强制降级，请使用 -f。"
   fi
 fi
 
@@ -693,10 +936,11 @@ archive="$(ensure_archive_cached "$release_detail" "$source" "$asset" "$cache_di
 extract_netsgo "$archive" "$tmp/netsgo"
 
 log "验证临时 NetsGo 版本"
-version_output="$("$tmp/netsgo" --version)"
+version_output="$(TERM=dumb "$tmp/netsgo" --version)"
 version="$(extract_exact_release_version "$version_output" || true)"
 [ "$version" = "$target" ] || die "临时 netsgo 版本不匹配: want $target, got $version_output"
 
-log "执行升级"
-run_upgrade_binary "$tmp/netsgo" "$force" "$yes"
-completed=1
+if confirm_upgrade; then
+  run_upgrade_binary "$tmp/netsgo" "$force"
+  completed=1
+fi

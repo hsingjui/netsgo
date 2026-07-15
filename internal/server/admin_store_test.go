@@ -1360,6 +1360,45 @@ func TestAdminStore_Token_ExchangeWithDifferentKeyForSameInstallCreatesNewToken(
 	}
 }
 
+func TestAdminStore_RegisterClientAndExchangeTokenWithDifferentKeyRetainsClientID(t *testing.T) {
+	store := newTestAdminStore(t)
+	keyA := "sk-register-key-a"
+	if _, err := store.AddAPIKey("key-a", keyA, []string{"connect"}, nil); err != nil {
+		t.Fatalf("AddAPIKey(key A) error = %v", err)
+	}
+	keyB := "sk-register-key-b"
+	if _, err := store.AddAPIKey("key-b", keyB, []string{"connect"}, nil); err != nil {
+		t.Fatalf("AddAPIKey(key B) error = %v", err)
+	}
+
+	installID := "install-register-rotate"
+	info := protocol.ClientInfo{Hostname: "rotation-client"}
+	first, err := store.RegisterClientAndExchangeToken(keyA, installID, info, "1.2.3.4:5678")
+	if err != nil {
+		t.Fatalf("first RegisterClientAndExchangeToken() error = %v", err)
+	}
+	second, err := store.RegisterClientAndExchangeToken(keyB, installID, info, "1.2.3.4:5678")
+	if err != nil {
+		t.Fatalf("second RegisterClientAndExchangeToken() error = %v", err)
+	}
+	if first.Client.ID != second.Client.ID {
+		t.Fatalf("Client IDs = %q and %q, want stable ID", first.Client.ID, second.Client.ID)
+	}
+	if first.Token == second.Token {
+		t.Fatal("key rotation should issue a replacement token")
+	}
+	if _, err := store.ValidateClientToken(first.Token, installID); !errors.Is(err, ErrClientTokenRevoked) {
+		t.Fatalf("ValidateClientToken(first) error = %v, want ErrClientTokenRevoked", err)
+	}
+	validated, err := store.ValidateClientToken(second.Token, installID)
+	if err != nil {
+		t.Fatalf("ValidateClientToken(second) error = %v", err)
+	}
+	if validated.InstallID != installID {
+		t.Fatalf("validated InstallID = %q, want %q", validated.InstallID, installID)
+	}
+}
+
 func TestAdminStore_Token_ReuseRequiresValidKey(t *testing.T) {
 	store := newTestAdminStore(t)
 	rawKey := "sk-reuse-key-guard"

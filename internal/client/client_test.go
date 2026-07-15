@@ -320,6 +320,101 @@ func TestClient_ConnectAndAuth(t *testing.T) {
 	}
 }
 
+func TestClient_KeyAuthenticationSelection(t *testing.T) {
+	tests := []struct {
+		name            string
+		key             string
+		state           persistedState
+		wantToken       string
+		wantKey         string
+		wantFingerprint string
+	}{
+		{
+			name:            "matching fingerprint uses token",
+			key:             "key-old",
+			state:           persistedState{InstallID: "install-test", Token: "tk-old", KeyFingerprint: clientKeyFingerprint("key-old")},
+			wantToken:       "tk-old",
+			wantFingerprint: clientKeyFingerprint("key-old"),
+		},
+		{
+			name:            "changed key uses key and persists replacement",
+			key:             "key-new",
+			state:           persistedState{InstallID: "install-test", Token: "tk-old", KeyFingerprint: clientKeyFingerprint("key-old")},
+			wantKey:         "key-new",
+			wantFingerprint: clientKeyFingerprint("key-new"),
+		},
+		{
+			name:      "historical state uses token",
+			key:       "key-old",
+			state:     persistedState{InstallID: "install-test", Token: "tk-old"},
+			wantToken: "tk-old",
+		},
+		{
+			name:      "empty key uses token",
+			state:     persistedState{InstallID: "install-test", Token: "tk-old", KeyFingerprint: clientKeyFingerprint("key-old")},
+			wantToken: "tk-old",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ms := newMockServer(true)
+			ms.authResp.Token = "tk-replacement"
+			ts := newMockHTTPServer(ms)
+			defer ts.Close()
+
+			wsURL := "ws" + strings.TrimPrefix(ts.URL, "http")
+			c := newIsolatedTestClient(t, wsURL, tt.key)
+			c.DisableReconnect = true
+			store, err := newClientStateStore(c.statePath())
+			if err != nil {
+				t.Fatalf("newClientStateStore() error = %v", err)
+			}
+			if err := store.Save(tt.state); err != nil {
+				t.Fatalf("Save() error = %v", err)
+			}
+			if err := store.Close(); err != nil {
+				t.Fatalf("Close() error = %v", err)
+			}
+
+			errCh := make(chan error, 1)
+			go func() { errCh <- c.Start() }()
+			authMsg := ms.waitForMessage(t, 2*time.Second, protocol.MsgTypeAuth)
+			var authReq protocol.AuthRequest
+			if err := authMsg.ParsePayload(&authReq); err != nil {
+				t.Fatalf("ParsePayload() error = %v", err)
+			}
+			if authReq.Token != tt.wantToken || authReq.Key != tt.wantKey {
+				t.Fatalf("AuthRequest = %+v, want token=%q key=%q", authReq, tt.wantToken, tt.wantKey)
+			}
+
+			c.Shutdown()
+			select {
+			case err := <-errCh:
+				if err != nil {
+					t.Fatalf("Start() error = %v", err)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("client did not stop")
+			}
+
+			got, ok, err := LoadClientIdentity(c.statePath())
+			if err != nil {
+				t.Fatalf("LoadClientIdentity() error = %v", err)
+			}
+			if !ok {
+				t.Fatal("expected persisted identity")
+			}
+			if got.InstallID != tt.state.InstallID {
+				t.Fatalf("InstallID = %q, want %q", got.InstallID, tt.state.InstallID)
+			}
+			if tt.wantKey != "" && (got.Token != "tk-replacement" || got.KeyFingerprint != tt.wantFingerprint) {
+				t.Fatalf("key-auth state = %+v, want replacement token and fingerprint %q", got, tt.wantFingerprint)
+			}
+		})
+	}
+}
+
 func TestClientControlDial_SendsSubprotocol(t *testing.T) {
 	ms := newMockServer(true)
 	ts := newMockHTTPServer(ms)

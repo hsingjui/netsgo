@@ -86,7 +86,13 @@ type apiClient struct {
 }
 
 type apiKeyResponse struct {
+	Key    apiKey `json:"key"`
 	RawKey string `json:"raw_key"`
+}
+
+type apiKey struct {
+	ID       string `json:"id"`
+	UseCount int    `json:"use_count"`
 }
 
 type tunnelResponse struct {
@@ -433,6 +439,41 @@ func TestSystemCapabilityLossReconcileE2E(t *testing.T) {
 	h.expectServerListenerCount(t, "tcp", h.serverTCPPort, 0)
 }
 
+func TestSystemClientKeyRotationE2E(t *testing.T) {
+	h := newSystemHarness(t)
+	h.startInfrastructure(t)
+	h.adminToken = h.waitForAdminToken(t, 90*time.Second)
+
+	keyA := h.createAPIKeyWithID(t)
+	h.startTargetClient(t, keyA.RawKey)
+	originalClientID := h.waitForClientOnline(t, h.targetHostname, 90*time.Second)
+
+	keyB := h.createAPIKeyWithID(t)
+	env := append([]string{}, h.composeEnv...)
+	env = append(env, "NETSGO_CLIENT_KEY="+keyB.RawKey)
+	h.compose(t, env, "up", "-d", "--force-recreate", "--no-deps", "--no-build", "--remove-orphans", "target-client")
+	if clientID := h.waitForClientOnline(t, h.targetHostname, 90*time.Second); clientID != originalClientID {
+		t.Fatalf("client ID after key rotation = %q, want %q", clientID, originalClientID)
+	}
+	h.waitForAPIKeyUseCount(t, keyB.Key.ID, 1, 30*time.Second)
+
+	resp, err := h.apiRequest(http.MethodPut, "/api/admin/keys/"+keyB.Key.ID+"/disable", h.adminToken, nil)
+	if err != nil {
+		t.Fatalf("disable key B: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("disable key B: want 200, got %d body=%s", resp.StatusCode, body)
+	}
+
+	h.compose(t, env, "up", "-d", "--force-recreate", "--no-deps", "--no-build", "--remove-orphans", "target-client")
+	if clientID := h.waitForClientOnline(t, h.targetHostname, 90*time.Second); clientID != originalClientID {
+		t.Fatalf("client ID after unchanged disabled key restart = %q, want %q", clientID, originalClientID)
+	}
+	h.waitForAPIKeyUseCount(t, keyB.Key.ID, 1, 30*time.Second)
+}
+
 func newSystemHarness(t *testing.T) *systemHarness {
 	t.Helper()
 	filesRaw := getenvDefault("NETSGO_E2E_COMPOSE_FILES", "")
@@ -632,7 +673,7 @@ func (h *systemHarness) expectAdminAPIAuthorization(t *testing.T) {
 	}
 }
 
-func (h *systemHarness) createAPIKey(t *testing.T) string {
+func (h *systemHarness) createAPIKeyWithID(t *testing.T) apiKeyResponse {
 	t.Helper()
 	body := []byte(`{"name":"system-e2e","permissions":["connect"]}`)
 	resp, err := h.apiRequest(http.MethodPost, "/api/admin/keys", h.adminToken, body)
@@ -648,10 +689,14 @@ func (h *systemHarness) createAPIKey(t *testing.T) string {
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		t.Fatalf("decode API key response: %v", err)
 	}
-	if out.RawKey == "" {
-		t.Fatal("API key response missing raw_key")
+	if out.Key.ID == "" || out.RawKey == "" {
+		t.Fatalf("API key response missing key.id or raw_key: %+v", out)
 	}
-	return out.RawKey
+	return out
+}
+
+func (h *systemHarness) createAPIKey(t *testing.T) string {
+	return h.createAPIKeyWithID(t).RawKey
 }
 
 func (h *systemHarness) waitForClientPair(t *testing.T, timeout time.Duration) (targetID, ingressID string) {
@@ -710,6 +755,34 @@ func (h *systemHarness) waitForClientOnline(t *testing.T, hostname string, timeo
 		return false, fmt.Sprintf("client %q not online", hostname)
 	})
 	return clientID
+}
+
+func (h *systemHarness) waitForAPIKeyUseCount(t *testing.T, keyID string, want int, timeout time.Duration) {
+	t.Helper()
+	h.poll(t, timeout, func() (bool, string) {
+		resp, err := h.apiRequest(http.MethodGet, "/api/admin/keys", h.adminToken, nil)
+		if err != nil {
+			return false, err.Error()
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			return false, fmt.Sprintf("list API keys: status=%d body=%s", resp.StatusCode, body)
+		}
+		var keys []apiKey
+		if err := json.NewDecoder(resp.Body).Decode(&keys); err != nil {
+			return false, err.Error()
+		}
+		for _, key := range keys {
+			if key.ID == keyID {
+				if key.UseCount == want {
+					return true, ""
+				}
+				return false, fmt.Sprintf("key %q use_count=%d, want %d", keyID, key.UseCount, want)
+			}
+		}
+		return false, fmt.Sprintf("key %q not found", keyID)
+	})
 }
 
 func (h *systemHarness) listClients(t *testing.T) []apiClient {

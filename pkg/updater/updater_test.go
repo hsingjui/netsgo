@@ -3,11 +3,25 @@ package updater
 import (
 	"fmt"
 	"netsgo/internal/svcmgr"
+	"netsgo/pkg/flock"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 )
+
+func TestMain(m *testing.M) {
+	root, err := os.MkdirTemp("", "netsgo-updater-tests-")
+	if err != nil {
+		panic(err)
+	}
+	upgradeLockPathFor = func() string {
+		return filepath.Join(root, "upgrade.lock")
+	}
+	code := m.Run()
+	_ = os.RemoveAll(root)
+	os.Exit(code)
+}
 
 func TestReplaceBinary(t *testing.T) {
 	srcDir := t.TempDir()
@@ -46,9 +60,12 @@ func TestReplaceBinaryCleansTempFileOnRenameError(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected rename error")
 	}
-
-	if _, err := os.Stat(dstPath + ".tmp"); !os.IsNotExist(err) {
-		t.Fatalf("expected temp file to be cleaned up, stat err = %v", err)
+	matches, globErr := filepath.Glob(filepath.Join(dstDir, "."+filepath.Base(dstPath)+".tmp-*"))
+	if globErr != nil {
+		t.Fatal(globErr)
+	}
+	if len(matches) != 0 {
+		t.Fatalf("expected temp files to be cleaned up, got %v", matches)
 	}
 }
 
@@ -434,13 +451,20 @@ func TestUpgradeRestartsStoppedServicesWhenPanicOccurs(t *testing.T) {
 	origEnableAndStart := enableAndStartFunc
 	origDetectInstalledUnits := detectInstalledUnitsFunc
 	origReplaceBinary := replaceBinaryFunc
+	origBinaryPath := installedBinaryPath
 	t.Cleanup(func() {
 		disableAndStopFunc = origDisableAndStop
 		enableAndStartFunc = origEnableAndStart
 		detectInstalledUnitsFunc = origDetectInstalledUnits
 		replaceBinaryFunc = origReplaceBinary
+		installedBinaryPath = origBinaryPath
 	})
 
+	tmpDir := t.TempDir()
+	installedBinaryPath = filepath.Join(tmpDir, "installed-netsgo")
+	if err := os.WriteFile(installedBinaryPath, []byte("old binary"), 0o755); err != nil {
+		t.Fatal(err)
+	}
 	var restarted []string
 	detectInstalledUnitsFunc = func() []string { return []string{"netsgo-server.service", "netsgo-client.service"} }
 	disableAndStopFunc = func(unit string) error { return nil }
@@ -598,4 +622,37 @@ func TestUpgradeRestartsStoppedServicesWhenPanicOccursInProtectionGap(t *testing
 	}()
 
 	_, _ = Upgrade("/tmp/netsgo", "1.0.0", "1.1.0")
+}
+
+func TestUpgradeRejectsConcurrentRunBeforeStoppingServices(t *testing.T) {
+	origLockPathFor := upgradeLockPathFor
+	origDetectInstalledUnits := detectInstalledUnitsFunc
+	origDisableAndStop := disableAndStopFunc
+	t.Cleanup(func() {
+		upgradeLockPathFor = origLockPathFor
+		detectInstalledUnitsFunc = origDetectInstalledUnits
+		disableAndStopFunc = origDisableAndStop
+	})
+	lockPath := filepath.Join(t.TempDir(), "upgrade.lock")
+	upgradeLockPathFor = func() string { return lockPath }
+	unlock, err := flock.TryLock(lockPath)
+	if err != nil {
+		t.Fatalf("hold upgrade lock: %v", err)
+	}
+	defer unlock()
+
+	stopCalls := 0
+	detectInstalledUnitsFunc = func() []string { return []string{"netsgo-server.service"} }
+	disableAndStopFunc = func(unit string) error {
+		stopCalls++
+		return nil
+	}
+
+	_, err = Upgrade("/tmp/netsgo", "v1.0.0", "v1.1.0")
+	if err == nil || !strings.Contains(err.Error(), "another upgrade is already running") {
+		t.Fatalf("expected concurrent upgrade error, got %v", err)
+	}
+	if stopCalls != 0 {
+		t.Fatalf("concurrent upgrade must not stop services, got %d stop calls", stopCalls)
+	}
 }
