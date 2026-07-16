@@ -388,6 +388,11 @@ func TestClient_KeyAuthenticationSelection(t *testing.T) {
 				t.Fatalf("AuthRequest = %+v, want token=%q key=%q", authReq, tt.wantToken, tt.wantKey)
 			}
 
+			waitForClientCondition(t, 2*time.Second, func() bool {
+				c.dataMu.RLock()
+				defer c.dataMu.RUnlock()
+				return c.dataSession != nil
+			})
 			c.Shutdown()
 			select {
 			case err := <-errCh:
