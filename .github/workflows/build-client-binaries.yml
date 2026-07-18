@@ -90,23 +90,51 @@ jobs:
           ls -lh dist/client-binaries
           cat dist/client-binaries/checksums.txt
 
-      - name: Resolve artifact name
+      - name: Resolve artifact prefix
         id: artifact
         shell: bash
         run: |
           set -euo pipefail
           if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
-            name="netsgo-client-binaries-${GITHUB_REF_NAME}"
+            prefix="netsgo-${GITHUB_REF_NAME}"
           else
-            name="netsgo-client-binaries-${GITHUB_REF_NAME}-${GITHUB_SHA:0:7}"
+            prefix="netsgo-${GITHUB_REF_NAME}-${GITHUB_SHA:0:7}"
           fi
           # Artifact names may only contain alphanumeric, -, and _
-          name="${name//\//-}"
-          echo "name=${name}" >> "$GITHUB_OUTPUT"
+          prefix="${prefix//\//-}"
+          echo "prefix=${prefix}" >> "$GITHUB_OUTPUT"
 
       - uses: actions/upload-artifact@v7
         with:
-          name: ${{ steps.artifact.outputs.name }}
-          path: dist/client-binaries/*
+          name: ${{ steps.artifact.outputs.prefix }}-darwin-arm64
+          path: dist/client-binaries/netsgo_darwin_arm64
+          if-no-files-found: error
+          retention-days: 30
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.artifact.outputs.prefix }}-darwin-amd64
+          path: dist/client-binaries/netsgo_darwin_amd64
+          if-no-files-found: error
+          retention-days: 30
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.artifact.outputs.prefix }}-windows-amd64
+          path: dist/client-binaries/netsgo_windows_amd64.exe
+          if-no-files-found: error
+          retention-days: 30
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.artifact.outputs.prefix }}-windows-arm64
+          path: dist/client-binaries/netsgo_windows_arm64.exe
+          if-no-files-found: error
+          retention-days: 30
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.artifact.outputs.prefix }}-checksums
+          path: dist/client-binaries/checksums.txt
           if-no-files-found: error
           retention-days: 30
