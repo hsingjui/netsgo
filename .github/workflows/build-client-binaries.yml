@@ -1,0 +1,112 @@
+# Personal convenience workflow for local/fork use.
+# Builds macOS + Windows CLI binaries (same `netsgo` binary; run `netsgo client`).
+# Intentionally separate from release.yml / .goreleaser.yaml so upstream merges stay easy.
+#
+# Auto-triggers when:
+# - you merge/sync upstream into main/master and push
+# - a new version tag (v*) is pushed
+# Manual Run workflow is still available.
+name: Build Client Binaries
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-client-binaries-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - uses: oven-sh/setup-bun@v2
+
+      - uses: actions/cache@v5
+        with:
+          path: ~/.bun/install/cache
+          key: ${{ runner.os }}-bun-${{ hashFiles('web/bun.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-bun-
+
+      - name: Build web assets
+        working-directory: web
+        run: |
+          set -euo pipefail
+          bun install --frozen-lockfile
+          bun run build
+
+      - name: Cross-compile macOS / Windows CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="$(git describe --tags --always --dirty 2>/dev/null || echo dev)"
+          COMMIT="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+          DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          LDFLAGS="-s -w -X netsgo/pkg/version.Current=${VERSION} -X netsgo/pkg/version.Commit=${COMMIT} -X netsgo/pkg/version.Date=${DATE}"
+
+          mkdir -p dist/client-binaries
+          targets=(
+            "darwin amd64"
+            "darwin arm64"
+            "windows amd64"
+            "windows arm64"
+          )
+
+          for target in "${targets[@]}"; do
+            goos="${target%% *}"
+            goarch="${target##* }"
+            ext=""
+            if [ "$goos" = "windows" ]; then
+              ext=".exe"
+            fi
+            out="dist/client-binaries/netsgo_${goos}_${goarch}${ext}"
+            echo "Building ${out}"
+            CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" \
+              go build -trimpath -ldflags "$LDFLAGS" -o "$out" ./cmd/netsgo
+          done
+
+          (
+            cd dist/client-binaries
+            sha256sum netsgo_* > checksums.txt
+          )
+          ls -lh dist/client-binaries
+          cat dist/client-binaries/checksums.txt
+
+      - name: Resolve artifact name
+        id: artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            name="netsgo-client-binaries-${GITHUB_REF_NAME}"
+          else
+            name="netsgo-client-binaries-${GITHUB_REF_NAME}-${GITHUB_SHA:0:7}"
+          fi
+          # Artifact names may only contain alphanumeric, -, and _
+          name="${name//\//-}"
+          echo "name=${name}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.artifact.outputs.name }}
+          path: dist/client-binaries/*
+          if-no-files-found: error
+          retention-days: 30
