@@ -24,7 +24,7 @@ import (
 func newDispatchTestServer(t *testing.T, initialized bool, serverAddr string) (*Server, func()) {
 	t.Helper()
 
-	adminStore, err := NewAdminStore(filepath.Join(t.TempDir(), "admin.db"))
+	adminStore, err := NewAdminStore(filepath.Join(t.TempDir(), serverDBFileName))
 	if err != nil {
 		t.Fatalf("Failed to create AdminStore: %v", err)
 	}
@@ -41,9 +41,22 @@ func newDispatchTestServer(t *testing.T, initialized bool, serverAddr string) (*
 
 	s := New(0)
 	s.auth.adminStore = adminStore
-	s.store = newTestTunnelStore(t)
+	s.store, err = newTunnelStoreWithDB(adminStore.path, adminStore.db, false)
+	if err != nil {
+		t.Fatalf("create shared TunnelStore: %v", err)
+	}
 
 	return s, func() {}
+}
+
+func dispatchTestOwnerEpoch(t *testing.T, s *Server, ownerUserID string) uint64 {
+	t.Helper()
+	epoch, release, err := s.acquireUserLifecycleRead(ownerUserID, 0, true)
+	if err != nil {
+		t.Fatalf("resolve dispatch test owner %q: %v", ownerUserID, err)
+	}
+	release()
+	return epoch
 }
 
 func newManagementRequest(method, path, host string, body io.Reader) *http.Request {
@@ -66,12 +79,26 @@ func newAuthenticatedManagementRequest(t *testing.T, s *Server, method, path, ho
 func addLiveHTTPDispatchTunnel(t *testing.T, s *Server, clientID, tunnelName, domain string, backendAddr net.Addr) func() {
 	t.Helper()
 
+	seedStoredTunnel(t, s, clientID, protocol.ProxyNewRequest{
+		Name:      tunnelName,
+		Type:      protocol.ProxyTypeHTTP,
+		LocalIP:   "127.0.0.1",
+		LocalPort: 3000,
+		Domain:    domain,
+	}, protocol.ProxyStatusActive)
+	stored, err := s.store.GetTunnelE(clientID, tunnelName)
+	if err != nil {
+		t.Fatalf("load dispatch test tunnel: %v", err)
+	}
+
 	client := &ClientConn{
-		ID:         clientID,
-		Info:       protocol.ClientInfo{Hostname: clientID + ".local"},
-		proxies:    make(map[string]*ProxyTunnel),
-		generation: 1,
-		state:      clientStateLive,
+		ID:          clientID,
+		OwnerUserID: stored.OwnerUserID,
+		OwnerEpoch:  dispatchTestOwnerEpoch(t, s, stored.OwnerUserID),
+		Info:        protocol.ClientInfo{Hostname: clientID + ".local"},
+		proxies:     make(map[string]*ProxyTunnel),
+		generation:  1,
+		state:       clientStateLive,
 	}
 	s.clients.Store(clientID, client)
 
@@ -108,14 +135,6 @@ func addLiveHTTPDispatchTunnel(t *testing.T, s *Server, clientID, tunnelName, do
 		done: make(chan struct{}),
 	}
 	client.proxyMu.Unlock()
-
-	seedStoredTunnel(t, s, clientID, protocol.ProxyNewRequest{
-		Name:      tunnelName,
-		Type:      protocol.ProxyTypeHTTP,
-		LocalIP:   "127.0.0.1",
-		LocalPort: 3000,
-		Domain:    domain,
-	}, protocol.ProxyStatusActive)
 
 	stopRelay := make(chan struct{})
 	go func() {
@@ -323,6 +342,12 @@ func addUnifiedHTTPDispatchTunnelWithConflictingFlatDomain(t *testing.T, s *Serv
 		},
 	}
 	mustAddStableTunnel(t, s.store, stored)
+	persisted, err := s.store.GetTunnelByID(tunnelID)
+	if err != nil {
+		t.Fatalf("reload unified HTTP dispatch tunnel: %v", err)
+	}
+	client.OwnerUserID = persisted.OwnerUserID
+	client.OwnerEpoch = dispatchTestOwnerEpoch(t, s, persisted.OwnerUserID)
 
 	return func() {
 		_ = clientSession.Close()
@@ -653,7 +678,7 @@ func TestDispatch_HTTPTunnelHTTPBasicAuth(t *testing.T) {
 	}
 }
 
-func TestDispatch_HTTPTunnel_PersistedInactiveStatusesDoNotRegisterHost(t *testing.T) {
+func TestDispatch_HTTPTunnel_PersistedInactiveStatusesReserveHost(t *testing.T) {
 	testCases := []struct {
 		name   string
 		status string
@@ -680,8 +705,8 @@ func TestDispatch_HTTPTunnel_PersistedInactiveStatusesDoNotRegisterHost(t *testi
 
 			s.StartHTTPOnly().ServeHTTP(w, req)
 
-			if w.Code != http.StatusNotFound {
-				t.Fatalf("inactive HTTP tunnel should not register host: want 404, got %d", w.Code)
+			if w.Code != http.StatusServiceUnavailable {
+				t.Fatalf("inactive HTTP tunnel should reserve its host: want 503, got %d", w.Code)
 			}
 		})
 	}

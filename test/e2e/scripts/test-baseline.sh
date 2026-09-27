@@ -16,6 +16,7 @@ E2E_BASE_COMPOSE="${E2E_BASE_COMPOSE:?E2E_BASE_COMPOSE is required}"
 E2E_PROXY_COMPOSE="${E2E_PROXY_COMPOSE:?E2E_PROXY_COMPOSE is required}"
 PROXY_PORT="${PROXY_PORT:-19080}"
 UPSTREAM_PORT="${UPSTREAM_PORT:-19081}"
+E2E_PROBE_MODE="${E2E_PROBE_MODE:-internal}"
 COMPAT_BASELINE="${COMPAT_BASELINE:-v0.1.8}"
 E2E_STABLE_IMAGE="${E2E_STABLE_IMAGE:-netsgo-e2e:${COMPAT_BASELINE}}"
 NETSGO_E2E_DIR="${NETSGO_E2E_DIR:-.}"
@@ -97,6 +98,8 @@ log "ingress image: ${NETSGO_INGRESS_CLIENT_IMAGE}"
 log "tools image:   ${NETSGO_E2E_TOOLS_IMAGE}"
 log "proxy:         ${E2E_PROXY}"
 log "mode:          ${MODE}"
+log "probe mode:    ${E2E_PROBE_MODE} (host remains available via E2E_PROBE_MODE=host)"
+log "compat skips:   1 MiB raw upload and client key rotation (not in v0.1.8 contract)"
 log "rebuild image: ${REBUILD_IMAGE}"
 log "project:       ${project}"
 log "============================================="
@@ -106,6 +109,7 @@ if [ "${MODE}" = "smoke" ]; then
 	SMOKE_BASE_COMPOSE="${E2E_BASE_COMPOSE}" \
 	SMOKE_PROXY_COMPOSE="${E2E_PROXY_COMPOSE}" \
 	SMOKE_PROXY_PORT="${PROXY_PORT}" \
+	SMOKE_PROBE_MODE="${E2E_PROBE_MODE}" \
 	SMOKE_ADMIN_PASS="${admin_pass}" \
 	bash "${NETSGO_E2E_DIR}/test/e2e/scripts/smoke-system.sh"
 else
@@ -114,6 +118,9 @@ else
 	NETSGO_E2E_COMPOSE_FILES="${E2E_BASE_COMPOSE},${E2E_PROXY_COMPOSE}" \
 	NETSGO_ADMIN_PASS="${admin_pass}" \
 	NETSGO_E2E_COMPOSE_BUILD=0 \
+	E2E_PROBE_MODE="${E2E_PROBE_MODE}" \
+	NETSGO_E2E_SKIP_LARGE_UPLOAD=1 \
+	NETSGO_E2E_SKIP_KEY_ROTATION=1 \
 	PROXY_PORT="${PROXY_PORT}" \
 	UPSTREAM_PORT="${UPSTREAM_PORT}" \
 	SERVER_TCP_PORT="${SERVER_TCP_PORT}" \

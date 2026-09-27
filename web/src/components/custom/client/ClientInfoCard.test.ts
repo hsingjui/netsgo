@@ -1,9 +1,10 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { describe, expect, test } from 'bun:test';
+import { describe, expect, test } from 'vitest';
 import { createElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 
 import type { Client, SystemStats } from '@/types';
+import { SELF_RESOURCE_SCOPE } from '@/lib/resource-scope';
 
 import { ClientInfoCard } from './ClientInfoCard';
 
@@ -56,6 +57,7 @@ describe('ClientInfoCard', () => {
         QueryClientProvider,
         { client: queryClient },
         createElement(ClientInfoCard, {
+          scope: SELF_RESOURCE_SCOPE,
           client: createClient({ online: false }),
         }),
       ),
@@ -74,6 +76,7 @@ describe('ClientInfoCard', () => {
         QueryClientProvider,
         { client: offlineQueryClient },
         createElement(ClientInfoCard, {
+          scope: SELF_RESOURCE_SCOPE,
           client: createClient({ online: false }),
           onRequestDelete: () => {},
         }),
@@ -86,6 +89,7 @@ describe('ClientInfoCard', () => {
         QueryClientProvider,
         { client: onlineQueryClient },
         createElement(ClientInfoCard, {
+          scope: SELF_RESOURCE_SCOPE,
           client: createClient({ online: true }),
           onRequestDelete: () => {},
         }),

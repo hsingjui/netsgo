@@ -113,7 +113,7 @@ func (s *Server) socks5ProxyAcceptLoop(client *ClientConn, tunnel *ProxyTunnel, 
 				return
 			default:
 				log.Printf("⚠️ SOCKS5 proxy [%s] Accept failed: %v", activation.config.Name, err)
-				s.markTCPProxyRuntimeErrorIfCurrent(client, activation.config.Name, tunnel, listener, fmt.Sprintf("SOCKS5 proxy listener failed: %v", err))
+				s.markTCPProxyRuntimeErrorIfCurrent(client, activation.config.Name, tunnel, listener, activation.config, fmt.Sprintf("SOCKS5 proxy listener failed: %v", err))
 				return
 			}
 		}
@@ -138,7 +138,7 @@ func (s *Server) handleSOCKS5ProxyConn(client *ClientConn, tunnel *ProxyTunnel, 
 	if err != nil {
 		log.Printf("⚠️ SOCKS5 proxy [%s] open stream failed: %v", activation.config.Name, err)
 		_ = socks5wire.WriteReply(extConn, socks5wire.RepGeneralFailure, "", 0)
-		s.markTCPProxyRuntimeErrorIfCurrent(client, activation.config.Name, tunnel, listener, fmt.Sprintf("SOCKS5 proxy forwarding channel failed: %v", err))
+		s.markTCPProxyRuntimeErrorIfCurrent(client, activation.config.Name, tunnel, listener, activation.config, fmt.Sprintf("SOCKS5 proxy forwarding channel failed: %v", err))
 		return
 	}
 	defer func() { _ = stream.Close() }()

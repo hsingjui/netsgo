@@ -15,6 +15,7 @@ type trafficAccumulator struct {
 	shards                  [trafficAccumulatorShardCount]trafficAccumulatorShard
 	minimumRevisionMu       sync.RWMutex
 	minimumRevisionByTunnel map[string]int64
+	deletedOwnerUserIDs     map[string]struct{}
 }
 
 type trafficAccumulatorShard struct {
@@ -26,6 +27,7 @@ type trafficAccumulatorKey struct {
 	tunnelID    string
 	revision    int64
 	clientID    string
+	ownerUserID string
 	tunnelName  string
 	tunnelType  string
 	transport   string
@@ -34,7 +36,10 @@ type trafficAccumulatorKey struct {
 }
 
 func newTrafficAccumulator() *trafficAccumulator {
-	acc := &trafficAccumulator{minimumRevisionByTunnel: make(map[string]int64)}
+	acc := &trafficAccumulator{
+		minimumRevisionByTunnel: make(map[string]int64),
+		deletedOwnerUserIDs:     make(map[string]struct{}),
+	}
 	for i := range acc.shards {
 		acc.shards[i].pending = make(map[trafficAccumulatorKey]TrafficDelta)
 	}
@@ -61,6 +66,9 @@ func (a *trafficAccumulator) AddDelta(now time.Time, delta TrafficDelta) error {
 	}
 	a.minimumRevisionMu.RLock()
 	defer a.minimumRevisionMu.RUnlock()
+	if _, deleted := a.deletedOwnerUserIDs[delta.OwnerUserID]; deleted {
+		return nil
+	}
 	if delta.TunnelID != "" && delta.Revision < a.minimumRevisionByTunnel[delta.TunnelID] {
 		return nil
 	}
@@ -72,6 +80,7 @@ func (a *trafficAccumulator) AddDelta(now time.Time, delta TrafficDelta) error {
 		tunnelID:    delta.TunnelID,
 		revision:    delta.Revision,
 		clientID:    delta.ClientID,
+		ownerUserID: delta.OwnerUserID,
 		tunnelName:  delta.TunnelName,
 		tunnelType:  delta.TunnelType,
 		transport:   delta.Transport,
@@ -106,7 +115,38 @@ func (a *trafficAccumulator) AddDelta(now time.Time, delta TrafficDelta) error {
 	return nil
 }
 
+// evictDeletedOwner removes every queued observation for a hard-deleted user
+// and permanently rejects late observations carrying that immutable owner ID.
+// User IDs are never reused, so retaining this small tombstone prevents a
+// producer that drained before the deletion boundary from poisoning a later
+// traffic flush with a deleted owner foreign key.
+func (a *trafficAccumulator) evictDeletedOwner(ownerUserID string) {
+	if a == nil || ownerUserID == "" {
+		return
+	}
+
+	a.minimumRevisionMu.Lock()
+	defer a.minimumRevisionMu.Unlock()
+	if a.deletedOwnerUserIDs == nil {
+		a.deletedOwnerUserIDs = make(map[string]struct{})
+	}
+	a.deletedOwnerUserIDs[ownerUserID] = struct{}{}
+	for i := range a.shards {
+		shard := &a.shards[i]
+		shard.mu.Lock()
+		for key := range shard.pending {
+			if key.ownerUserID == ownerUserID {
+				delete(shard.pending, key)
+			}
+		}
+		shard.mu.Unlock()
+	}
+}
+
 func mergeTrafficDeltaMetadata(existing *TrafficDelta, delta TrafficDelta) {
+	if existing.OwnerUserID == "" {
+		existing.OwnerUserID = delta.OwnerUserID
+	}
 	if existing.OwnerClientID == "" {
 		existing.OwnerClientID = delta.OwnerClientID
 	}
@@ -180,6 +220,9 @@ func (a *trafficAccumulator) Drain() []TrafficDelta {
 		if deltas[i].ClientID != deltas[j].ClientID {
 			return deltas[i].ClientID < deltas[j].ClientID
 		}
+		if deltas[i].OwnerUserID != deltas[j].OwnerUserID {
+			return deltas[i].OwnerUserID < deltas[j].OwnerUserID
+		}
 		if deltas[i].TunnelName != deltas[j].TunnelName {
 			return deltas[i].TunnelName < deltas[j].TunnelName
 		}
@@ -212,6 +255,7 @@ func (a *trafficAccumulator) Len() int {
 func trafficAccumulatorShardIndex(key trafficAccumulatorKey) int {
 	hash := trafficAccumulatorHashString(2166136261, key.tunnelID)
 	hash = trafficAccumulatorHashString(hash, key.clientID)
+	hash = trafficAccumulatorHashString(hash, key.ownerUserID)
 	hash = trafficAccumulatorHashString(hash, key.tunnelName)
 	hash = trafficAccumulatorHashString(hash, key.tunnelType)
 	hash = trafficAccumulatorHashString(hash, key.transport)
@@ -231,11 +275,12 @@ func (s *Server) recordTunnelTraffic(clientID string, config protocol.ProxyConfi
 }
 
 func (s *Server) recordTunnelTrafficAt(now time.Time, clientID string, config protocol.ProxyConfig, ingressBytes, egressBytes uint64) {
-	s.recordTrafficDeltaAt(now, trafficDeltaFromProxyConfig(clientID, config, ingressBytes, egressBytes))
-}
-
-func (s *Server) recordTrafficAt(now time.Time, clientID, tunnelName, tunnelType string, ingressBytes, egressBytes uint64) {
-	s.recordTrafficObservationAt(now, "", clientID, tunnelName, tunnelType, ingressBytes, egressBytes)
+	delta := trafficDeltaFromProxyConfig(clientID, config, ingressBytes, egressBytes)
+	// This is the hot data path. OwnerUserID on a live ClientConn was resolved
+	// by control authentication, so preserve that server-side snapshot before
+	// falling back to storage in recordTrafficDeltaAt.
+	delta.OwnerUserID = s.liveTrafficOwnerUserID(delta.OwnerClientID, clientID)
+	s.recordTrafficDeltaAt(now, delta)
 }
 
 func (s *Server) recordTrafficObservationAt(now time.Time, tunnelID, clientID, tunnelName, tunnelType string, ingressBytes, egressBytes uint64) {
@@ -246,14 +291,16 @@ func (s *Server) recordTrafficObservationAt(now time.Time, tunnelID, clientID, t
 		return
 	}
 	s.trafficStore.attachAccumulator(s.trafficAccumulator)
-	s.recordTrafficDeltaAt(now, TrafficDelta{
+	delta := TrafficDelta{
 		TunnelID:     tunnelID,
 		ClientID:     clientID,
 		TunnelName:   tunnelName,
 		TunnelType:   tunnelType,
 		IngressBytes: ingressBytes,
 		EgressBytes:  egressBytes,
-	})
+	}
+	delta.OwnerUserID = s.liveTrafficOwnerUserID(clientID)
+	s.recordTrafficDeltaAt(now, delta)
 }
 
 func (s *Server) recordStoredTunnelTrafficAt(now time.Time, stored StoredTunnel, ingressBytes, egressBytes uint64) {
@@ -280,6 +327,15 @@ func (s *Server) recordTrafficDeltaAt(now time.Time, delta TrafficDelta) {
 		if delta.Revision <= 0 && tunnelID == delta.TunnelID {
 			delta.Revision = revision
 		}
+	}
+	if delta.OwnerUserID == "" {
+		delta.OwnerUserID = s.resolveTrafficOwnerUserID(delta)
+	}
+	if delta.OwnerUserID == "" {
+		// A traffic row without an owner would be impossible to serve through a
+		// user scope safely. Drop it instead of writing an unscoped bucket.
+		log.Printf("⚠️ Dropping traffic bytes without resolved owner: client=%s tunnel=%s", delta.ClientID, delta.TunnelName)
+		return
 	}
 	s.trafficStore.attachAccumulator(s.trafficAccumulator)
 
@@ -361,6 +417,7 @@ func trafficDeltaFromStoredTunnel(stored StoredTunnel, ingressBytes, egressBytes
 		TunnelID:        stored.ID,
 		Revision:        stored.Revision,
 		ClientID:        ownerClientID,
+		OwnerUserID:     stored.OwnerUserID,
 		OwnerClientID:   ownerClientID,
 		IngressClientID: stored.Ingress.ClientID,
 		TargetClientID:  targetClientID,
@@ -371,6 +428,77 @@ func trafficDeltaFromStoredTunnel(stored StoredTunnel, ingressBytes, egressBytes
 		IngressBytes:    ingressBytes,
 		EgressBytes:     egressBytes,
 	}
+}
+
+// resolveTrafficOwnerUserID obtains the immutable ownership snapshot from
+// persisted tunnel metadata first, then from the registered/live Client
+// identity. No client-supplied protocol field participates in this decision.
+func (s *Server) resolveTrafficOwnerUserID(delta TrafficDelta) string {
+	if s == nil {
+		return ""
+	}
+	if delta.OwnerUserID != "" {
+		return delta.OwnerUserID
+	}
+	if s.store != nil {
+		if delta.TunnelID != "" {
+			stored, err := s.store.GetTunnelByID(delta.TunnelID)
+			if err == nil && stored.OwnerUserID != "" {
+				return stored.OwnerUserID
+			}
+		}
+		if delta.ClientID != "" && delta.TunnelName != "" {
+			stored, err := s.store.GetTunnelE(delta.ClientID, delta.TunnelName)
+			if err == nil && stored.OwnerUserID != "" {
+				return stored.OwnerUserID
+			}
+		}
+	}
+
+	seen := make(map[string]struct{}, 4)
+	for _, clientID := range []string{delta.OwnerClientID, delta.ClientID, delta.TargetClientID, delta.IngressClientID} {
+		if clientID == "" {
+			continue
+		}
+		if _, ok := seen[clientID]; ok {
+			continue
+		}
+		seen[clientID] = struct{}{}
+		if s.auth != nil && s.auth.adminStore != nil {
+			registered, ok := s.auth.adminStore.GetRegisteredClient(clientID)
+			if ok && registered.OwnerUserID != "" {
+				return registered.OwnerUserID
+			}
+		}
+		if value, ok := s.clients.Load(clientID); ok {
+			if client, ok := value.(*ClientConn); ok && client.OwnerUserID != "" {
+				return client.OwnerUserID
+			}
+		}
+	}
+	return ""
+}
+
+func (s *Server) liveTrafficOwnerUserID(clientIDs ...string) string {
+	if s == nil {
+		return ""
+	}
+	seen := make(map[string]struct{}, len(clientIDs))
+	for _, clientID := range clientIDs {
+		if clientID == "" {
+			continue
+		}
+		if _, ok := seen[clientID]; ok {
+			continue
+		}
+		seen[clientID] = struct{}{}
+		if value, ok := s.clients.Load(clientID); ok {
+			if client, ok := value.(*ClientConn); ok && client.OwnerUserID != "" {
+				return client.OwnerUserID
+			}
+		}
+	}
+	return ""
 }
 
 func relayTrafficTransport(actual string) string {

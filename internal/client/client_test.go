@@ -284,6 +284,17 @@ func newIsolatedTestClient(t *testing.T, serverAddr, key string) *Client {
 	return c
 }
 
+// waitForAuthenticatedTestClient ensures the client has consumed auth_resp
+// before a test injects another server control message. A WebSocket connection
+// alone is not sufficient: the next message could otherwise be consumed as the
+// authentication response.
+func waitForAuthenticatedTestClient(t *testing.T, c *Client, timeout time.Duration) {
+	t.Helper()
+	waitForClientCondition(t, timeout, func() bool {
+		return c.CurrentClientID() != ""
+	})
+}
+
 // ============================================================
 // Client integration tests
 // ============================================================
@@ -889,6 +900,7 @@ func TestClient_RequestProxy(t *testing.T) {
 	go func() { _ = c.Start() }()
 	// Wait for authentication and the data channel attempt to complete
 	_ = ms.waitForConn(t, 2*time.Second)
+	waitForAuthenticatedTestClient(t, c, 2*time.Second)
 
 	// Call requestProxy manually
 	cfg := protocol.ProxyNewRequest{
@@ -943,6 +955,7 @@ func TestClient_ControlLoop_ProxyCreateResp_Success(t *testing.T) {
 
 	go func() { _ = c.Start() }()
 	conn := ms.waitForConn(t, 2*time.Second)
+	waitForAuthenticatedTestClient(t, c, 2*time.Second)
 
 	// The server proactively sends proxy_create_resp (success)
 	resp, _ := protocol.NewMessage(protocol.MsgTypeProxyCreateResp, protocol.ProxyCreateResponse{
@@ -958,8 +971,14 @@ func TestClient_ControlLoop_ProxyCreateResp_Success(t *testing.T) {
 		t.Fatalf("server failed to send proxy_create_resp: %v", err)
 	}
 
-	// Wait for the client to handle it.
-	time.Sleep(200 * time.Millisecond)
+	// Wait for the control loop to apply the server response. The race detector can
+	// legitimately delay this beyond a fixed sleep.
+	waitForClientCondition(t, 2*time.Second, func() bool {
+		_, cfg, ok := c.proxyForDataStreamHeader(protocol.DataStreamHeader{
+			TunnelID: "stable-client-created",
+		})
+		return ok && cfg.ID == "stable-client-created"
+	})
 
 	name, cfg, ok := c.proxyForDataStreamHeader(protocol.DataStreamHeader{
 		TunnelID: "stable-client-created",
@@ -986,6 +1005,7 @@ func TestClient_ControlLoop_ProxyCreateResp_Failure(t *testing.T) {
 
 	go func() { _ = c.Start() }()
 	conn := ms.waitForConn(t, 2*time.Second)
+	waitForAuthenticatedTestClient(t, c, 2*time.Second)
 
 	// The server proactively sends proxy_create_resp (failure)
 	{
@@ -1026,6 +1046,7 @@ func TestClient_ControlLoop_ServerProvisionSendsProvisionAck(t *testing.T) {
 
 	go func() { _ = c.Start() }()
 	conn := ms.waitForConn(t, 2*time.Second)
+	waitForAuthenticatedTestClient(t, c, 2*time.Second)
 
 	msg, _ := protocol.NewMessage(protocol.MsgTypeProxyProvision, protocol.ProxyProvisionRequest{
 		Name:       "server-pushed-proxy",
@@ -1077,6 +1098,7 @@ func TestClient_ControlLoop_ServerProvisionDoesNotGateOnBackendHealth(t *testing
 
 	go func() { _ = c.Start() }()
 	conn := ms.waitForConn(t, 2*time.Second)
+	waitForAuthenticatedTestClient(t, c, 2*time.Second)
 
 	msg, _ := protocol.NewMessage(protocol.MsgTypeProxyProvision, protocol.ProxyProvisionRequest{
 		Name:       "unreachable-backend",

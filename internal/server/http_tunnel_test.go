@@ -506,6 +506,12 @@ func seedStoredTunnelWithoutResourceLock(t *testing.T, s *Server, clientID strin
 		Hostname:        clientID + ".local",
 		Binding:         TunnelBindingClientID,
 	}
+	mustPrepareTestTunnelOwnership(t, s.store, tunnel)
+	registered, ok := s.auth.adminStore.GetRegisteredClient(clientID)
+	if !ok || registered.OwnerUserID == "" {
+		t.Fatalf("load owner for test client %q", clientID)
+	}
+	tunnel.OwnerUserID = registered.OwnerUserID
 	if tunnel.ID == "" {
 		tunnel.ID = generateUUID()
 	}
@@ -650,7 +656,7 @@ func TestTrustedProxyHeaders(t *testing.T) {
 			req.TLS = tc.requestTLS
 			req.Header = tc.forwarded.Clone()
 
-			gotHost, gotHeaders := computeForwardedHeaders(s, req, tc.domain)
+			gotHost, gotHeaders := computeForwardedHeaders(s, req)
 			if gotHost != tc.wantHost {
 				t.Fatalf("Host = %q, want %q", gotHost, tc.wantHost)
 			}

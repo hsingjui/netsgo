@@ -24,6 +24,8 @@ services:
       - ${NETSGO_SERVER_ADDR:-http://panel.playwright.local}
       - --tls-mode
       - off
+    environment:
+      NETSGO_LOGIN_RATE_LIMIT_MAX: ${NETSGO_LOGIN_RATE_LIMIT_MAX:-1000}
     ports:
       - "${PLAYWRIGHT_SERVER_PORT:-19180}:8080"
     volumes:
@@ -49,6 +51,26 @@ services:
     depends_on:
       - server
 
+  multi-user-fixture:
+    <<: *netsgo-image
+    hostname: playwright-multi-user-fixture
+    entrypoint:
+      - /bin/sh
+      - /opt/netsgo-e2e/create-multi-user-fixture.sh
+    environment:
+      NETSGO_BOOTSTRAP_BASE_URL: http://server:8080
+      NETSGO_ADMIN_USER: ${NETSGO_ADMIN_USER:-admin}
+      NETSGO_ADMIN_PASS: ${NETSGO_ADMIN_PASS:?NETSGO_ADMIN_PASS is required}
+      NETSGO_MANAGEMENT_HOST: ${NETSGO_MANAGEMENT_HOST:-panel.playwright.local}
+      NETSGO_BOOTSTRAP_READY_FILE: /bootstrap/client-key.ready
+      NETSGO_MULTI_USER_SHARED_DIR: /shared
+      NETSGO_MULTI_USER_PASSWORD: ${NETSGO_MULTI_USER_PASSWORD:-PlaywrightUser123!}
+    volumes:
+      - netsgo-playwright-multi-user-shared:/shared
+      - netsgo-playwright-shared:/bootstrap:ro
+    depends_on:
+      - server
+
   tcp-backend:
     image: hashicorp/http-echo:1.0.0
     hostname: playwright-tcp-backend
@@ -63,6 +85,13 @@ services:
       - /bin/sh
       - -c
       - while true; do socat -T30 UDP4-RECVFROM:18084,fork,reuseaddr SYSTEM:'printf playwright-udp-c2c-response'; done
+
+  webhook-receiver:
+    image: hashicorp/http-echo:1.0.0
+    hostname: playwright-webhook-receiver
+    command:
+      - -listen=:18085
+      - -text=playwright webhook response
 
   source-client:
     <<: *netsgo-image
@@ -105,8 +134,77 @@ services:
     depends_on:
       - client-key
 
+  user-a-source:
+    <<: *netsgo-image
+    hostname: playwright-user-a-source
+    restart: unless-stopped
+    entrypoint: [/bin/sh, /opt/netsgo-e2e/run-client.sh]
+    environment:
+      NETSGO_SERVER: http://server:8080
+      NETSGO_CLIENT_KEY_FILE: /shared/user-a.key
+      NETSGO_CLIENT_KEY_WAIT_TIMEOUT: ${NETSGO_CLIENT_KEY_WAIT_TIMEOUT:-180}
+    volumes:
+      - netsgo-playwright-user-a-source-data:/var/lib/netsgo
+      - netsgo-playwright-multi-user-shared:/shared
+    depends_on:
+      - multi-user-fixture
+
+  user-a-ingress:
+    <<: *netsgo-image
+    hostname: playwright-user-a-ingress
+    restart: unless-stopped
+    entrypoint: [/bin/sh, /opt/netsgo-e2e/run-client.sh]
+    environment:
+      NETSGO_SERVER: http://server:8080
+      NETSGO_CLIENT_KEY_FILE: /shared/user-a.key
+      NETSGO_CLIENT_KEY_WAIT_TIMEOUT: ${NETSGO_CLIENT_KEY_WAIT_TIMEOUT:-180}
+    ports:
+      - "${PLAYWRIGHT_USER_A_TCP_INGRESS_PORT:-19194}:18094"
+    volumes:
+      - netsgo-playwright-user-a-ingress-data:/var/lib/netsgo
+      - netsgo-playwright-multi-user-shared:/shared
+    depends_on:
+      - multi-user-fixture
+
+  user-b-source:
+    <<: *netsgo-image
+    hostname: playwright-user-b-source
+    restart: unless-stopped
+    entrypoint: [/bin/sh, /opt/netsgo-e2e/run-client.sh]
+    environment:
+      NETSGO_SERVER: http://server:8080
+      NETSGO_CLIENT_KEY_FILE: /shared/user-b.key
+      NETSGO_CLIENT_KEY_WAIT_TIMEOUT: ${NETSGO_CLIENT_KEY_WAIT_TIMEOUT:-180}
+    volumes:
+      - netsgo-playwright-user-b-source-data:/var/lib/netsgo
+      - netsgo-playwright-multi-user-shared:/shared
+    depends_on:
+      - multi-user-fixture
+
+  user-b-ingress:
+    <<: *netsgo-image
+    hostname: playwright-user-b-ingress
+    restart: unless-stopped
+    entrypoint: [/bin/sh, /opt/netsgo-e2e/run-client.sh]
+    environment:
+      NETSGO_SERVER: http://server:8080
+      NETSGO_CLIENT_KEY_FILE: /shared/user-b.key
+      NETSGO_CLIENT_KEY_WAIT_TIMEOUT: ${NETSGO_CLIENT_KEY_WAIT_TIMEOUT:-180}
+    ports:
+      - "${PLAYWRIGHT_USER_B_TCP_INGRESS_PORT:-19195}:18095"
+    volumes:
+      - netsgo-playwright-user-b-ingress-data:/var/lib/netsgo
+      - netsgo-playwright-multi-user-shared:/shared
+    depends_on:
+      - multi-user-fixture
+
 volumes:
   netsgo-playwright-ingress-data:
   netsgo-playwright-server-data:
   netsgo-playwright-shared:
   netsgo-playwright-source-data:
+  netsgo-playwright-multi-user-shared:
+  netsgo-playwright-user-a-source-data:
+  netsgo-playwright-user-a-ingress-data:
+  netsgo-playwright-user-b-source-data:
+  netsgo-playwright-user-b-ingress-data:

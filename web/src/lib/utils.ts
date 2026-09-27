@@ -14,3 +14,23 @@ export function createLocalId(prefix = "id") {
   }
   return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
 }
+
+export async function copyText(value: string) {
+  if (navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(value)
+      return
+    } catch {
+      // Permission denied (e.g. unfocused document); fall through to execCommand.
+    }
+  }
+
+  const textarea = document.createElement("textarea")
+  textarea.value = value
+  textarea.style.position = "fixed"
+  textarea.style.opacity = "0"
+  document.body.appendChild(textarea)
+  textarea.select()
+  document.execCommand("copy")
+  document.body.removeChild(textarea)
+}

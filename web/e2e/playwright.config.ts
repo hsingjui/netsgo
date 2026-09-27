@@ -13,7 +13,9 @@ export default defineConfig({
   outputDir: '../../test-results/playwright',
   use: {
     baseURL: process.env.NETSGO_E2E_BASE_URL ?? 'http://127.0.0.1:19180',
-    headless: false,
+    // Browser tests run headless by default; set PLAYWRIGHT_HEADLESS=0 to
+    // watch them locally.
+    headless: process.env.PLAYWRIGHT_HEADLESS !== '0',
     locale: 'en-US',
     trace: 'retain-on-failure',
   },

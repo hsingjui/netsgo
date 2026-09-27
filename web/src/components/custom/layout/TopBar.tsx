@@ -12,6 +12,7 @@ import { useConsoleSummary } from '@/hooks/use-console-summary';
 
 import { SidebarTrigger, useSidebar } from '@/components/ui/sidebar';
 import { Separator } from '@/components/ui/separator';
+import type { ResourceScope } from '@/lib/resource-scope';
 
 export function DualTriggerCard({ triggers, children }: { triggers: React.ReactNode, children: React.ReactNode }) {
   const [isOpen, setIsOpen] = useState(false);
@@ -89,10 +90,10 @@ function GitHubStarLink() {
   );
 }
 
-function TopBarInner() {
+function TopBarInner({ scope }: { scope: ResourceScope | null }) {
   const { t } = useTranslation();
   const navigate = useNavigate();
-  const { data: summary = EMPTY_CONSOLE_SUMMARY } = useConsoleSummary();
+  const { data: summary = EMPTY_CONSOLE_SUMMARY } = useConsoleSummary(scope);
 
   const totalClients = summary.total_clients;
   const onlineClientCount = summary.online_clients;
@@ -147,7 +148,7 @@ function TopBarInner() {
 
           {/* Status Group */}
         <AnimatePresence>
-          <motion.div
+          {scope ? <motion.div
             key="header-status"
             className="hidden sm:flex items-center gap-2"
             initial={{ opacity: 0 }}
@@ -206,7 +207,7 @@ function TopBarInner() {
                   </div>
                 </div>
               </DualTriggerCard>
-          </motion.div>
+          </motion.div> : null}
         </AnimatePresence>
         </div>
 
@@ -232,6 +233,6 @@ function TopBarInner() {
   );
 }
 
-export function TopBar() {
-  return <TopBarInner />;
+export function TopBar({ scope }: { scope: ResourceScope | null }) {
+  return <TopBarInner scope={scope} />;
 }

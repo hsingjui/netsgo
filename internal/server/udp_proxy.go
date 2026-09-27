@@ -24,6 +24,25 @@ type UDPProxyState struct {
 	closeOnce    sync.Once
 }
 
+func (s *Server) closeUDPProxyRuntimeStateIfDetached(client *ClientConn, proxyName string, state *UDPProxyState) {
+	if state == nil {
+		return
+	}
+	if client != nil {
+		currentClient, ok := s.clients.Load(client.ID)
+		if ok && currentClient == client {
+			client.proxyMu.RLock()
+			current := client.proxies[proxyName]
+			stillPublished := current != nil && current.UDPState == state
+			client.proxyMu.RUnlock()
+			if stillPublished {
+				return
+			}
+		}
+	}
+	state.Close()
+}
+
 // Close shuts down the UDP proxy state and releases all resources.
 func (s *UDPProxyState) Close() {
 	s.closeOnce.Do(func() {
@@ -257,59 +276,70 @@ func (s *Server) markUDPProxyRuntimeErrorIfCurrent(
 	proxyName string,
 	tunnel *ProxyTunnel,
 	state *UDPProxyState,
+	expectedConfig protocol.ProxyConfig,
 	message string,
 ) {
+	if client == nil || tunnel == nil {
+		if state != nil {
+			state.Close()
+		}
+		return
+	}
 	client.proxyMu.RLock()
 	current, exists := client.proxies[proxyName]
 	if !exists ||
 		current != tunnel ||
 		current.UDPState != state ||
+		!proxyRuntimeErrorIdentityMatches(current.Config, expectedConfig) ||
 		!isTunnelExposed(current.Config) {
 		client.proxyMu.RUnlock()
-		if state != nil {
-			state.Close()
-		}
+		s.closeUDPProxyRuntimeStateIfDetached(client, proxyName, state)
 		return
 	}
-	operationConfig := current.Config
+	operationConfig := expectedConfig
 	client.proxyMu.RUnlock()
 
-	releaseRuntimeOperation := s.tunnelRuntimeOps.lock(tunnelRuntimeOperationKey(operationConfig.ID, client.ID, proxyName))
-	defer releaseRuntimeOperation()
-
-	client.proxyMu.Lock()
-	current, exists = client.proxies[proxyName]
-	if !exists ||
-		current != tunnel ||
-		current.UDPState != state ||
-		!isTunnelExposed(current.Config) {
-		client.proxyMu.Unlock()
-		if state != nil {
-			state.Close()
+	handled := s.withProxyRuntimeErrorPublication(client, operationConfig, func() bool {
+		client.proxyMu.Lock()
+		current, exists = client.proxies[proxyName]
+		if !exists ||
+			current != tunnel ||
+			current.UDPState != state ||
+			!proxyRuntimeErrorIdentityMatches(current.Config, operationConfig) ||
+			!isTunnelExposed(current.Config) {
+			client.proxyMu.Unlock()
+			return false
 		}
-		return
-	}
-	closeTunnelRuntimeResources(current)
-	setProxyConfigStates(&current.Config, protocol.ProxyDesiredStateRunning, protocol.ProxyRuntimeStateError, message)
-	markTunnelRuntimeError(current, client.ID, message, time.Now())
-	config := current.Config
-	client.proxyMu.Unlock()
+		closeTunnelRuntimeResources(current)
+		setProxyConfigStates(&current.Config, protocol.ProxyDesiredStateRunning, protocol.ProxyRuntimeStateError, message)
+		markTunnelRuntimeError(current, client.ID, message, time.Now())
+		config := current.Config
+		client.proxyMu.Unlock()
 
-	updated, err := s.updateProxyConfigRuntimeIfCurrent(client.ID, config, protocol.ProxyRuntimeStateError, message)
-	if err != nil {
-		log.Printf("⚠️ UDP proxy [%s] failed to persist error state: %v", proxyName, err)
+		updated, err := s.updateProxyConfigRuntimeIfCurrent(client.ID, config, protocol.ProxyRuntimeStateError, message)
+		if err != nil {
+			log.Printf("⚠️ UDP proxy [%s] failed to persist error state: %v", proxyName, err)
+		}
+		if err == nil && !updated && config.Topology == protocol.TunnelTopologyServerExpose {
+			s.discardTunnelRuntimeIfCurrent(client, proxyName, tunnel, config.ID, config.Revision)
+			return true
+		}
+		if s.runtimeErrorCleanupHook != nil {
+			s.runtimeErrorCleanupHook(config)
+		}
+		if notifyErr := s.notifyRuntimeErrorUnprovision(client, tunnel, config); notifyErr != nil {
+			log.Printf("⚠️ UDP proxy [%s] failed to notify client of close: %v", proxyName, notifyErr)
+		}
+		if err != nil || !updated {
+			return true
+		}
+		s.recordServerExposeIngressIssue(config.ID, config.Revision, config.Type, message)
+		s.emitTunnelChangedIfStored(client.ID, config, "error")
+		return true
+	})
+	if !handled {
+		s.closeUDPProxyRuntimeStateIfDetached(client, proxyName, state)
 	}
-	if s.runtimeErrorCleanupHook != nil {
-		s.runtimeErrorCleanupHook(config)
-	}
-	if notifyErr := s.notifyRuntimeErrorUnprovision(client, tunnel, config); notifyErr != nil {
-		log.Printf("⚠️ UDP proxy [%s] failed to notify client of close: %v", proxyName, notifyErr)
-	}
-	if err != nil || !updated {
-		return
-	}
-	s.recordServerExposeIngressIssue(config.ID, config.Revision, config.Type, message)
-	s.emitTunnelChangedIfStored(client.ID, config, "error")
 }
 
 // udpReadLoop reads incoming UDP packets from packetConn and dispatches them
@@ -336,6 +366,7 @@ func (s *Server) udpReadLoop(client *ClientConn, tunnel *ProxyTunnel, state *UDP
 					activation.config.Name,
 					tunnel,
 					state,
+					activation.config,
 					fmt.Sprintf("UDP proxy read failed: %v", err),
 				)
 				return
@@ -377,6 +408,7 @@ func (s *Server) udpReadLoop(client *ClientConn, tunnel *ProxyTunnel, state *UDP
 					activation.config.Name,
 					tunnel,
 					state,
+					activation.config,
 					fmt.Sprintf("UDP proxy forwarding channel failed: %v", err),
 				)
 				return

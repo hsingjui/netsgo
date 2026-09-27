@@ -5,10 +5,11 @@ import { ArrowRightLeft } from 'lucide-react';
 import { TunnelListTable, type TunnelEntry } from '@/components/custom/tunnel/TunnelListTable';
 import { getClientDisplayName } from '@/lib/client-utils';
 import { useTranslation } from 'react-i18next';
+import type { ResourceScope } from '@/lib/resource-scope';
 
-export function DashboardTunnelTable() {
+export function DashboardTunnelTable({ scope }: { scope: ResourceScope }) {
   const { t } = useTranslation();
-  const { data: clients, isLoading } = useClients();
+  const { data: clients, isLoading } = useClients(scope);
   const navigate = useNavigate();
 
   if (isLoading) {
@@ -32,6 +33,7 @@ export function DashboardTunnelTable() {
 
   return (
     <TunnelListTable
+      scope={scope}
       tunnels={allTunnels}
       title={t('dashboard.allTunnels')}
       icon={<ArrowRightLeft className="h-5 w-5 text-primary" />}
@@ -39,10 +41,19 @@ export function DashboardTunnelTable() {
       showClient
       showActions={false}
       showSearch
-      onClientClick={(tunnel) => navigate({
-        to: '/dashboard/clients/$clientId',
-        params: { clientId: tunnel.clientId },
-      })}
+      onClientClick={(tunnel) => {
+        if (scope.kind === 'admin-user') {
+          navigate({
+            to: '/dashboard/users/$userId/clients/$clientId',
+            params: { userId: scope.userId, clientId: tunnel.clientId },
+          });
+          return;
+        }
+        navigate({
+          to: '/dashboard/clients/$clientId',
+          params: { clientId: tunnel.clientId },
+        });
+      }}
     />
   );
 }

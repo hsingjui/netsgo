@@ -1,9 +1,10 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"fmt"
-	"log"
+	"io"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -37,13 +38,19 @@ type AdminClaims struct {
 	jwt.RegisteredClaims
 }
 
-// SessionInfo 从 Context 中提取的 session 信息（替代旧的 AdminClaims）
-type SessionInfo struct {
+// RequestPrincipal is reconstructed from user_sessions JOIN users for every
+// request.  Role is a presentation compatibility field; IsAdmin is the only
+// authorization flag and never comes from a JWT claim.
+type RequestPrincipal struct {
 	SessionID string
 	UserID    string
 	Username  string
+	IsAdmin   bool
 	Role      string
 }
+
+// SessionInfo is retained as a source-compatible alias for existing handlers.
+type SessionInfo = RequestPrincipal
 
 // GenerateAdminToken 生成一个新的 JWT Token（绑定 session）
 func (s *Server) GenerateAdminToken(session *AdminSession) (string, error) {
@@ -70,7 +77,7 @@ func (s *Server) GenerateAdminToken(session *AdminSession) (string, error) {
 //  2. Cookie netsgo_session — 浏览器 Web 面板
 //
 // JWT 只作为 session 载体，真正的权限判定来自 session 状态
-func (s *Server) RequireAuth(next http.HandlerFunc) http.HandlerFunc {
+func (s *Server) RequirePrincipal(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 
@@ -81,7 +88,7 @@ func (s *Server) RequireAuth(next http.HandlerFunc) http.HandlerFunc {
 		}
 
 		// 🔑 核心：检查 adminStore 是否已初始化
-		if s.auth.adminStore == nil {
+		if s.auth == nil || s.auth.adminStore == nil {
 			writeAPIError(w, http.StatusInternalServerError, "admin_store_unavailable", "admin store not initialized")
 			return
 		}
@@ -115,19 +122,117 @@ func (s *Server) RequireAuth(next http.HandlerFunc) http.HandlerFunc {
 		if r.UserAgent() != session.UserAgent {
 			slog.Warn("session UA mismatch, possible token theft",
 				"session_id", session.ID, "user", session.Username, "module", "security")
+			s.recordSessionEnvironmentMismatch(r, session)
 			writeAPIError(w, http.StatusUnauthorized, "session_environment_mismatch", "session environment mismatch")
 			return
 		}
 
 		// session 有效 → 注入用户信息到 Context
-		info := &SessionInfo{
+		info := &RequestPrincipal{
 			SessionID: session.ID,
 			UserID:    session.UserID,
 			Username:  session.Username,
+			IsAdmin:   session.Role == "admin",
 			Role:      session.Role,
 		}
 		ctx := context.WithValue(r.Context(), sessionContextKey, info)
 		next.ServeHTTP(w, r.WithContext(ctx))
+	}
+}
+
+// RequireAuth remains the compatibility name for handlers that allow any
+// authenticated operational user.  New code should use RequirePrincipal.
+func (s *Server) RequireAuth(next http.HandlerFunc) http.HandlerFunc {
+	return s.RequirePrincipal(next)
+}
+
+func (s *Server) RequireAdmin(next http.HandlerFunc) http.HandlerFunc {
+	return s.RequirePrincipal(func(w http.ResponseWriter, r *http.Request) {
+		principal := GetPrincipalFromContext(r.Context())
+		if principal == nil || !principal.IsAdmin {
+			writeAPIError(w, http.StatusForbidden, "administrator_access_required", "administrator access required")
+			return
+		}
+
+		if isAdminMutationRequest(r) {
+			if !bufferAdminMutationBody(w, r) {
+				return
+			}
+			s.runAdminAuthorizationHook("before_mutation_boundary", principal)
+			s.adminAuthorizationMu.Lock()
+			defer s.adminAuthorizationMu.Unlock()
+			s.runAdminAuthorizationHook("after_mutation_boundary", principal)
+			if !s.revalidateAdminPrincipal(w, principal) {
+				return
+			}
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		// Read-only and streaming handlers only need a current decision at their
+		// boundary. Holding the read lock for an SSE lifetime would prevent the
+		// revocation path that is responsible for closing that stream.
+		s.adminAuthorizationMu.RLock()
+		valid := s.revalidateAdminPrincipal(w, principal)
+		s.adminAuthorizationMu.RUnlock()
+		if !valid {
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func bufferAdminMutationBody(w http.ResponseWriter, r *http.Request) bool {
+	if r.Body == nil || r.Body == http.NoBody {
+		return true
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, passkeyJSONRequestBodyLimitBytes+1))
+	_ = r.Body.Close()
+	if err != nil {
+		writeJSONRequestDecodeError(w, err)
+		return false
+	}
+	if int64(len(body)) > passkeyJSONRequestBodyLimitBytes {
+		writeJSONRequestDecodeError(w, errJSONRequestBodyTooLarge)
+		return false
+	}
+	r.Body = io.NopCloser(bytes.NewReader(body))
+	r.ContentLength = int64(len(body))
+	return true
+}
+
+func isAdminMutationRequest(r *http.Request) bool {
+	switch r.Method {
+	case http.MethodGet, http.MethodHead, http.MethodOptions:
+		return false
+	default:
+		return true
+	}
+}
+
+func (s *Server) revalidateAdminPrincipal(w http.ResponseWriter, principal *RequestPrincipal) bool {
+	if principal == nil || s.auth == nil || s.auth.adminStore == nil {
+		writeAPIError(w, http.StatusUnauthorized, "session_expired_or_revoked", "session expired or revoked")
+		return false
+	}
+	session := s.auth.adminStore.GetSession(principal.SessionID)
+	if session == nil || session.UserID != principal.UserID {
+		writeAPIError(w, http.StatusUnauthorized, "session_expired_or_revoked", "session expired or revoked")
+		return false
+	}
+	if session.Role != "admin" {
+		writeAPIError(w, http.StatusForbidden, "administrator_access_required", "administrator access required")
+		return false
+	}
+	principal.Username = session.Username
+	principal.Role = session.Role
+	principal.IsAdmin = true
+	return true
+}
+
+func (s *Server) runAdminAuthorizationHook(stage string, principal *RequestPrincipal) {
+	if s != nil && s.adminAuthorizationHook != nil {
+		s.adminAuthorizationHook(stage, principal)
 	}
 }
 
@@ -145,29 +250,12 @@ func GetSessionFromContext(ctx context.Context) *SessionInfo {
 	return info
 }
 
-// GetAdminFromContext 向后兼容的别名
-func GetAdminFromContext(ctx context.Context) *SessionInfo {
-	return GetSessionFromContext(ctx)
-}
-
-func (s *Server) RequireAuthIfInitialized(next http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if s.auth.adminStore == nil {
-			next.ServeHTTP(w, r)
-			return
-		}
-		initialized, err := s.auth.adminStore.IsInitializedE()
-		if err != nil {
-			log.Printf("⚠️ failed to read initialization state for auth middleware: %v", err)
-			writeAPIError(w, http.StatusServiceUnavailable, "temporary_storage_failure", "temporary storage failure")
-			return
-		}
-		if !initialized {
-			next.ServeHTTP(w, r)
-			return
-		}
-		s.RequireAuth(next).ServeHTTP(w, r)
+func GetPrincipalFromContext(ctx context.Context) *RequestPrincipal {
+	info, ok := ctx.Value(sessionContextKey).(*RequestPrincipal)
+	if !ok {
+		return nil
 	}
+	return info
 }
 
 // setSessionCookie 设置 httpOnly session cookie

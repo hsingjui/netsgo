@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/hex"
+	"errors"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -20,8 +21,10 @@ type apiKeyResponse struct {
 }
 
 type clientAuthRateLimitResponse struct {
-	Entries     []RateLimitSnapshot `json:"entries"`
-	GeneratedAt time.Time           `json:"generated_at"`
+	Enabled           bool                `json:"enabled"`
+	RequestsPerMinute int                 `json:"requests_per_minute"`
+	Entries           []RateLimitSnapshot `json:"entries"`
+	GeneratedAt       time.Time           `json:"generated_at"`
 }
 
 func sanitizeAPIKey(key APIKey) apiKeyResponse {
@@ -64,6 +67,7 @@ func (s *Server) handleAPILogin(w http.ResponseWriter, r *http.Request) {
 			if s.auth.adminStore != nil {
 				slog.Warn("Login endpoint rate limited", "ip", ip, "module", "security")
 			}
+			s.recordAuthFailure(r, "admin_login_rate_limited", "rate_limited")
 			writeRateLimitResponse(w, retryAfter)
 			return
 		}
@@ -78,30 +82,46 @@ func (s *Server) handleAPILogin(w http.ResponseWriter, r *http.Request) {
 		writeJSONRequestDecodeError(w, err)
 		return
 	}
+	identityLimiterKey := loginIdentityLimiterKey(ip, req.Username)
+	if s.auth.loginLimiter != nil {
+		if allowed, retryAfter := s.auth.loginLimiter.Allow(identityLimiterKey); !allowed {
+			slog.Warn("Login identity rate limited", "ip", ip, "module", "security")
+			s.recordAuthFailure(r, "admin_login_rate_limited", "rate_limited")
+			writeRateLimitResponse(w, retryAfter)
+			return
+		}
+	}
 
 	if s.auth.adminStore == nil {
 		writeAPIError(w, http.StatusInternalServerError, "admin_store_unavailable", "admin store not initialized")
 		return
 	}
 
-	user, err := s.auth.adminStore.ValidateAdminPassword(req.Username, req.Password)
+	user, err := s.auth.adminStore.ValidateUserPassword(req.Username, req.Password)
 	if err != nil {
 		if s.auth.loginLimiter != nil {
-			s.auth.loginLimiter.RecordFailure(ip)
+			s.auth.loginLimiter.RecordFailure(identityLimiterKey)
 		}
+		if errors.Is(err, ErrUserDisabled) {
+			s.recordAuthFailure(r, "admin_login_disabled", "user_disabled")
+			writeAPIError(w, http.StatusUnauthorized, "user_disabled", "user is disabled")
+			return
+		}
+		s.recordAuthFailure(r, "admin_login_failed", "bad_credentials")
 		writeAPIError(w, http.StatusUnauthorized, "username_or_password_incorrect", "username or password incorrect")
 		return
 	}
 
-	slog.Info("Admin user logged in", "user", user.Username, "module", "auth")
+	slog.Info("Web user logged in", "user", user.Username, "is_admin", user.IsAdmin, "module", "auth")
 	if s.auth.loginLimiter != nil {
-		s.auth.loginLimiter.ResetFailures(ip)
+		s.auth.loginLimiter.ResetFailures(identityLimiterKey)
 	}
 
-	if s.maybeBeginMFALogin(w, r, user) {
-		return
-	}
-	s.createAdminLoginSession(w, r, *user)
+	s.finishPasswordLogin(w, r, *user, req.Password)
+}
+
+func loginIdentityLimiterKey(ip, username string) string {
+	return "identity\x00" + ip + "\x00" + strings.TrimSpace(username)
 }
 
 func (s *Server) handleAPILogout(w http.ResponseWriter, r *http.Request) {
@@ -116,10 +136,20 @@ func (s *Server) handleAPILogout(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := s.auth.adminStore.DeleteSession(info.SessionID); err != nil {
+	gate := s.lifecycleGate(info.UserID)
+	if gate == nil {
+		writeAPIError(w, http.StatusUnauthorized, "session_not_found", "session not found")
+		return
+	}
+	gate.mu.Lock()
+	defer gate.mu.Unlock()
+	activityID, err := s.auth.adminStore.DeleteSessionWithActivity(info.SessionID, s.activityActorForRequest(r))
+	if err != nil {
 		writeAPIError(w, http.StatusInternalServerError, "logout_persist_failed", "failed to persist logout")
 		return
 	}
+	s.cancelSSEForSession(info.SessionID, "logout")
+	s.publishActivityID(activityID)
 	slog.Info("Admin user logged out", "user", info.Username, "module", "auth")
 
 	s.clearSessionCookie(w, r)
@@ -130,18 +160,39 @@ func (s *Server) handleAPILogout(w http.ResponseWriter, r *http.Request) {
 // ========= Rate Limits =========
 
 func (s *Server) handleAPIAdminClientAuthRateLimits(w http.ResponseWriter, r *http.Request) {
-	if s.auth.clientLimiter == nil {
-		writeAPIError(w, http.StatusServiceUnavailable, "client_auth_limiter_unavailable", "client auth limiter unavailable")
+	if s.auth.adminStore == nil {
+		writeAPIError(w, http.StatusInternalServerError, "admin_store_unavailable", "admin store not initialized")
 		return
 	}
 
 	switch r.Method {
 	case http.MethodGet:
 		now := time.Now()
+		settings, entries := s.auth.clientRateLimitSnapshot(now)
 		encodeJSON(w, http.StatusOK, clientAuthRateLimitResponse{
-			Entries:     s.auth.clientLimiter.Snapshot(now),
-			GeneratedAt: now,
+			Enabled:           settings.Enabled,
+			RequestsPerMinute: settings.RequestsPerMinute,
+			Entries:           entries,
+			GeneratedAt:       now,
 		})
+
+	case http.MethodPut:
+		var settings ClientAuthRateLimitSettings
+		if err := decodeJSONRequestBody(r, &settings); err != nil {
+			writeJSONRequestDecodeError(w, err)
+			return
+		}
+		if err := validateClientAuthRateLimitSettings(settings); err != nil {
+			writeAPIError(w, http.StatusBadRequest, "invalid_client_auth_rate_limit", err.Error())
+			return
+		}
+		activityID, err := s.auth.updateClientRateLimitSettingsWithActivity(settings, s.activityActorForRequest(r))
+		if err != nil {
+			writeAPIError(w, http.StatusInternalServerError, "client_auth_rate_limit_update_failed", "failed to update client auth rate limit")
+			return
+		}
+		s.publishActivityID(activityID)
+		encodeJSON(w, http.StatusOK, settings)
 
 	case http.MethodDelete:
 		var req struct {
@@ -156,7 +207,7 @@ func (s *Server) handleAPIAdminClientAuthRateLimits(w http.ResponseWriter, r *ht
 			writeAPIError(w, http.StatusBadRequest, "missing_ip", "ip is required")
 			return
 		}
-		deleted := s.auth.clientLimiter.Delete(ip)
+		deleted := s.auth.deleteClientRateLimit(ip)
 		encodeJSON(w, http.StatusOK, map[string]any{
 			"success": true,
 			"deleted": deleted,
@@ -175,10 +226,18 @@ func (s *Server) handleAPIAdminKeys(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusInternalServerError, "admin_store_unavailable", "admin store not initialized")
 		return
 	}
+	scope, scopeOK := requireResourceScope(w, r)
+	if !scopeOK {
+		return
+	}
 
 	switch r.Method {
 	case http.MethodGet:
-		keys := s.auth.adminStore.GetAPIKeys()
+		keys, err := s.auth.adminStore.GetAPIKeysForUser(scope.OwnerUserID)
+		if err != nil {
+			writeAPIError(w, http.StatusServiceUnavailable, "temporary_storage_failure", "temporary storage failure")
+			return
+		}
 		encodeJSON(w, http.StatusOK, sanitizeAPIKeys(keys))
 
 	case http.MethodPost:
@@ -190,6 +249,10 @@ func (s *Server) handleAPIAdminKeys(w http.ResponseWriter, r *http.Request) {
 		}
 		if err := decodeJSONRequestBody(r, &req); err != nil {
 			writeJSONRequestDecodeError(w, err)
+			return
+		}
+		if _, err := normalizeKeyPermissions(req.Permissions); err != nil || req.MaxUses < 0 {
+			writeAPIError(w, http.StatusBadRequest, "invalid_api_key", "invalid API key settings")
 			return
 		}
 
@@ -210,23 +273,20 @@ func (s *Server) handleAPIAdminKeys(w http.ResponseWriter, r *http.Request) {
 			writeAPIError(w, http.StatusInternalServerError, "api_key_generate_failed", "failed to generate api key")
 			return
 		}
-		key, err := s.auth.adminStore.AddAPIKey(req.Name, rawKey, req.Permissions, expiresAt)
+		releaseMutation, err := s.acquireResourceMutation(scope, true)
 		if err != nil {
-			encodeJSON(w, http.StatusBadRequest, map[string]any{
-				"error":   err.Error(),
-				"message": err.Error(),
-				"code":    "api_key_create_failed",
-			})
+			writeResourceLifecycleError(w, err)
+			return
+		}
+		key, activityID, err := s.auth.adminStore.AddAPIKeyForUserWithActivity(scope.OwnerUserID, req.Name, rawKey, req.Permissions, expiresAt, req.MaxUses, s.activityActorForRequest(r))
+		if err != nil {
+			releaseMutation()
+			writeAPIError(w, http.StatusServiceUnavailable, "temporary_storage_failure", "temporary storage failure")
 			return
 		}
 
-		// set MaxUses
-		if req.MaxUses > 0 {
-			if err := s.auth.adminStore.SetAPIKeyMaxUses(key.ID, req.MaxUses); err != nil {
-				slog.Warn("Failed to set max_uses for key", "key_id", key.ID, "module", "admin")
-			}
-			key.MaxUses = req.MaxUses
-		}
+		s.publishActivityID(activityID)
+		releaseMutation()
 
 		slog.Info("Created new API Key", "name", req.Name, "module", "admin")
 
@@ -235,7 +295,8 @@ func (s *Server) handleAPIAdminKeys(w http.ResponseWriter, r *http.Request) {
 		if s.auth.adminStore != nil {
 			// Best-effort response enrichment only: API key creation already
 			// succeeded, so config read failure should not roll it back.
-			serverAddr = s.auth.adminStore.GetServerConfig().ServerAddr
+			config := s.auth.adminStore.GetServerConfig()
+			serverAddr = resourceServerAddr(&config, config.ServerAddr)
 		}
 
 		// return the full response including the raw key (only visible at creation time!)
@@ -263,6 +324,10 @@ func (s *Server) handleAPIAdminKeyItem(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusInternalServerError, "admin_store_unavailable", "admin store not initialized")
 		return
 	}
+	scope, scopeOK := requireResourceScope(w, r)
+	if !scopeOK {
+		return
+	}
 
 	keyID := r.PathValue("id")
 	action := r.PathValue("action")
@@ -280,10 +345,23 @@ func (s *Server) handleAPIAdminKeyItem(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		if err := s.auth.adminStore.SetAPIKeyActive(keyID, active); err != nil {
-			writeAPIError(w, http.StatusNotFound, "api_key_not_found", "key not found")
+		releaseMutation, err := s.acquireResourceMutation(scope, active)
+		if err != nil {
+			writeResourceLifecycleError(w, err)
 			return
 		}
+		activityID, err := s.auth.adminStore.SetAPIKeyActiveForUserWithActivity(scope.OwnerUserID, keyID, active, s.activityActorForRequest(r))
+		if err != nil {
+			releaseMutation()
+			if errors.Is(err, ErrAPIKeyNotFound) {
+				writeAPIError(w, http.StatusNotFound, "api_key_not_found", "key not found")
+				return
+			}
+			writeAPIError(w, http.StatusServiceUnavailable, "temporary_storage_failure", "temporary storage failure")
+			return
+		}
+		s.publishActivityID(activityID)
+		releaseMutation()
 
 		actionText := "disabled"
 		if active {
@@ -294,10 +372,23 @@ func (s *Server) handleAPIAdminKeyItem(w http.ResponseWriter, r *http.Request) {
 		encodeJSON(w, http.StatusOK, map[string]any{"success": true})
 
 	case http.MethodDelete:
-		if err := s.auth.adminStore.DeleteAPIKey(keyID); err != nil {
-			writeAPIError(w, http.StatusNotFound, "api_key_not_found", "key not found")
+		releaseMutation, err := s.acquireResourceMutation(scope, false)
+		if err != nil {
+			writeResourceLifecycleError(w, err)
 			return
 		}
+		activityID, err := s.auth.adminStore.DeleteAPIKeyForUserWithActivity(scope.OwnerUserID, keyID, s.activityActorForRequest(r))
+		if err != nil {
+			releaseMutation()
+			if errors.Is(err, ErrAPIKeyNotFound) {
+				writeAPIError(w, http.StatusNotFound, "api_key_not_found", "key not found")
+				return
+			}
+			writeAPIError(w, http.StatusServiceUnavailable, "temporary_storage_failure", "temporary storage failure")
+			return
+		}
+		s.publishActivityID(activityID)
+		releaseMutation()
 
 		slog.Info("API Key deleted", "key_id", keyID, "module", "admin")
 		w.WriteHeader(http.StatusNoContent)
@@ -329,6 +420,7 @@ func (s *Server) handleAPIAdminConfig(w http.ResponseWriter, r *http.Request) {
 			ServerAddr:          config.ServerAddr,
 			AllowedPorts:        config.AllowedPorts,
 			EffectiveServerAddr: effectiveManagementHost(&config, serverListenAddr(s)),
+			ActivityRetention:   config.ActivityRetention,
 			ServerAddrLocked:    isServerAddrLocked(),
 		})
 
@@ -336,8 +428,8 @@ func (s *Server) handleAPIAdminConfig(w http.ResponseWriter, r *http.Request) {
 		s.serverConfigMutationMu.Lock()
 		defer s.serverConfigMutationMu.Unlock()
 
-		var config ServerConfig
-		if err := decodeJSONRequestBody(r, &config); err != nil {
+		var request adminConfigUpdateRequest
+		if err := decodeJSONRequestBody(r, &request); err != nil {
 			writeJSONRequestDecodeError(w, err)
 			return
 		}
@@ -348,6 +440,14 @@ func (s *Server) handleAPIAdminConfig(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		config := ServerConfig{ServerAddr: request.ServerAddr, AllowedPorts: request.AllowedPorts, ActivityRetention: current.ActivityRetention}
+		if request.ActivityRetention != nil {
+			config.ActivityRetention = applyActivityRetentionPatch(current.ActivityRetention, request.ActivityRetention)
+		}
+		if err := config.ActivityRetention.validate(); err != nil {
+			writeAPIError(w, http.StatusBadRequest, "invalid_activity_retention", err.Error())
+			return
+		}
 		normalizedServerAddr, err := normalizeServerAddrForConfigUpdate(config.ServerAddr, current.ServerAddr)
 		if err != nil {
 			encodeJSON(w, http.StatusBadRequest, map[string]any{
@@ -424,10 +524,13 @@ func (s *Server) handleAPIAdminConfig(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// save config
-		if err := s.auth.adminStore.UpdateServerConfig(config); err != nil {
+		activityID, err := s.auth.adminStore.UpdateServerConfigWithActivity(config, s.activityActorForRequest(r))
+		if err != nil {
 			writeAPIError(w, http.StatusInternalServerError, "config_update_failed", "failed to update config")
 			return
 		}
+		s.publishActivityID(activityID)
+		go s.pruneActivityEvents()
 		if s.portPolicyAfterConfigSaveHook != nil {
 			s.portPolicyAfterConfigSaveHook()
 		}

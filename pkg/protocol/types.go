@@ -133,6 +133,7 @@ const (
 	TunnelIssueCodeProvisionAckRejected   = "provision_ack_rejected"
 	TunnelIssueCodeProvisionAckCancelled  = "provision_ack_cancelled"
 	TunnelIssueCodeTargetStreamOpenFailed = "target_stream_open_failed"
+	TunnelIssueCodeOwnerDisabled          = "owner_disabled"
 )
 
 // TunnelSpec is the canonical tunnel payload used by API, protocol, storage,

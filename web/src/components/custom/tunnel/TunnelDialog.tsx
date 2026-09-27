@@ -36,9 +36,10 @@ import {
   getTunnelMutationFieldError,
 } from '@/lib/tunnel-model';
 import { parseMbpsInputToBps } from '@/lib/format';
-import { useServerStatus } from '@/hooks/use-server-status';
+import { useResourceBootstrap } from '@/hooks/use-server-status';
 import { getClientDisplayName } from '@/lib/client-utils';
 import { cn } from '@/lib/utils';
+import type { ResourceScope } from '@/lib/resource-scope';
 import type { Client, PortRange, TransportPolicy, TunnelFormType, TunnelTopology } from '@/types';
 import { i18n } from '@/i18n';
 import { useTranslation } from 'react-i18next';
@@ -51,6 +52,7 @@ import {
 } from '@/lib/source-cidrs';
 
 interface TunnelDialogCreateProps {
+  scope: ResourceScope;
   mode: 'create';
   clientId: string;
   clients?: Client[];
@@ -62,6 +64,7 @@ interface TunnelDialogCreateProps {
 }
 
 interface TunnelDialogEditProps {
+  scope: ResourceScope;
   mode: 'edit';
   tunnel: TunnelDialogEditData | null;
   clients?: Client[];
@@ -387,8 +390,8 @@ function TunnelDialogForm({
   const parsedRemotePort = isHttp ? 0 : parsePortInput(remotePort);
   const parsedSocks5DialTimeout = Number.parseInt(socks5DialTimeout, 10);
 
-  const createTunnel = useCreateTunnel();
-  const updateTunnel = useUpdateTunnel();
+  const createTunnel = useCreateTunnel(props.scope);
+  const updateTunnel = useUpdateTunnel(props.scope);
   const mutation = isEdit ? updateTunnel : createTunnel;
   const portErrorMessage = t('tunnels.portInvalid');
 
@@ -408,7 +411,7 @@ function TunnelDialogForm({
     }
   };
 
-  const { data: status } = useServerStatus({
+  const { data: status, isError: isBootstrapError } = useResourceBootstrap(props.scope, {
     enabled: open,
     refetchOnMount: 'always',
     staleTime: 0,
@@ -420,6 +423,11 @@ function TunnelDialogForm({
     const parsedIngressBps = parseMbpsInputToBps(ingressBps);
     const parsedEgressBps = parseMbpsInputToBps(egressBps);
     const parsedTotalBps = parseMbpsInputToBps(totalBps);
+
+    if (!isClientToClient && !isHttp && (!status || isBootstrapError)) {
+      failField(localFieldError('remote_port', t('tunnels.bootstrapUnavailable')));
+      return;
+    }
 
     if (!name.trim()) {
       failField(localFieldError('name', t('tunnels.nameRequired')));
@@ -942,7 +950,7 @@ function TunnelDialogForm({
               <label className="text-sm font-medium">{t('tunnels.domain')}</label>
               <Input
                 aria-label={t('tunnels.domain')}
-                placeholder="e.g. app.example.com"
+                placeholder="app.example.com / *.example.com"
                 value={domain}
                 onChange={(e) => {
                   clearMutationFeedback();
@@ -1300,6 +1308,12 @@ function TunnelDialogForm({
             {getTunnelMutationErrorMessage(mutation.error)}
           </div>
         )}
+        {!isClientToClient && !isHttp && isBootstrapError && (
+          <div className="flex items-center gap-2 rounded-lg bg-destructive/10 px-3 py-2 text-sm text-destructive">
+            <AlertTriangle className="size-4 shrink-0" />
+            {t('tunnels.bootstrapUnavailable')}
+          </div>
+        )}
         </div>
 
         <DialogFooter>
@@ -1312,7 +1326,7 @@ function TunnelDialogForm({
           </Button>
           <Button
             type="submit"
-            disabled={mutation.isPending}
+            disabled={mutation.isPending || (!isClientToClient && !isHttp && (!status || isBootstrapError))}
           >
             {mutation.isPending
               ? (isEdit ? t('tunnels.updating') : t('tunnels.creating'))

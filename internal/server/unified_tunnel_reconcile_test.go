@@ -61,8 +61,8 @@ func TestReconcileRunningUnifiedTunnelsSkipsStoppedAndProjectsOffline(t *testing
 
 	running := testStoredC2CTunnelForReconcile("running-c2c", "running-c2c", protocol.ProxyDesiredStateRunning, protocol.ProxyRuntimeStateError, 22022)
 	stopped := testStoredC2CTunnelForReconcile("stopped-c2c", "stopped-c2c", protocol.ProxyDesiredStateStopped, protocol.ProxyRuntimeStateIdle, 22023)
-	mustAddStableTunnel(t, s.store, running)
-	mustAddStableTunnel(t, s.store, stopped)
+	running = mustAddStableTunnelForServer(t, s, running)
+	stopped = mustAddStableTunnelForServer(t, s, stopped)
 
 	s.reconcileRunningUnifiedTunnels("test")
 
@@ -89,9 +89,9 @@ func TestScheduleUnifiedTunnelReconcileAfterShutdownDoesNotMutateState(t *testin
 	if err != nil {
 		t.Fatalf("parse unified_tunnel_reconcile.go: %v", err)
 	}
-	fn := findFuncDecl(file, "scheduleUnifiedTunnelReconcile")
+	fn := findFuncDecl(file, "scheduleCapturedUnifiedTunnelReconcile")
 	if fn == nil || fn.Body == nil {
-		t.Fatal("scheduleUnifiedTunnelReconcile not found")
+		t.Fatal("scheduleCapturedUnifiedTunnelReconcile not found")
 	}
 	body := fn.Body
 
@@ -99,7 +99,7 @@ func TestScheduleUnifiedTunnelReconcileAfterShutdownDoesNotMutateState(t *testin
 	for _, stmt := range body.List {
 		if _, ok := stmt.(*ast.GoStmt); ok {
 			if !sawDoneGuardBeforeGo {
-				t.Fatal("scheduleUnifiedTunnelReconcile must check s.done before starting reconcile goroutine")
+				t.Fatal("scheduleCapturedUnifiedTunnelReconcile must check s.done before starting reconcile goroutine")
 			}
 			return
 		}
@@ -107,7 +107,7 @@ func TestScheduleUnifiedTunnelReconcileAfterShutdownDoesNotMutateState(t *testin
 			sawDoneGuardBeforeGo = true
 		}
 	}
-	t.Fatal("scheduleUnifiedTunnelReconcile does not start a reconcile goroutine")
+	t.Fatal("scheduleCapturedUnifiedTunnelReconcile does not start a reconcile goroutine")
 }
 
 func TestUnifiedMutationEventsPublishBeforeSchedulingReconcile(t *testing.T) {
@@ -120,9 +120,9 @@ func TestUnifiedMutationEventsPublishBeforeSchedulingReconcile(t *testing.T) {
 		function string
 		emitCall string
 	}{
-		{function: "createUnifiedStoredTunnel", emitCall: "emitTunnelChangedIfStored"},
-		{function: "updateUnifiedStoredTunnel", emitCall: "emitTunnelChangedIfStored"},
-		{function: "migrateUnifiedStoredTunnel", emitCall: "emitMigratedTunnelOwnerEvents"},
+		{function: "createUnifiedStoredTunnelForUserAtEpoch", emitCall: "emitTunnelChangedIfStored"},
+		{function: "updateUnifiedStoredTunnelAtEpoch", emitCall: "emitTunnelChangedIfStored"},
+		{function: "migrateUnifiedStoredTunnelAtEpoch", emitCall: "emitMigratedTunnelOwnerEvents"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.function, func(t *testing.T) {
@@ -131,7 +131,7 @@ func TestUnifiedMutationEventsPublishBeforeSchedulingReconcile(t *testing.T) {
 				t.Fatalf("function %s not found", tc.function)
 			}
 			emitPos := firstSelectorCallPosition(fn.Body, tc.emitCall)
-			schedulePos := firstSelectorCallPosition(fn.Body, "scheduleUnifiedTunnelReconcile")
+			schedulePos := firstSelectorCallPosition(fn.Body, "scheduleOwnedMutationReconcile")
 			if emitPos == token.NoPos || schedulePos == token.NoPos {
 				t.Fatalf("missing event/schedule calls: emit=%v schedule=%v", emitPos, schedulePos)
 			}
@@ -377,6 +377,338 @@ func TestUnifiedReconcileRegistryCoalescesMultipleDirtyCallsIntoSingleRerun(t *t
 	}
 }
 
+func TestUnifiedReconcileRegistryPreservesQueuedTaskGeneration(t *testing.T) {
+	registry := newUnifiedTunnelReconcileRegistry()
+	firstEntered := make(chan struct{})
+	allowFirstReturn := make(chan struct{})
+	tasks := make(chan unifiedTunnelReconcileTask, 2)
+
+	first := unifiedTunnelReconcileTask{
+		TunnelID:    "same-tunnel",
+		OwnerUserID: "owner",
+		OwnerEpoch:  1,
+		Revision:    1,
+		Participants: []unifiedTunnelParticipant{
+			{ClientID: "client-a", Generation: 1},
+		},
+	}
+	second := unifiedTunnelReconcileTask{
+		TunnelID:    "same-tunnel",
+		OwnerUserID: "owner",
+		OwnerEpoch:  3,
+		Revision:    2,
+		Participants: []unifiedTunnelParticipant{
+			{ClientID: "client-a", Generation: 7},
+		},
+	}
+	execute := func(task unifiedTunnelReconcileTask) error {
+		tasks <- task
+		if task.OwnerEpoch == first.OwnerEpoch {
+			close(firstEntered)
+			<-allowFirstReturn
+		}
+		return nil
+	}
+
+	firstDone := make(chan error, 1)
+	go func() { firstDone <- registry.runTask(first, execute) }()
+	<-firstEntered
+	if err := registry.runTask(second, execute); err != nil {
+		t.Fatalf("queue second generation: %v", err)
+	}
+	close(allowFirstReturn)
+	if err := <-firstDone; err != nil {
+		t.Fatalf("run queued generations: %v", err)
+	}
+
+	if got := <-tasks; !sameUnifiedTunnelReconcileTask(got, first) {
+		t.Fatalf("first task changed while queued: got %+v want %+v", got, first)
+	}
+	if got := <-tasks; !sameUnifiedTunnelReconcileTask(got, second) {
+		t.Fatalf("dirty rerun washed task generation: got %+v want %+v", got, second)
+	}
+}
+
+func TestUnifiedReconcileTaskCapturedBeforeDisableEnableCannotRestoreRuntime(t *testing.T) {
+	s := New(0)
+	s.store = newTestTunnelStore(t)
+	stored := testStoredC2CTunnelForReconcile("stale-source", "stale-source", protocol.ProxyDesiredStateRunning, protocol.ProxyRuntimeStateError, 22091)
+	stored.OwnerUserID = "stale-source-owner"
+	stored = mustAddStableTunnelForServer(t, s, stored)
+
+	task, err := s.captureUnifiedTunnelReconcileTask(stored, "runtime_report")
+	if err != nil {
+		t.Fatalf("capture source task: %v", err)
+	}
+	beforeExecute := make(chan struct{})
+	allowExecute := make(chan struct{})
+	var hookOnce sync.Once
+	s.userLifecycleHook = func(stage, userID string) {
+		if stage == "unified_reconcile_before_execute" && userID == stored.OwnerUserID {
+			hookOnce.Do(func() {
+				close(beforeExecute)
+				<-allowExecute
+			})
+		}
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- s.unifiedReconcileRegistry().runTask(task, s.executeUnifiedTunnelReconcileTask)
+	}()
+	<-beforeExecute
+
+	gate := s.lifecycleGate(stored.OwnerUserID)
+	gate.mu.Lock()
+	if _, err := s.store.db.Exec(`UPDATE users SET status = ? WHERE id = ?`, string(UserStatusDisabled), stored.OwnerUserID); err != nil {
+		gate.mu.Unlock()
+		t.Fatalf("disable owner: %v", err)
+	}
+	gate.epoch++
+	if _, err := s.store.db.Exec(`UPDATE users SET status = ? WHERE id = ?`, string(UserStatusActive), stored.OwnerUserID); err != nil {
+		gate.mu.Unlock()
+		t.Fatalf("enable owner: %v", err)
+	}
+	gate.epoch++
+	gate.mu.Unlock()
+	close(allowExecute)
+	if err := <-done; err != nil {
+		t.Fatalf("stale task should be abandoned without error: %v", err)
+	}
+
+	afterStale, err := s.store.GetTunnelByID(stored.ID)
+	if err != nil {
+		t.Fatalf("load tunnel after stale task: %v", err)
+	}
+	if afterStale.RuntimeState != protocol.ProxyRuntimeStateError {
+		t.Fatalf("stale task restored runtime after disable/enable: got %s", afterStale.RuntimeState)
+	}
+
+	fresh := unifiedTunnelReconcileTask{TunnelID: stored.ID, Reason: "periodic", Fresh: true}
+	if err := s.unifiedReconcileRegistry().runTask(fresh, s.executeUnifiedTunnelReconcileTask); err != nil {
+		t.Fatalf("fresh periodic reconcile: %v", err)
+	}
+	afterFresh, err := s.store.GetTunnelByID(stored.ID)
+	if err != nil {
+		t.Fatalf("load tunnel after fresh task: %v", err)
+	}
+	if afterFresh.RuntimeState != protocol.ProxyRuntimeStateOffline {
+		t.Fatalf("fresh periodic task did not reconcile current epoch: got %s", afterFresh.RuntimeState)
+	}
+}
+
+func TestRuntimeReportReconcilePinsParticipantGenerationBeforeScheduling(t *testing.T) {
+	s := New(0)
+	s.store = newTestTunnelStore(t)
+	stored := testStoredC2CTunnelForReconcile("runtime-report-generation", "runtime-report-generation", protocol.ProxyDesiredStateRunning, protocol.ProxyRuntimeStateError, 22092)
+	stored = mustAddStableTunnelForServer(t, s, stored)
+	ownerEpoch := s.lifecycleGate(stored.OwnerUserID).epoch
+
+	target := &ClientConn{
+		ID: stored.Target.ClientID, OwnerUserID: stored.OwnerUserID, OwnerEpoch: ownerEpoch,
+		generation: 1, state: clientStateLive,
+	}
+	ingress := &ClientConn{
+		ID: stored.Ingress.ClientID, OwnerUserID: stored.OwnerUserID, OwnerEpoch: ownerEpoch,
+		generation: 1, state: clientStateLive,
+	}
+	s.clients.Store(target.ID, target)
+	s.clients.Store(ingress.ID, ingress)
+
+	captured := make(chan struct{})
+	allowSchedule := make(chan struct{})
+	executed := make(chan struct{})
+	var capturedOnce sync.Once
+	var executedOnce sync.Once
+	s.userLifecycleHook = func(stage, userID string) {
+		if userID != stored.OwnerUserID {
+			return
+		}
+		switch stage {
+		case "runtime_report_reconcile_captured":
+			capturedOnce.Do(func() {
+				close(captured)
+				<-allowSchedule
+			})
+		case "unified_reconcile_after_execute":
+			executedOnce.Do(func() { close(executed) })
+		}
+	}
+
+	msg, err := protocol.NewMessage(protocol.MsgTypeTunnelRuntimeReport, protocol.TunnelRuntimeReport{
+		TunnelID: stored.ID,
+		Revision: stored.Revision,
+		Role:     protocol.DataStreamRoleIngress,
+		Message:  "old generation report",
+	})
+	if err != nil {
+		t.Fatalf("build runtime report: %v", err)
+	}
+	handlerDone := make(chan struct{})
+	go func() {
+		s.handleTunnelRuntimeReportMessage(ingress, *msg)
+		close(handlerDone)
+	}()
+
+	select {
+	case <-captured:
+	case <-time.After(time.Second):
+		t.Fatal("runtime report did not capture reconcile task")
+	}
+	s.clientTunnelMutationMu.Lock()
+	s.clients.Store(ingress.ID, &ClientConn{
+		ID: ingress.ID, OwnerUserID: stored.OwnerUserID, OwnerEpoch: ownerEpoch,
+		generation: 2, state: clientStateLive,
+	})
+	s.clientTunnelMutationMu.Unlock()
+	close(allowSchedule)
+	select {
+	case <-handlerDone:
+	case <-time.After(time.Second):
+		t.Fatal("runtime report handler did not return")
+	}
+	select {
+	case <-executed:
+	case <-time.After(time.Second):
+		t.Fatal("captured runtime report reconcile did not finish")
+	}
+
+	got, err := s.store.GetTunnelByID(stored.ID)
+	if err != nil {
+		t.Fatalf("reload tunnel: %v", err)
+	}
+	if got.RuntimeState != protocol.ProxyRuntimeStateError {
+		t.Fatalf("old runtime report reconciled replacement generation: got state %q", got.RuntimeState)
+	}
+}
+
+func TestUnifiedReconcileRevalidatesParticipantsAtFinalPublication(t *testing.T) {
+	s := New(0)
+	s.store = newTestTunnelStore(t)
+	stored := testStoredC2CTunnelForReconcile("publication-generation", "publication-generation", protocol.ProxyDesiredStateRunning, protocol.ProxyRuntimeStateError, 22093)
+	stored = mustAddStableTunnelForServer(t, s, stored)
+	ownerEpoch := s.lifecycleGate(stored.OwnerUserID).epoch
+	target := &ClientConn{
+		ID: stored.Target.ClientID, OwnerUserID: stored.OwnerUserID, OwnerEpoch: ownerEpoch,
+		generation: 1, state: clientStateLive,
+	}
+	ingress := &ClientConn{
+		ID: stored.Ingress.ClientID, OwnerUserID: stored.OwnerUserID, OwnerEpoch: ownerEpoch,
+		generation: 1, state: clientStateLive,
+	}
+	s.clients.Store(target.ID, target)
+	s.clients.Store(ingress.ID, ingress)
+	task, err := s.captureUnifiedTunnelReconcileTask(stored, "runtime_report")
+	if err != nil {
+		t.Fatalf("capture reconcile task: %v", err)
+	}
+
+	initialCheckDone := make(chan struct{})
+	allowPublication := make(chan struct{})
+	var hookOnce sync.Once
+	s.userLifecycleHook = func(stage, userID string) {
+		if stage == "unified_reconcile_after_initial_participant_check" && userID == stored.OwnerUserID {
+			hookOnce.Do(func() {
+				close(initialCheckDone)
+				<-allowPublication
+			})
+		}
+	}
+	done := make(chan error, 1)
+	go func() { done <- s.executeFixedUnifiedTunnelReconcileTask(task) }()
+	select {
+	case <-initialCheckDone:
+	case <-time.After(time.Second):
+		t.Fatal("fixed reconcile did not finish its initial participant check")
+	}
+
+	s.clientTunnelMutationMu.Lock()
+	s.clients.Store(ingress.ID, &ClientConn{
+		ID: ingress.ID, OwnerUserID: stored.OwnerUserID, OwnerEpoch: ownerEpoch,
+		generation: 2, state: clientStateLive,
+	})
+	s.clientTunnelMutationMu.Unlock()
+	close(allowPublication)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("stale reconcile should be abandoned without error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("fixed reconcile did not finish after participant replacement")
+	}
+
+	got, err := s.store.GetTunnelByID(stored.ID)
+	if err != nil {
+		t.Fatalf("reload tunnel: %v", err)
+	}
+	if got.RuntimeState != protocol.ProxyRuntimeStateError {
+		t.Fatalf("old task published to replacement generation: got state %q", got.RuntimeState)
+	}
+}
+
+func TestClientGenerationTriggeredReconcileCannotAdoptReplacement(t *testing.T) {
+	s := New(0)
+	s.store = newTestTunnelStore(t)
+	stored := testStoredC2CTunnelForReconcile("client-trigger-generation", "client-trigger-generation", protocol.ProxyDesiredStateRunning, protocol.ProxyRuntimeStateError, 22094)
+	stored = mustAddStableTunnelForServer(t, s, stored)
+	ownerEpoch := s.lifecycleGate(stored.OwnerUserID).epoch
+	oldIngress := &ClientConn{
+		ID: stored.Ingress.ClientID, OwnerUserID: stored.OwnerUserID, OwnerEpoch: ownerEpoch,
+		generation: 1, state: clientStateLive,
+	}
+	target := &ClientConn{
+		ID: stored.Target.ClientID, OwnerUserID: stored.OwnerUserID, OwnerEpoch: ownerEpoch,
+		generation: 1, state: clientStateLive,
+	}
+	s.clients.Store(oldIngress.ID, oldIngress)
+	s.clients.Store(target.ID, target)
+
+	readGateHeld := make(chan struct{})
+	allowCapture := make(chan struct{})
+	var hookOnce sync.Once
+	s.userLifecycleHook = func(stage, userID string) {
+		if stage == "after_read_gate" && userID == stored.OwnerUserID {
+			hookOnce.Do(func() {
+				close(readGateHeld)
+				<-allowCapture
+			})
+		}
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- s.reconcileUnifiedTunnelForClientGeneration(oldIngress, stored.ID, "data_channel_ready")
+	}()
+	select {
+	case <-readGateHeld:
+	case <-time.After(time.Second):
+		t.Fatal("client-triggered reconcile did not reach its source capture gate")
+	}
+	s.clientTunnelMutationMu.Lock()
+	s.clients.Store(oldIngress.ID, &ClientConn{
+		ID: oldIngress.ID, OwnerUserID: stored.OwnerUserID, OwnerEpoch: ownerEpoch,
+		generation: 2, state: clientStateLive,
+	})
+	s.clientTunnelMutationMu.Unlock()
+	close(allowCapture)
+	select {
+	case err := <-done:
+		if !errors.Is(err, ErrUserLifecycleEpochChanged) {
+			t.Fatalf("old client trigger error = %v, want lifecycle epoch change", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("old client-triggered reconcile did not return")
+	}
+
+	got, err := s.store.GetTunnelByID(stored.ID)
+	if err != nil {
+		t.Fatalf("reload tunnel: %v", err)
+	}
+	if got.RuntimeState != protocol.ProxyRuntimeStateError {
+		t.Fatalf("old data-ready trigger reconciled replacement generation: got state %q", got.RuntimeState)
+	}
+}
+
 func TestUnifiedReconcileRegistryAllowsDifferentTunnelsInParallel(t *testing.T) {
 	registry := newUnifiedTunnelReconcileRegistry()
 	firstEntered := make(chan struct{})
@@ -468,13 +800,15 @@ func TestRestoreTunnelsReconcilesNonOwnerClientRelayParticipant(t *testing.T) {
 		protocol.ProxyRuntimeStateOffline,
 		22024,
 	)
-	mustAddStableTunnel(t, s.store, stored)
+	stored = mustAddStableTunnelForServer(t, s, stored)
 
 	caps := protocol.DefaultClientCapabilities()
 	_, ingressSession := newTestClientRelayDataSession(t)
 	_, targetSession := newTestClientRelayDataSession(t)
 	ingressClient := &ClientConn{
 		ID:          stored.Ingress.ClientID,
+		OwnerUserID: stored.OwnerUserID,
+		OwnerEpoch:  s.lifecycleGate(stored.OwnerUserID).epoch,
 		Info:        protocol.ClientInfo{Capabilities: &caps},
 		dataSession: ingressSession,
 		generation:  1,
@@ -483,6 +817,8 @@ func TestRestoreTunnelsReconcilesNonOwnerClientRelayParticipant(t *testing.T) {
 	}
 	targetClient := &ClientConn{
 		ID:          stored.Target.ClientID,
+		OwnerUserID: stored.OwnerUserID,
+		OwnerEpoch:  s.lifecycleGate(stored.OwnerUserID).epoch,
 		Info:        protocol.ClientInfo{Capabilities: &caps},
 		dataSession: targetSession,
 		generation:  1,
@@ -519,13 +855,15 @@ func TestRestoreTunnelsReconcilesRunningErrorTunnel(t *testing.T) {
 		22025,
 	)
 	stored.Error = "old persisted failure"
-	mustAddStableTunnel(t, s.store, stored)
+	stored = mustAddStableTunnelForServer(t, s, stored)
 
 	caps := protocol.DefaultClientCapabilities()
 	_, ingressSession := newTestClientRelayDataSession(t)
 	_, targetSession := newTestClientRelayDataSession(t)
 	targetClient := &ClientConn{
 		ID:          stored.Target.ClientID,
+		OwnerUserID: stored.OwnerUserID,
+		OwnerEpoch:  s.lifecycleGate(stored.OwnerUserID).epoch,
 		Info:        protocol.ClientInfo{Capabilities: &caps},
 		dataSession: targetSession,
 		generation:  1,
@@ -534,6 +872,8 @@ func TestRestoreTunnelsReconcilesRunningErrorTunnel(t *testing.T) {
 	}
 	ingressClient := &ClientConn{
 		ID:          stored.Ingress.ClientID,
+		OwnerUserID: stored.OwnerUserID,
+		OwnerEpoch:  s.lifecycleGate(stored.OwnerUserID).epoch,
 		Info:        protocol.ClientInfo{Capabilities: &caps},
 		dataSession: ingressSession,
 		generation:  1,
@@ -609,7 +949,7 @@ func TestUnifiedServerExposeProvisionAndDataHeaderUseStoredRevision(t *testing.T
 	if err := stored.normalize(); err != nil {
 		t.Fatalf("normalize stored tunnel: %v", err)
 	}
-	mustAddStableTunnel(t, s.store, stored)
+	stored = mustAddStableTunnelForServer(t, s, stored)
 
 	targetWS, targetServerWS := newTestWebSocketPair(t)
 	defer mustClose(t, targetWS)
@@ -618,6 +958,8 @@ func TestUnifiedServerExposeProvisionAndDataHeaderUseStoredRevision(t *testing.T
 	caps := protocol.DefaultClientCapabilities()
 	target := &ClientConn{
 		ID:          stored.Target.ClientID,
+		OwnerUserID: stored.OwnerUserID,
+		OwnerEpoch:  s.lifecycleGate(stored.OwnerUserID).epoch,
 		Info:        protocol.ClientInfo{Hostname: "target-client", Capabilities: &caps},
 		conn:        targetServerWS,
 		proxies:     make(map[string]*ProxyTunnel),
@@ -886,7 +1228,7 @@ func TestUnifiedServerExposeReconcilePreservesNewRuntimeAfterLateRevisionAdvance
 	if err := stored.normalize(); err != nil {
 		t.Fatalf("normalize stored tunnel: %v", err)
 	}
-	mustAddStableTunnel(t, s.store, stored)
+	stored = mustAddStableTunnelForServer(t, s, stored)
 
 	targetWS, targetServerWS := newTestWebSocketPair(t)
 	defer mustClose(t, targetWS)
@@ -895,6 +1237,8 @@ func TestUnifiedServerExposeReconcilePreservesNewRuntimeAfterLateRevisionAdvance
 	caps := protocol.DefaultClientCapabilities()
 	target := &ClientConn{
 		ID:          stored.Target.ClientID,
+		OwnerUserID: stored.OwnerUserID,
+		OwnerEpoch:  s.lifecycleGate(stored.OwnerUserID).epoch,
 		Info:        protocol.ClientInfo{Hostname: "target-client", Capabilities: &caps},
 		conn:        targetServerWS,
 		proxies:     make(map[string]*ProxyTunnel),
@@ -1061,7 +1405,7 @@ func TestUnifiedServerExposeRejectedProvisionLeavesNoListenerOrAckWaiter(t *test
 	if err := stored.normalize(); err != nil {
 		t.Fatalf("normalize stored tunnel: %v", err)
 	}
-	mustAddStableTunnel(t, s.store, stored)
+	stored = mustAddStableTunnelForServer(t, s, stored)
 
 	targetWS, targetServerWS := newTestWebSocketPair(t)
 	defer mustClose(t, targetWS)
@@ -1070,6 +1414,8 @@ func TestUnifiedServerExposeRejectedProvisionLeavesNoListenerOrAckWaiter(t *test
 	caps := protocol.DefaultClientCapabilities()
 	target := &ClientConn{
 		ID:          stored.Target.ClientID,
+		OwnerUserID: stored.OwnerUserID,
+		OwnerEpoch:  s.lifecycleGate(stored.OwnerUserID).epoch,
 		Info:        protocol.ClientInfo{Hostname: "target-client", Capabilities: &caps},
 		conn:        targetServerWS,
 		proxies:     make(map[string]*ProxyTunnel),
@@ -1219,7 +1565,12 @@ func TestUnifiedServerExposeRuntimeErrorWinsActivationTransition(t *testing.T) {
 	stored.Revision = 6
 	stored.RuntimeState = protocol.ProxyRuntimeStateOffline
 	stored.ActualTransport = protocol.ActualTransportUnknown
-	mustAddStableTunnel(t, s.store, stored)
+	stored = mustAddStableTunnelForServer(t, s, stored)
+	ownerEpoch, releaseOwnerGate, err := s.acquireUserLifecycleRead(stored.OwnerUserID, 0, true)
+	if err != nil {
+		t.Fatalf("capture activation error owner epoch: %v", err)
+	}
+	releaseOwnerGate()
 
 	clientWS, serverWS := newTestWebSocketPair(t)
 	defer mustClose(t, clientWS)
@@ -1228,6 +1579,8 @@ func TestUnifiedServerExposeRuntimeErrorWinsActivationTransition(t *testing.T) {
 	caps := protocol.DefaultClientCapabilities()
 	client := &ClientConn{
 		ID:          stored.OwnerClientID,
+		OwnerUserID: stored.OwnerUserID,
+		OwnerEpoch:  ownerEpoch,
 		Info:        protocol.ClientInfo{Hostname: stored.OwnerClientID, Capabilities: &caps},
 		conn:        serverWS,
 		proxies:     make(map[string]*ProxyTunnel),
@@ -1242,10 +1595,10 @@ func TestUnifiedServerExposeRuntimeErrorWinsActivationTransition(t *testing.T) {
 	s.serverExposeActivatedHook = func(_ StoredTunnel, tunnel *ProxyTunnel) {
 		client.proxyMu.RLock()
 		listener := tunnel.Listener
-		proxyName := tunnel.Config.Name
+		activationConfig := tunnel.Config
 		client.proxyMu.RUnlock()
 		go func() {
-			s.markTCPProxyRuntimeErrorIfCurrent(client, proxyName, tunnel, listener, "injected activation failure")
+			s.markTCPProxyRuntimeErrorIfCurrent(client, activationConfig.Name, tunnel, listener, activationConfig, "injected activation failure")
 			close(runtimeErrorDone)
 		}()
 	}
@@ -1320,7 +1673,12 @@ func TestUnifiedServerExposeRetryWaitsForRuntimeErrorCleanup(t *testing.T) {
 		time.Now().UTC(),
 	)
 	stored.Revision = 7
-	mustAddStableTunnel(t, s.store, stored)
+	stored = mustAddStableTunnelForServer(t, s, stored)
+	ownerEpoch, releaseOwnerGate, err := s.acquireUserLifecycleRead(stored.OwnerUserID, 0, true)
+	if err != nil {
+		t.Fatalf("capture runtime cleanup owner epoch: %v", err)
+	}
+	releaseOwnerGate()
 
 	clientWS, serverWS := newTestWebSocketPair(t)
 	defer mustClose(t, clientWS)
@@ -1329,6 +1687,8 @@ func TestUnifiedServerExposeRetryWaitsForRuntimeErrorCleanup(t *testing.T) {
 	caps := protocol.DefaultClientCapabilities()
 	client := &ClientConn{
 		ID:          stored.OwnerClientID,
+		OwnerUserID: stored.OwnerUserID,
+		OwnerEpoch:  ownerEpoch,
 		Info:        protocol.ClientInfo{Hostname: stored.OwnerClientID, Capabilities: &caps},
 		conn:        serverWS,
 		proxies:     make(map[string]*ProxyTunnel),
@@ -1362,9 +1722,12 @@ func TestUnifiedServerExposeRetryWaitsForRuntimeErrorCleanup(t *testing.T) {
 		close(cleanupEntered)
 		<-releaseCleanup
 	}
+	client.proxyMu.RLock()
+	activationConfig := tunnel.Config
+	client.proxyMu.RUnlock()
 	markDone := make(chan struct{})
 	go func() {
-		s.markTCPProxyRuntimeErrorIfCurrent(client, stored.Name, tunnel, listener, "ordered runtime failure")
+		s.markTCPProxyRuntimeErrorIfCurrent(client, stored.Name, tunnel, listener, activationConfig, "ordered runtime failure")
 		close(markDone)
 	}()
 	select {
@@ -1377,26 +1740,26 @@ func TestUnifiedServerExposeRetryWaitsForRuntimeErrorCleanup(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load error state before retry: %v", err)
 	}
+	reconcileEnteredOwnerGate := make(chan struct{})
+	var reconcileGateOnce sync.Once
+	s.userLifecycleHook = func(stage, userID string) {
+		if stage == "after_read_gate" && userID == stored.OwnerUserID {
+			reconcileGateOnce.Do(func() { close(reconcileEnteredOwnerGate) })
+		}
+	}
 	reconcileDone := make(chan error, 1)
 	go func() {
 		reconcileDone <- s.reconcileServerExposeTunnel(current)
 	}()
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		s.tunnelRuntimeOps.mu.Lock()
-		entry := s.tunnelRuntimeOps.entries[tunnelRuntimeOperationKey(stored.ID, stored.OwnerClientID, stored.Name)]
-		refs := 0
-		if entry != nil {
-			refs = entry.refs
-		}
-		s.tunnelRuntimeOps.mu.Unlock()
-		if refs >= 2 {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("retry did not wait on runtime cleanup operation")
-		}
-		time.Sleep(time.Millisecond)
+	select {
+	case <-reconcileEnteredOwnerGate:
+	case <-time.After(2 * time.Second):
+		t.Fatal("retry did not enter the owner lifecycle gate")
+	}
+	select {
+	case err := <-reconcileDone:
+		t.Fatalf("retry completed before runtime cleanup: %v", err)
+	default:
 	}
 	client.proxyMu.RLock()
 	stillOldRuntime := client.proxies[stored.Name] == tunnel
@@ -1498,7 +1861,7 @@ func TestUnifiedServerExposeInFlightReconcileShutdownCleansRuntimeAndAckWaiter(t
 	if err := stored.normalize(); err != nil {
 		t.Fatalf("normalize stored tunnel: %v", err)
 	}
-	mustAddStableTunnel(t, s.store, stored)
+	stored = mustAddStableTunnelForServer(t, s, stored)
 
 	targetWS, targetServerWS := newTestWebSocketPair(t)
 	defer mustClose(t, targetWS)
@@ -1507,6 +1870,8 @@ func TestUnifiedServerExposeInFlightReconcileShutdownCleansRuntimeAndAckWaiter(t
 	caps := protocol.DefaultClientCapabilities()
 	target := &ClientConn{
 		ID:          stored.Target.ClientID,
+		OwnerUserID: stored.OwnerUserID,
+		OwnerEpoch:  s.lifecycleGate(stored.OwnerUserID).epoch,
 		Info:        protocol.ClientInfo{Hostname: "target-client", Capabilities: &caps},
 		conn:        targetServerWS,
 		proxies:     make(map[string]*ProxyTunnel),
@@ -1621,12 +1986,14 @@ func TestUnifiedServerExposeCapabilityLossCleansListenerAndProjectsIssue(t *test
 	if err := stored.normalize(); err != nil {
 		t.Fatalf("normalize stored tunnel: %v", err)
 	}
-	mustAddStableTunnel(t, s.store, stored)
+	stored = mustAddStableTunnelForServer(t, s, stored)
 
 	caps := protocol.DefaultClientCapabilities()
 	_, serverSession := newTestClientRelayDataSession(t)
 	target := &ClientConn{
 		ID:          stored.Target.ClientID,
+		OwnerUserID: stored.OwnerUserID,
+		OwnerEpoch:  s.lifecycleGate(stored.OwnerUserID).epoch,
 		Info:        protocol.ClientInfo{Hostname: "target-client", Capabilities: &caps},
 		proxies:     make(map[string]*ProxyTunnel),
 		dataSession: serverSession,
@@ -1741,7 +2108,7 @@ func TestUnifiedServerExposeHTTPCapabilityRecoveryReactivatesClosedRuntime(t *te
 	if err := stored.normalize(); err != nil {
 		t.Fatalf("normalize HTTP capability tunnel: %v", err)
 	}
-	mustAddStableTunnel(t, s.store, stored)
+	stored = mustAddStableTunnelForServer(t, s, stored)
 
 	clientWS, serverWS := newTestWebSocketPair(t)
 	defer mustClose(t, clientWS)
@@ -1750,6 +2117,8 @@ func TestUnifiedServerExposeHTTPCapabilityRecoveryReactivatesClosedRuntime(t *te
 	caps := protocol.DefaultClientCapabilities()
 	target := &ClientConn{
 		ID:          stored.OwnerClientID,
+		OwnerUserID: stored.OwnerUserID,
+		OwnerEpoch:  s.lifecycleGate(stored.OwnerUserID).epoch,
 		Info:        protocol.ClientInfo{Hostname: stored.OwnerClientID, Capabilities: &caps},
 		conn:        serverWS,
 		proxies:     make(map[string]*ProxyTunnel),

@@ -14,6 +14,7 @@ import { useMemo, useState } from 'react';
 import { ConfirmDialog } from '@/components/custom/common/ConfirmDialog';
 import toast from 'react-hot-toast';
 import { useTranslation } from 'react-i18next';
+import type { ResourceScope } from '@/lib/resource-scope';
 
 function sortClientsForDashboard(clients: Client[] | undefined) {
   return [...(clients ?? [])].sort((a, b) => {
@@ -292,10 +293,10 @@ export function DashboardClientTableContent({
   );
 }
 
-export function DashboardClientTable() {
+export function DashboardClientTable({ scope }: { scope: ResourceScope }) {
   const { t } = useTranslation();
-  const { data: clients, isLoading } = useClients();
-  const deleteClient = useDeleteClient();
+  const { data: clients, isLoading } = useClients(scope);
+  const deleteClient = useDeleteClient(scope);
   const navigate = useNavigate();
   const { openAddClientDialog } = useAddClientDialog();
   const [deleteTarget, setDeleteTarget] = useState<Client | null>(null);
@@ -309,6 +310,13 @@ export function DashboardClientTable() {
       <DashboardClientTableContent
         clients={clients}
         onNavigate={(clientId) => {
+          if (scope.kind === 'admin-user') {
+            navigate({
+              to: '/dashboard/users/$userId/clients/$clientId',
+              params: { userId: scope.userId, clientId },
+            });
+            return;
+          }
           navigate({ to: '/dashboard/clients/$clientId', params: { clientId } });
         }}
         onDelete={setDeleteTarget}

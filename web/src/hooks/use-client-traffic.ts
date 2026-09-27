@@ -1,5 +1,7 @@
 import { useQuery } from '@tanstack/react-query';
 import { api } from '@/lib/api';
+import { scopedClientPath } from '@/lib/api';
+import { scopedQueryKey, type ResourceScope } from '@/lib/resource-scope';
 import type { ClientTrafficRange, ClientTrafficResponse, TrafficResolution } from '@/types';
 
 export interface UseClientTrafficOptions {
@@ -33,14 +35,16 @@ const TRAFFIC_RANGE_CONFIG: Record<
 };
 
 export function buildClientTrafficQueryKey(
+  scope: ResourceScope,
   clientId: string | undefined,
   range: ClientTrafficRange,
   options: UseClientTrafficOptions = {},
 ) {
-  return ['client-traffic', clientId, range, options.tunnel ?? ''] as const;
+  return scopedQueryKey(scope, 'client-traffic', clientId, range, options.tunnel ?? '');
 }
 
 export function buildClientTrafficUrl(
+  scope: ResourceScope,
   clientId: string,
   range: ClientTrafficRange,
   options: UseClientTrafficOptions = {},
@@ -61,10 +65,11 @@ export function buildClientTrafficUrl(
     params.set('tunnel', options.tunnel);
   }
 
-  return `/api/clients/${encodeURIComponent(clientId)}/traffic?${params.toString()}`;
+  return `${scopedClientPath(scope, clientId, '/traffic')}?${params.toString()}`;
 }
 
 export function useClientTraffic(
+  scope: ResourceScope,
   clientId: string | undefined,
   range: ClientTrafficRange,
   options: UseClientTrafficOptions = {},
@@ -72,14 +77,14 @@ export function useClientTraffic(
   const config = TRAFFIC_RANGE_CONFIG[range];
 
   return useQuery({
-    queryKey: buildClientTrafficQueryKey(clientId, range, options),
+    queryKey: buildClientTrafficQueryKey(scope, clientId, range, options),
     enabled: Boolean(clientId),
     queryFn: async () => {
       if (!clientId) {
         throw new Error('clientId is required to load traffic data');
       }
 
-      return api.get<ClientTrafficResponse>(buildClientTrafficUrl(clientId, range, options));
+      return api.get<ClientTrafficResponse>(buildClientTrafficUrl(scope, clientId, range, options));
     },
     staleTime: 30_000,
     refetchInterval: config.refetchInterval,

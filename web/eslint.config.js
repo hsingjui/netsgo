@@ -19,8 +19,10 @@ export default defineConfig([
     },
   },
   {
+    // toggle.tsx / toggle-group.tsx are vendored shadcn sources relocated out
+    // of components/ui per repo policy; keep the same lint treatment.
     files: ['src/**/*.{ts,tsx}'],
-    ignores: ['src/routes/**/*', 'src/components/ui/**/*'],
+    ignores: ['src/routes/**/*', 'src/components/ui/**/*', 'src/components/custom/toggle.tsx', 'src/components/custom/toggle-group.tsx'],
     extends: [
       reactHooks.configs.flat.recommended,
     ],

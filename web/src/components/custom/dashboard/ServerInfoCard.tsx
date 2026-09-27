@@ -11,6 +11,7 @@ import {
   HoverCardTrigger,
 } from "@/components/ui/hover-card"
 import { useTranslation } from 'react-i18next';
+import type { ResourceScope } from '@/lib/resource-scope';
 
 function ProgressBar({ value, label, total, colorClass = "bg-primary" }: { value: number, label: string, total?: string, colorClass?: string }) {
   return (
@@ -26,7 +27,7 @@ function ProgressBar({ value, label, total, colorClass = "bg-primary" }: { value
   );
 }
 
-export function ServerInfoCard() {
+export function ServerInfoCard({ scope }: { scope?: ResourceScope }) {
   const { t } = useTranslation();
   const { data: status, isLoading } = useServerStatus();
   const [now] = useState(() => Date.now());
@@ -92,14 +93,15 @@ export function ServerInfoCard() {
           <span className="font-medium text-sm truncate" title={status?.go_version}>{status?.go_version || '-'}</span>
           <span className="group/version-update inline-flex min-w-0 items-center gap-1.5 text-xs text-muted-foreground">
             <span className="truncate">{status?.version || '-'}</span>
-            <VersionUpdateIndicator
+            {scope ? <VersionUpdateIndicator
+              scope={scope}
               target={{
                 kind: 'server',
                 version: status?.version,
                 installMethod: status?.update_capability?.install_method,
               }}
               label={t('admin.serverVersion')}
-            />
+            /> : null}
           </span>
         </div>
       </div>

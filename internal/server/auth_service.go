@@ -1,6 +1,9 @@
 package server
 
 import (
+	"os"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -12,37 +15,140 @@ import (
 //
 // Other files in the same package access it via s.auth.*; no interface is exposed externally.
 type AuthService struct {
-	adminStore    *AdminStore
-	loginLimiter  *RateLimiter
-	clientLimiter *RateLimiter
-	mfaLimiter    *mfaAttemptLimiter
-	authTimeout   time.Duration
+	adminStore                   *AdminStore
+	loginLimiter                 *RateLimiter
+	clientLimiterMu              sync.RWMutex
+	clientLimiter                *RateLimiter
+	clientRateLimits             ClientAuthRateLimitSettings
+	clientRateLimitUpdateMu      sync.Mutex
+	clientRateLimitAfterSaveHook func()
+	mfaLimiter                   *mfaAttemptLimiter
+	passkeyBeginLimiter          *RateLimiter
+	authTimeout                  time.Duration
 }
 
 // newAuthService creates an empty AuthService (fields are populated during Start()).
 func newAuthService() *AuthService {
-	return &AuthService{}
+	return &AuthService{
+		clientRateLimits: ClientAuthRateLimitSettings{RequestsPerMinute: defaultClientAuthRateLimitPerMinute},
+	}
+}
+
+// defaultLoginRateLimitMaxRequests is the per-IP login request cap per minute.
+const defaultLoginRateLimitMaxRequests = 10
+
+// loginRateLimitMaxRequests returns the per-IP login request cap. The default
+// preserves the production brute-force protection; NETSGO_LOGIN_RATE_LIMIT_MAX
+// lets shared-IP test environments (E2E suites whose browser traffic arrives
+// from one gateway IP) raise the cap without weakening the default.
+func loginRateLimitMaxRequests() int {
+	raw := strings.TrimSpace(os.Getenv("NETSGO_LOGIN_RATE_LIMIT_MAX"))
+	if raw == "" {
+		return defaultLoginRateLimitMaxRequests
+	}
+	parsed, err := strconv.Atoi(raw)
+	if err != nil || parsed < 1 {
+		return defaultLoginRateLimitMaxRequests
+	}
+	return parsed
 }
 
 // initRateLimiters initializes the server's rate limiters.
-func (a *AuthService) initRateLimiters() {
+func (a *AuthService) initRateLimiters(clientSettings ClientAuthRateLimitSettings) {
 	a.loginLimiter = NewRateLimiter(RateLimiterConfig{
 		WindowSize:      time.Minute,
-		MaxRequests:     10,
+		MaxRequests:     loginRateLimitMaxRequests(),
 		MaxFailures:     5,
 		LockoutPeriod:   15 * time.Minute,
 		CleanupInterval: 10 * time.Minute,
 	})
 
-	a.clientLimiter = NewRateLimiter(RateLimiterConfig{
+	a.replaceClientRateLimiter(clientSettings)
+	a.mfaLimiter = newMFAAttemptLimiter(time.Minute, 10, 5*time.Minute)
+	a.passkeyBeginLimiter = NewRateLimiter(RateLimiterConfig{
 		WindowSize:      time.Minute,
-		MaxRequests:     20,
-		MaxFailures:     10,
-		LockoutPeriod:   15 * time.Minute,
+		MaxRequests:     adminPasskeyLoginBeginRateLimit,
 		CleanupInterval: 10 * time.Minute,
 	})
+}
 
-	a.mfaLimiter = newMFAAttemptLimiter(time.Minute, 10, 5*time.Minute)
+func newClientAuthRateLimiter(settings ClientAuthRateLimitSettings) *RateLimiter {
+	if !settings.Enabled {
+		return nil
+	}
+	return NewRateLimiter(RateLimiterConfig{
+		WindowSize:      time.Minute,
+		MaxRequests:     settings.RequestsPerMinute,
+		CleanupInterval: 10 * time.Minute,
+	})
+}
+
+func (a *AuthService) replaceClientRateLimiter(settings ClientAuthRateLimitSettings) {
+	next := newClientAuthRateLimiter(settings)
+	a.clientLimiterMu.Lock()
+	previous := a.clientLimiter
+	a.clientLimiter = next
+	a.clientRateLimits = settings
+	a.clientLimiterMu.Unlock()
+	if previous != nil {
+		previous.Stop()
+	}
+}
+
+func (a *AuthService) updateClientRateLimitSettingsWithActivity(settings ClientAuthRateLimitSettings, actor ActivityActor) (int64, error) {
+	a.clientRateLimitUpdateMu.Lock()
+	defer a.clientRateLimitUpdateMu.Unlock()
+
+	activityID, err := a.adminStore.UpdateClientAuthRateLimitSettingsWithActivity(settings, actor)
+	if err != nil {
+		return 0, err
+	}
+	if a.clientRateLimitAfterSaveHook != nil {
+		a.clientRateLimitAfterSaveHook()
+	}
+	a.replaceClientRateLimiter(settings)
+	return activityID, nil
+}
+
+func (a *AuthService) clientRateLimitSnapshot(now time.Time) (ClientAuthRateLimitSettings, []RateLimitSnapshot) {
+	a.clientLimiterMu.RLock()
+	defer a.clientLimiterMu.RUnlock()
+	settings := a.clientRateLimits
+	if a.clientLimiter == nil {
+		return settings, []RateLimitSnapshot{}
+	}
+	return settings, a.clientLimiter.Snapshot(now)
+}
+
+func (a *AuthService) allowClientAuthentication(ip string) (bool, time.Duration) {
+	a.clientLimiterMu.RLock()
+	defer a.clientLimiterMu.RUnlock()
+	if a.clientLimiter == nil {
+		return true, 0
+	}
+	return a.clientLimiter.Allow(ip)
+}
+
+func (a *AuthService) deleteClientRateLimit(ip string) bool {
+	a.clientLimiterMu.RLock()
+	defer a.clientLimiterMu.RUnlock()
+	return a.clientLimiter != nil && a.clientLimiter.Delete(ip)
+}
+
+func (a *AuthService) stopRateLimiters() {
+	if a.loginLimiter != nil {
+		a.loginLimiter.Stop()
+	}
+	if a.passkeyBeginLimiter != nil {
+		a.passkeyBeginLimiter.Stop()
+	}
+	a.clientLimiterMu.Lock()
+	clientLimiter := a.clientLimiter
+	a.clientLimiter = nil
+	a.clientLimiterMu.Unlock()
+	if clientLimiter != nil {
+		clientLimiter.Stop()
+	}
 }
 
 type mfaAttemptLimiter struct {

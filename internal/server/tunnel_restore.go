@@ -40,15 +40,29 @@ func (s *Server) restoreTunnelPlaceholderIfCurrent(
 		return false
 	}
 
-	releaseRuntimeOperation := s.tunnelRuntimeOps.lock(tunnelRuntimeOperationKey(stored.ID, ownerClientID, stored.Name))
-	defer releaseRuntimeOperation()
-
 	current, err := s.store.GetTunnelByIDE(ownerClientID, stored.ID)
 	if err != nil || !storedTunnelMatchesRestoreSnapshot(current, stored) {
 		return false
 	}
 	if s.restorePlaceholderBeforeInstallHook != nil {
 		s.restorePlaceholderBeforeInstallHook(stored, action)
+	}
+	releaseOwnerGate := func() {}
+	if client.OwnerUserID != "" {
+		_, release, gateErr := s.acquireUserLifecycleRead(client.OwnerUserID, client.OwnerEpoch, true)
+		if gateErr != nil {
+			return false
+		}
+		releaseOwnerGate = release
+	}
+	defer releaseOwnerGate()
+	s.clientTunnelMutationMu.Lock()
+	defer s.clientTunnelMutationMu.Unlock()
+	releaseRuntimeOperation := s.tunnelRuntimeOps.lock(tunnelRuntimeOperationKey(stored.ID, ownerClientID, stored.Name))
+	defer releaseRuntimeOperation()
+	if currentClient, ok := s.clients.Load(client.ID); !ok || currentClient != client ||
+		!client.isLive() || !s.clientLifecycleCurrentLocked(client) {
+		return false
 	}
 	current, err = s.store.GetTunnelByIDE(ownerClientID, stored.ID)
 	if err != nil || !storedTunnelMatchesRestoreSnapshot(current, stored) {
@@ -138,7 +152,7 @@ func (s *Server) restoreTunnels(client *ClientConn) {
 		return
 	}
 	if len(tunnels) == 0 {
-		s.reconcileNonOwnerTunnelsForClient(client.ID, "restore_related")
+		s.reconcileNonOwnerTunnelsForClientGeneration(client, "restore_related")
 		return
 	}
 
@@ -174,7 +188,7 @@ func (s *Server) restoreTunnels(client *ClientConn) {
 		switch st.DesiredState {
 		case protocol.ProxyDesiredStateRunning:
 			log.Printf("🔄 restoring tunnel: %s (:%d → %s:%d)", st.Name, st.RemotePort, st.LocalIP, st.LocalPort)
-			if err := s.reconcileUnifiedTunnel(st.ID, "restore"); err != nil {
+			if err := s.reconcileUnifiedTunnelForClientGeneration(client, st.ID, "restore"); err != nil {
 				log.Printf("⚠️ failed to restore tunnel [%s]: %v", st.Name, err)
 				continue
 			}
@@ -190,11 +204,13 @@ func (s *Server) restoreTunnels(client *ClientConn) {
 	}
 
 	if restoredCount > 0 && s.isCurrentLive(client.ID, client.generation) {
-		s.events.PublishJSON("tunnel_changed", map[string]any{
-			"client_id": client.ID,
-			"action":    "restored_batch",
-			"count":     restoredCount,
+		s.withClientRuntimePublication(client, func() {
+			s.events.PublishScopedJSON("tunnel_changed", client.OwnerUserID, map[string]any{
+				"client_id": client.ID,
+				"action":    "restored_batch",
+				"count":     restoredCount,
+			})
 		})
 	}
-	s.reconcileNonOwnerTunnelsForClient(client.ID, "restore_related")
+	s.reconcileNonOwnerTunnelsForClientGeneration(client, "restore_related")
 }

@@ -75,9 +75,14 @@ async function expectDashboardShell(page: Page) {
 }
 
 export async function login(page: Page) {
+  await loginAs(page, e2eConfig.adminUser, e2eConfig.adminPass);
+  await expect(page.getByText('Runtime status', { exact: true })).toBeVisible();
+}
+
+export async function loginAs(page: Page, username: string, password: string) {
   await gotoWhenReady(page, '/#/login');
-  await page.getByPlaceholder('Enter username').fill(e2eConfig.adminUser);
-  await page.getByPlaceholder('Enter password').fill(e2eConfig.adminPass);
+  await page.getByPlaceholder('Enter user account').fill(username);
+  await page.getByPlaceholder('Enter password').fill(password);
   await page.getByRole('button', { name: 'Log in', exact: true }).click();
   await expectDashboardShell(page);
 }
@@ -146,7 +151,15 @@ export async function waitForClientPair(page: Page): Promise<ClientPair> {
 }
 
 export async function openCreateTunnelDialog(page: Page, clientID: string) {
-  await page.goto(e2eURL(`/#/dashboard/clients/${clientID}`));
+  const principalResponse = await page.request.get(e2eURL('/api/auth/me'));
+  if (!principalResponse.ok()) {
+    throw new Error(`fetch current user failed: ${principalResponse.status()} ${await principalResponse.text()}`);
+  }
+  const principal = await principalResponse.json() as { id: string; is_admin: boolean };
+  const clientPath = principal.is_admin
+    ? `/#/dashboard/users/${encodeURIComponent(principal.id)}/clients/${encodeURIComponent(clientID)}`
+    : `/#/dashboard/clients/${encodeURIComponent(clientID)}`;
+  await page.goto(e2eURL(clientPath));
   await expect(page.getByText('Child tunnels')).toBeVisible();
   await page.getByRole('button', { name: 'Add tunnel' }).click();
   const dialog = page.getByRole('dialog', { name: 'Create proxy tunnel' });
@@ -193,6 +206,19 @@ export async function waitForTunnelMissing(page: Page, name: string) {
     const tunnels = await fetchTunnels(page);
     return tunnels.some((item) => item.name === name) ? 'present' : 'missing';
   }, { timeout: 30_000 }).toBe('missing');
+}
+
+export async function deleteTunnelByName(page: Page, name: string) {
+  const tunnel = (await fetchTunnels(page)).find((item) => item.name === name);
+  if (!tunnel) {
+    return;
+  }
+
+  const response = await page.request.delete(e2eURL(`/api/tunnels/${encodeURIComponent(tunnel.id)}`));
+  if (!response.ok() && response.status() !== 404) {
+    throw new Error(`delete tunnel ${name} failed: ${response.status()} ${await response.text()}`);
+  }
+  await waitForTunnelMissing(page, name);
 }
 
 export function tunnelRow(page: Page, name: string) {
@@ -257,22 +283,102 @@ export async function sendUDP(host: string, port: number, message: string) {
   const socket = dgram.createSocket('udp4');
   try {
     return await new Promise<string>((resolve, reject) => {
-      const timeout = setTimeout(() => {
-        reject(new Error(`timed out waiting for UDP response from ${host}:${port}`));
-      }, 10_000);
-      socket.once('message', (payload) => {
-        clearTimeout(timeout);
-        resolve(payload.toString('utf8'));
-      });
-      socket.once('error', (err) => {
-        clearTimeout(timeout);
+      const timeoutMs = 10_000;
+      const resendIntervalMs = 250;
+      const deadline = Date.now() + timeoutMs;
+      const payload = Buffer.from(message);
+      let resendTimer: ReturnType<typeof setTimeout> | undefined;
+      let settled = false;
+
+      const cleanup = () => {
+        if (resendTimer) {
+          clearTimeout(resendTimer);
+        }
+        socket.removeListener('message', onMessage);
+        socket.removeListener('error', onError);
+      };
+      const finishResolve = (value: string) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        cleanup();
+        resolve(value);
+      };
+      const finishReject = (err: Error) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        cleanup();
         reject(err);
-      });
-      socket.send(Buffer.from(message), port, host);
+      };
+      function onMessage(response: Buffer) {
+        finishResolve(response.toString('utf8'));
+      }
+      function onError(err: Error) {
+        finishReject(err);
+      }
+      const send = () => {
+        if (settled) {
+          return;
+        }
+        const remainingMs = deadline - Date.now();
+        if (remainingMs <= 0) {
+          finishReject(new Error(`timed out waiting for UDP response from ${host}:${port}`));
+          return;
+        }
+        socket.send(payload, port, host, (err) => {
+          if (err) {
+            finishReject(err);
+          }
+        });
+        resendTimer = setTimeout(send, Math.min(resendIntervalMs, remainingMs));
+      };
+
+      socket.on('message', onMessage);
+      socket.on('error', onError);
+      send();
     });
   } finally {
     socket.close();
   }
+}
+
+async function udpPortResponds(host: string, port: number) {
+  const socket = dgram.createSocket('udp4');
+  return await new Promise<boolean>((resolve) => {
+    let settled = false;
+    const finish = (responded: boolean) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timeout);
+      socket.close();
+      resolve(responded);
+    };
+    const timeout = setTimeout(() => finish(false), 500);
+    socket.once('message', () => finish(true));
+    socket.once('error', () => finish(false));
+    socket.send(Buffer.from(`netsgo-cleanup-${Date.now()}`), port, host, (err) => {
+      if (err) {
+        finish(false);
+      }
+    });
+  });
+}
+
+export async function expectUDPUnavailable(host: string, port: number) {
+  let consecutiveUnavailable = 0;
+  await expect.poll(async () => {
+    if (await udpPortResponds(host, port)) {
+      consecutiveUnavailable = 0;
+      return 'reachable';
+    }
+    consecutiveUnavailable += 1;
+    return consecutiveUnavailable >= 3 ? 'unreachable' : 'reachable';
+  }, { timeout: 30_000 }).toBe('unreachable');
 }
 
 export async function captureArtifact(locator: Locator, testInfo: TestInfo, name: string) {

@@ -1,34 +1,4 @@
-
 # NetsGo Agent Guide
-
-
-Top expert. Accuracy beats approval. Blunt, argumentative. No disclaimers
-or praise. Lead with counterarguments. Don't capitulate without new
-evidence.
-
-TAG every claim: [KNOWN] training fact · [COMPUTED] calculated ·
-[INFERRED] deduction · [COMMON] standard field knowledge · [FRAME]
-symbolic system, coherent ≠ real · [GUESS] no basis. No untagged disease,
-statute, citation, or named entity.
-
-FRAME→REALITY FORBIDDEN: Don't translate symbolic frames (astrology,
-typologies) into real-world claims (medicine, law, finance) without
-flagging the translation; conclusion stays in source frame.
-
-CONFIDENCE: HIGH ≥80% · MED 50–80% · LOW 20–50% · VERY LOW <20% ·
-UNKNOWN. [FRAME] real-world and [GUESS] cap at LOW.
-
-DON'T KNOW: First line "I don't know." Don't bury, don't fabricate.
-
-ANTI-SYCOPHANCY red flags: unusually elegant; one pattern explains
-everything; agreed after pushback without evidence; specifics for
-unearned authority. Fire → cut specifics, add [GUESS], or "I don't know."
-
-POST-HOC: Would the frame predict this without knowing the outcome? If
-no: [INFERRED, post-hoc], accommodates, doesn't predict.
-
-Never fabricate citations. Revise openly if holding a position for
-consistency. Append "[RULES I BROKE]: which, where, why."
 
 使用中文沟通。
 
@@ -65,11 +35,11 @@ consistency. Append "[RULES I BROKE]: which, where, why."
 ## 仓库地图
 
 - `cmd/netsgo/`：CLI 入口与各子命令。
-- `internal/server/`：服务端核心；包含 API、认证、会话、SSE、隧道、数据通道。
+- `internal/server/`：服务端核心；包含 API、认证、会话、SSE、隧道、数据通道。详见 `internal/server/AGENTS.md`。
 - `internal/client/`：客户端核心；包含连接、探针、隧道执行、重连。
 - `pkg/protocol/`：双端共享协议、消息体、类型定义。
 - `pkg/mux/`：`WSConn`、`yamux` 适配、UDP 帧封装。
-- `web/`：前端工程。
+- `web/`：前端工程。详见 `web/src/AGENTS.md`。
   - `web/src/lib/`：API 封装、路由、工具函数。
   - `web/src/hooks/`：查询、事件流、状态相关 hooks。
   - `web/src/stores/`：Zustand 状态。

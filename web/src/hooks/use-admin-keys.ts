@@ -1,51 +1,51 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import { api } from '@/lib/api';
-import type { APIKey } from '@/types';
+import { scopedKeyApi } from '@/lib/api';
+import { invalidateResourceScope, scopedQueryKey, type ResourceScope } from '@/lib/resource-scope';
 
-export function useAdminKeys() {
+export function useAdminKeys(scope: ResourceScope) {
   return useQuery({
-    queryKey: ['admin-keys'],
-    queryFn: () => api.get<APIKey[]>('/api/admin/keys'),
+    queryKey: scopedQueryKey(scope, 'keys'),
+    queryFn: () => scopedKeyApi.list(scope),
   });
 }
 
-export function useCreateAPIKey() {
+export function useCreateAPIKey(scope: ResourceScope) {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: (data: { name: string; permissions?: string[]; max_uses?: number; expires_in?: string }) =>
-      api.post<{ key: APIKey; raw_key: string; server_addr: string }>('/api/admin/keys', data),
+      scopedKeyApi.create(scope, data),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['admin-keys'] });
+      void invalidateResourceScope(queryClient, scope);
     },
   });
 }
 
-export function useEnableAPIKey() {
+export function useEnableAPIKey(scope: ResourceScope) {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: (id: string) => api.put(`/api/admin/keys/${id}/enable`),
+    mutationFn: (id: string) => scopedKeyApi.enable(scope, id),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['admin-keys'] });
+      void invalidateResourceScope(queryClient, scope);
     },
   });
 }
 
-export function useDisableAPIKey() {
+export function useDisableAPIKey(scope: ResourceScope) {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: (id: string) => api.put(`/api/admin/keys/${id}/disable`),
+    mutationFn: (id: string) => scopedKeyApi.disable(scope, id),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['admin-keys'] });
+      void invalidateResourceScope(queryClient, scope);
     },
   });
 }
 
-export function useDeleteAPIKey() {
+export function useDeleteAPIKey(scope: ResourceScope) {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: (id: string) => api.delete(`/api/admin/keys/${id}`),
+    mutationFn: (id: string) => scopedKeyApi.delete(scope, id),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['admin-keys'] });
+      void invalidateResourceScope(queryClient, scope);
     },
   });
 }

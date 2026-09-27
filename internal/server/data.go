@@ -31,7 +31,10 @@ func (s *Server) handleDataWS(w http.ResponseWriter, r *http.Request) {
 		log.Printf("❌ data channel WebSocket upgrade failed: %v", err)
 		return
 	}
-	release := s.trackManagedConn(conn)
+	release, accepted := s.trackManagedConn(conn)
+	if !accepted {
+		return
+	}
 	defer release()
 	defer func() { _ = conn.Close() }()
 
@@ -96,11 +99,40 @@ func (s *Server) handleDataWS(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
+	// The data token proves possession of a pending logical session, not that
+	// its current owner is still permitted to operate. Check that policy at the
+	// last possible point before the handshake grants a yamux data plane.
+	_, releaseOwnerGate, err := s.acquireUserLifecycleRead(client.OwnerUserID, client.OwnerEpoch, true)
+	if err != nil {
+		log.Printf("❌ data channel: owner is not operational [%s]: %v", clientID, err)
+		_ = s.invalidateLogicalSessionIfCurrent(clientID, generation, "owner_not_operational")
+		if writeErr := s.writeDataHandshakeResult(conn, protocol.DataHandshakeAuthFail); writeErr != nil {
+			log.Printf("❌ data channel owner rejection response write failed: %v", writeErr)
+		}
+		return
+	}
+	s.clientTunnelMutationMu.Lock()
+	current, currentOK := s.clients.Load(clientID)
+	publicationCurrent := currentOK && current == client && client.generation == generation &&
+		client.getState() != clientStateClosing && s.clientLifecycleCurrentLocked(client) &&
+		client.dataToken != "" && subtle.ConstantTimeCompare([]byte(client.dataToken), []byte(dataToken)) == 1
+	if !publicationCurrent {
+		s.clientTunnelMutationMu.Unlock()
+		releaseOwnerGate()
+		if writeErr := s.writeDataHandshakeResult(conn, protocol.DataHandshakeAuthFail); writeErr != nil {
+			log.Printf("❌ data channel stale session response write failed: %v", writeErr)
+		}
+		return
+	}
 
 	if err := s.writeDataHandshakeResult(conn, protocol.DataHandshakeOK); err != nil {
+		s.clientTunnelMutationMu.Unlock()
+		releaseOwnerGate()
 		log.Printf("❌ data channel: write handshake result failed [%s]: %v", clientID, err)
 		return
 	}
+	s.clientTunnelMutationMu.Unlock()
+	releaseOwnerGate()
 
 	if err := conn.SetReadDeadline(time.Time{}); err != nil {
 		log.Printf("❌ data channel: clear read deadline failed [%s]: %v", clientID, err)
@@ -119,31 +151,21 @@ func (s *Server) handleDataWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !s.isCurrentGeneration(clientID, generation) {
+	oldSession, promoted, attached := s.attachDataSessionIfCurrent(client, session)
+	if !attached {
 		_ = session.Close()
 		return
 	}
-
-	client.dataMu.Lock()
-	oldSession := client.dataSession
-	client.dataSession = session
-	client.dataMu.Unlock()
 
 	if oldSession != nil && oldSession != session && !oldSession.IsClosed() {
 		_ = oldSession.Close()
 	}
 
-	promoted := s.promotePendingToLiveIfCurrent(client)
 	if promoted {
-		info := client.GetInfo()
 		log.Printf("🔗 data channel established: Client [%s] generation=%d", clientID, generation)
-		s.events.PublishJSON("client_online", map[string]any{
-			"client_id": client.ID,
-			"info":      info,
-		})
 		go s.restoreTunnels(client)
 	} else {
-		go s.reconcileTunnelsForClient(client.ID, "data_channel_ready")
+		go s.reconcileTunnelsForClientGeneration(client, "data_channel_ready")
 	}
 
 	var streamWG sync.WaitGroup
@@ -197,7 +219,7 @@ func (s *Server) acceptClientOpenedDataStreams(client *ClientConn, session *yamu
 				_ = stream.Close()
 				return
 			}
-			s.handleClientOpenedDataStream(client, stream, header)
+			s.handleClientOpenedDataStreamForSession(client, session, stream, header)
 		}()
 	}
 }

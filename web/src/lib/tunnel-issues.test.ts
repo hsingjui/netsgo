@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from 'bun:test';
+import { afterEach, describe, expect, test } from 'vitest';
 
 import { i18n } from '@/i18n';
 import { formatTunnelIssueMessage, formatTunnelIssueTooltipLine } from './tunnel-issues';

@@ -180,6 +180,28 @@ func assertTunnelBandwidthFields(t testing.TB, tunnelPayload map[string]any, ing
 
 func mustCreateSession(t testing.TB, store *AdminStore, userID, username, role, remoteAddr, userAgent string) *AdminSession {
 	t.Helper()
+	// Pre-unified-identity tests used a fixed "user-1" fixture ID. The
+	// initialized user now receives a generated ID, so resolve the existing
+	// fixture by username before creating a foreign-key-backed session.
+	if user, err := store.GetUser(userID); err == nil {
+		userID, username, role = user.ID, user.Username, user.Role
+	} else {
+		page, listErr := store.ListUsers(UserListOptions{Query: username, Limit: maxUserListLimit})
+		if listErr != nil {
+			t.Fatalf("list users while resolving session fixture: %v", listErr)
+		}
+		resolved := false
+		for _, candidate := range page.Items {
+			if candidate.Username == username {
+				userID, username, role = candidate.ID, candidate.Username, candidate.Role
+				resolved = true
+				break
+			}
+		}
+		if !resolved {
+			t.Fatalf("resolve session fixture user %q (%q): %v", userID, username, err)
+		}
+	}
 	session, err := store.CreateSession(userID, username, role, remoteAddr, userAgent)
 	if err != nil {
 		t.Fatalf("create session failed: %v", err)

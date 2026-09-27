@@ -1,0 +1,23 @@
+# golangci-lint v2 配置
+# CI 使用版本: v2.11 (golangci/golangci-lint-action@v9)
+version: "2"
+
+run:
+  timeout: 5m
+
+linters:
+  # 使用默认 standard 集合，与 CI 无配置文件时行为一致
+  default: standard
+  exclusions:
+    generated: lax
+    presets:
+      - common-false-positives
+    rules:
+      - path: _test\.go
+        linters:
+          - errcheck
+          - gosec
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0

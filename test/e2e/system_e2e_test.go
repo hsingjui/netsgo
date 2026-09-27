@@ -5,6 +5,7 @@ package e2e_test
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -49,6 +50,7 @@ type systemHarness struct {
 	composeEnv              []string
 	baseURL                 string
 	directBaseURL           string
+	probeMode               string
 	managementHost          string
 	tunnelHost              string
 	directTunnelHost        string
@@ -70,6 +72,7 @@ type systemHarness struct {
 	c2cSOCKS5AuthPort       int
 	c2cSOCKS5SourceDenyPort int
 	adminToken              string
+	clientKey               string
 	targetClientID          string
 	ingressClientID         string
 	c2cTransportPolicy      string
@@ -148,7 +151,7 @@ func TestSystemE2E(t *testing.T) {
 		h.expectTunnelNoIssues(t, httpDirectTunnel.ID)
 		h.expectHTTPContainsAt(t, h.directBaseURL, h.directTunnelHost, backendResponse, 60*time.Second)
 
-		h.compose(t, h.composeEnv, "restart", "proxy")
+		h.restartService(t, "proxy")
 		h.expectHTTPContainsAt(t, h.baseURL, h.tunnelHost, backendResponse, 90*time.Second)
 	})
 
@@ -164,16 +167,24 @@ func TestSystemE2E(t *testing.T) {
 	t.Run("TCP and UDP server_expose reach target client backends", func(t *testing.T) {
 		serverTCP = h.createTCPServerExposeTunnel(t, "system-tcp-server", h.serverTCPPort, backendHost, backendPort)
 		serverUDP = h.createUDPServerExposeTunnel(t, "system-udp-server", h.serverUDPPort, udpBackendHost, udpBackendPort)
-		largeTCP = h.createTCPServerExposeTunnel(t, "system-tcp-large-echo", h.serverTCPAltPort, backendEchoHost, backendEchoPort)
+		if getenvBool("NETSGO_E2E_SKIP_LARGE_UPLOAD") {
+			t.Log("skipping 1 MiB raw TCP upload: selected compatibility baseline does not guarantee this post-reconnect behavior")
+		} else {
+			largeTCP = h.createTCPServerExposeTunnel(t, "system-tcp-large-echo", h.serverTCPAltPort, backendEchoHost, backendEchoPort)
+		}
 		h.waitTunnelState(t, serverTCP.ID, "active", 90*time.Second)
 		h.waitTunnelState(t, serverUDP.ID, "active", 90*time.Second)
-		h.waitTunnelState(t, largeTCP.ID, "active", 90*time.Second)
 		h.expectTunnelNoIssues(t, serverTCP.ID)
 		h.expectTunnelNoIssues(t, serverUDP.ID)
-		h.expectTunnelNoIssues(t, largeTCP.ID)
+		if largeTCP.ID != "" {
+			h.waitTunnelState(t, largeTCP.ID, "active", 90*time.Second)
+			h.expectTunnelNoIssues(t, largeTCP.ID)
+		}
 		h.expectTCPHTTPContains(t, h.serverTCPPort, backendHost, backendResponse)
 		h.expectUDPEcho(t, h.serverUDPPort, []byte("system server udp probe"), 30*time.Second)
-		h.expectLargeTCPUpload(t, h.serverTCPAltPort, 1<<20, 60*time.Second)
+		if largeTCP.ID != "" {
+			h.expectLargeTCPUpload(t, h.serverTCPAltPort, 1<<20, 60*time.Second)
+		}
 	})
 
 	t.Run("SOCKS5 server_expose CONNECT reaches target client backend", func(t *testing.T) {
@@ -211,7 +222,7 @@ func TestSystemE2E(t *testing.T) {
 		})
 		h.expectFastTunnelWhileSlowTunnelBusy(t)
 
-		h.compose(t, h.composeEnv, "restart", "ingress-client")
+		h.restartService(t, "ingress-client")
 		h.targetClientID, h.ingressClientID = h.waitForClientPair(t, 90*time.Second)
 		h.waitTunnelState(t, c2cTCP.ID, "active", 90*time.Second)
 		h.waitTunnelState(t, c2cUDP.ID, "active", 90*time.Second)
@@ -256,7 +267,7 @@ func TestSystemE2E(t *testing.T) {
 		h.expectTunnelNoIssues(t, sourceDeny.ID)
 		h.expectSOCKS5SourceRejected(t, h.c2cSOCKS5SourceDenyPort)
 
-		h.compose(t, h.composeEnv, "restart", "target-client")
+		h.restartService(t, "target-client")
 		h.targetClientID, h.ingressClientID = h.waitForClientPair(t, 90*time.Second)
 		h.waitTunnelState(t, c2cSOCKS5.ID, "active", 90*time.Second)
 		h.waitTunnelP2PConnected(t, c2cSOCKS5.ID, 90*time.Second)
@@ -265,14 +276,17 @@ func TestSystemE2E(t *testing.T) {
 	})
 
 	t.Run("server restart restores persisted tunnels and data paths", func(t *testing.T) {
-		requiredTunnels := []tunnelResponse{httpProxyTunnel, httpDirectTunnel, serverTCP, largeTCP, serverUDP, serverSOCKS5, c2cSOCKS5, c2cTCP, c2cUDP}
+		requiredTunnels := []tunnelResponse{httpProxyTunnel, httpDirectTunnel, serverTCP, serverUDP, serverSOCKS5, c2cSOCKS5, c2cTCP, c2cUDP}
+		if largeTCP.ID != "" {
+			requiredTunnels = append(requiredTunnels, largeTCP)
+		}
 		for _, tunnel := range requiredTunnels {
 			if tunnel.ID == "" {
 				t.Fatalf("required persisted tunnel was not created before restart: %+v", tunnel)
 			}
 		}
 
-		h.compose(t, h.composeEnv, "restart", "server")
+		h.restartService(t, "server")
 		h.adminToken = h.waitForAdminToken(t, 90*time.Second)
 		h.targetClientID, h.ingressClientID = h.waitForClientPair(t, 120*time.Second)
 		for _, tunnel := range requiredTunnels {
@@ -285,7 +299,9 @@ func TestSystemE2E(t *testing.T) {
 		h.expectHTTPContainsAt(t, h.baseURL, h.tunnelHost, backendResponse, 90*time.Second)
 		h.expectHTTPContainsAt(t, h.directBaseURL, h.directTunnelHost, backendResponse, 90*time.Second)
 		h.expectTCPHTTPContains(t, h.serverTCPPort, backendHost, backendResponse)
-		h.expectLargeTCPUpload(t, h.serverTCPAltPort, 1<<20, 60*time.Second)
+		if largeTCP.ID != "" {
+			h.expectLargeTCPUpload(t, h.serverTCPAltPort, 1<<20, 60*time.Second)
+		}
 		h.expectUDPEcho(t, h.serverUDPPort, []byte("system server udp after server restart"), 60*time.Second)
 		h.expectSOCKS5HTTPContains(t, h.serverSOCKS5Port, backendHost, backendPort, nil, backendResponse)
 		h.expectSOCKS5HTTPContains(t, h.c2cSOCKS5Port, backendHost, backendPort, nil, backendResponse)
@@ -440,6 +456,9 @@ func TestSystemCapabilityLossReconcileE2E(t *testing.T) {
 }
 
 func TestSystemClientKeyRotationE2E(t *testing.T) {
+	if getenvBool("NETSGO_E2E_SKIP_KEY_ROTATION") {
+		t.Skip("client key rotation requires the current managed-client reauthentication contract")
+	}
 	h := newSystemHarness(t)
 	h.startInfrastructure(t)
 	h.adminToken = h.waitForAdminToken(t, 90*time.Second)
@@ -489,6 +508,10 @@ func newSystemHarness(t *testing.T) *systemHarness {
 	}
 	proxyPort := getenvDefault("PROXY_PORT", "19080")
 	upstreamPort := getenvDefault("UPSTREAM_PORT", "19081")
+	probeMode := getenvDefault("E2E_PROBE_MODE", "host")
+	if probeMode != "host" && probeMode != "internal" {
+		t.Fatalf("E2E_PROBE_MODE must be host or internal, got %q", probeMode)
+	}
 	h := &systemHarness{
 		projectName:             getenvDefault("NETSGO_E2E_COMPOSE_PROJECT", "netsgo-system-e2e"),
 		composeFiles:            splitCSV(filesRaw),
@@ -514,6 +537,7 @@ func newSystemHarness(t *testing.T) *systemHarness {
 		c2cSOCKS5SourceDenyPort: mustAtoi(t, getenvDefault("C2C_SOCKS5_SOURCE_DENY_PORT", "19103")),
 		baseURL:                 fmt.Sprintf("http://127.0.0.1:%s", proxyPort),
 		directBaseURL:           fmt.Sprintf("http://127.0.0.1:%s", upstreamPort),
+		probeMode:               probeMode,
 	}
 	if len(h.composeFiles) == 0 {
 		t.Skip("NETSGO_E2E_COMPOSE_FILES contains no files")
@@ -553,6 +577,7 @@ func (h *systemHarness) startInfrastructure(t *testing.T) {
 
 func (h *systemHarness) startClients(t *testing.T, clientKey string) {
 	t.Helper()
+	h.clientKey = clientKey
 	env := append([]string{}, h.composeEnv...)
 	env = append(env, "NETSGO_CLIENT_KEY="+clientKey)
 	h.compose(t, env, "up", "-d", "--remove-orphans", "target-client", "ingress-client")
@@ -560,9 +585,27 @@ func (h *systemHarness) startClients(t *testing.T, clientKey string) {
 
 func (h *systemHarness) startTargetClient(t *testing.T, clientKey string) {
 	t.Helper()
+	h.clientKey = clientKey
 	env := append([]string{}, h.composeEnv...)
 	env = append(env, "NETSGO_CLIENT_KEY="+clientKey)
 	h.compose(t, env, "up", "-d", "--remove-orphans", "target-client")
+}
+
+func (h *systemHarness) restartService(t *testing.T, service string) {
+	t.Helper()
+	// Recreate the service instead of using `docker compose restart`. The
+	// latter can leave published host ports detached on Docker Desktop/OrbStack
+	// even after the container reports ready, which makes the data-path check
+	// observe a false connection-refused failure. Explicitly removing the old
+	// container forces the runtime to bind the published port again while
+	// preserving named volumes and all other services.
+	env := append([]string{}, h.composeEnv...)
+	if h.clientKey != "" {
+		env = append(env, "NETSGO_CLIENT_KEY="+h.clientKey)
+	}
+	h.compose(t, env, "stop", service)
+	h.compose(t, env, "rm", "-f", service)
+	h.compose(t, env, "up", "-d", "--no-deps", "--remove-orphans", service)
 }
 
 func (h *systemHarness) compose(t *testing.T, env []string, args ...string) {
@@ -596,6 +639,153 @@ func (h *systemHarness) composeOutput(t *testing.T, env []string, args ...string
 		t.Fatalf("docker %v failed: %v\n%s", cmdArgs, err, output)
 	}
 	return output
+}
+
+// runComposeExec executes a command inside a Compose service without going
+// through a published host port.  Docker Desktop and OrbStack can report a
+// recreated container as healthy before the host-side port forward is ready;
+// using the Compose network keeps system E2E focused on the actual protocol
+// path instead of that platform-specific forwarding layer.
+func (h *systemHarness) runComposeExec(env []string, service string, stdin []byte, args ...string) ([]byte, error) {
+	cmdArgs := []string{"compose"}
+	for _, file := range h.composeFiles {
+		cmdArgs = append(cmdArgs, "-f", file)
+	}
+	cmdArgs = append(cmdArgs, "-p", h.projectName, "exec", "-T", service)
+	cmdArgs = append(cmdArgs, args...)
+	cmd := exec.Command("docker", cmdArgs...)
+	cmd.Env = env
+	if stdin != nil {
+		cmd.Stdin = bytes.NewReader(stdin)
+	}
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("docker %v failed: %w: %s", cmdArgs, err, strings.TrimSpace(stderr.String()))
+	}
+	return stdout.Bytes(), nil
+}
+
+const internalHTTPStatusMarker = "\n__NETSGO_STATUS__"
+
+// internalCurl runs curl from the server container.  It returns the HTTP
+// status separately from the response body so callers can keep using the
+// normal *http.Response-shaped test helpers in either probe mode.
+func (h *systemHarness) internalCurl(method, rawURL, host, token string, auth *basicAuth, body []byte, timeout time.Duration, extraArgs ...string) (int, []byte, error) {
+	seconds := int(timeout / time.Second)
+	if timeout%time.Second != 0 {
+		seconds++
+	}
+	if seconds < 1 {
+		seconds = 1
+	}
+	args := []string{
+		"curl",
+		"-sS",
+		"--connect-timeout", strconv.Itoa(seconds),
+		"--max-time", strconv.Itoa(seconds),
+		"-X", method,
+	}
+	if host != "" {
+		args = append(args, "-H", "Host: "+host)
+	}
+	if token != "" {
+		args = append(args, "-H", "Authorization: Bearer "+token)
+	}
+	if auth != nil {
+		args = append(args, "--user", auth.username+":"+auth.password)
+	}
+	if body != nil {
+		args = append(args, "-H", "Content-Type: application/json")
+	}
+	args = append(args, extraArgs...)
+	if body != nil {
+		args = append(args, "--data-binary", "@-")
+	}
+	args = append(args, rawURL, "-w", internalHTTPStatusMarker+"%{http_code}")
+	output, err := h.runComposeExec(h.composeEnv, "server", body, args...)
+	if err != nil {
+		return 0, nil, err
+	}
+	marker := []byte(internalHTTPStatusMarker)
+	idx := bytes.LastIndex(output, marker)
+	if idx < 0 {
+		return 0, nil, fmt.Errorf("curl response missing status marker: %q", output)
+	}
+	status, err := strconv.Atoi(strings.TrimSpace(string(output[idx+len(marker):])))
+	if err != nil {
+		return 0, nil, fmt.Errorf("parse curl HTTP status: %w; output=%q", err, output)
+	}
+	return status, output[:idx], nil
+}
+
+func (h *systemHarness) internalHTTPURL(baseURL string) (string, error) {
+	switch baseURL {
+	case h.baseURL:
+		return "http://proxy/", nil
+	case h.directBaseURL:
+		return "http://server:8080/", nil
+	default:
+		return "", fmt.Errorf("unsupported internal HTTP base URL %q", baseURL)
+	}
+}
+
+func (h *systemHarness) internalDataServiceForPort(port int) string {
+	switch port {
+	case h.c2cSOCKS5Port, h.c2cDenyPort, h.c2cTCPPort, h.c2cTCPAltPort, h.c2cTCPSlowPort, h.c2cUDPPort, h.c2cSOCKS5AuthPort, h.c2cSOCKS5SourceDenyPort:
+		return "ingress-client"
+	default:
+		return "server"
+	}
+}
+
+func shellPrintfBytes(payload []byte) string {
+	var format strings.Builder
+	for _, value := range payload {
+		fmt.Fprintf(&format, "\\%03o", value)
+	}
+	return format.String()
+}
+
+func (h *systemHarness) internalSOCKS5Exchange(proxyPort int, payload []byte) ([]byte, error) {
+	service := h.internalDataServiceForPort(proxyPort)
+	// Keep the shell pipeline's exit status independent from the expected
+	// SOCKS5 rejection (which commonly closes the socket immediately).  The
+	// helpers validate the decoded response bytes and still fail on an empty
+	// response when a reply is required.
+	command := fmt.Sprintf(
+		"tmp=$(mktemp); printf '%s' | socat -T5 - TCP:%s:%d >$tmp; xxd -p -c 256 $tmp; rm -f $tmp",
+		shellPrintfBytes(payload), service, proxyPort,
+	)
+	output, err := h.runComposeExec(h.composeEnv, "server", nil, "sh", "-c", command)
+	if err != nil {
+		return nil, err
+	}
+	encoded := strings.ReplaceAll(strings.TrimSpace(string(output)), "\n", "")
+	if encoded == "" {
+		return nil, nil
+	}
+	decoded, err := hex.DecodeString(encoded)
+	if err != nil {
+		return nil, fmt.Errorf("decode internal SOCKS5 exchange %q: %w", encoded, err)
+	}
+	return decoded, nil
+}
+
+func internalHTTPResponse(method, rawURL string, status int, payload []byte) *http.Response {
+	statusText := http.StatusText(status)
+	if statusText == "" {
+		statusText = "Unknown Status"
+	}
+	return &http.Response{
+		Status:        fmt.Sprintf("%d %s", status, statusText),
+		StatusCode:    status,
+		Header:        make(http.Header),
+		Body:          io.NopCloser(bytes.NewReader(payload)),
+		ContentLength: int64(len(payload)),
+		Request:       &http.Request{Method: method, Host: rawURL},
+	}
 }
 
 func (h *systemHarness) dumpCompose(t *testing.T, args ...string) {
@@ -1143,6 +1333,20 @@ func (h *systemHarness) expectHTTPContains(t *testing.T, host, expected string, 
 func (h *systemHarness) expectHTTPContainsAt(t *testing.T, baseURL, host, expected string, timeout time.Duration) {
 	t.Helper()
 	h.poll(t, timeout, func() (bool, string) {
+		if h.probeMode == "internal" {
+			internalURL, err := h.internalHTTPURL(baseURL)
+			if err != nil {
+				return false, err.Error()
+			}
+			status, payload, err := h.internalCurl(http.MethodGet, internalURL, host, "", nil, nil, 10*time.Second)
+			if err != nil {
+				return false, err.Error()
+			}
+			if status != http.StatusOK {
+				return false, fmt.Sprintf("status=%d body=%s", status, payload)
+			}
+			return bytes.Contains(payload, []byte(expected)), string(payload)
+		}
 		req, err := http.NewRequest(http.MethodGet, baseURL+"/", nil)
 		if err != nil {
 			return false, err.Error()
@@ -1185,6 +1389,17 @@ func (h *systemHarness) expectHTTPStatusAt(t *testing.T, baseURL, host string, a
 }
 
 func (h *systemHarness) doHTTPHostRequest(baseURL, host string, auth *basicAuth) (*http.Response, []byte, error) {
+	if h.probeMode == "internal" {
+		internalURL, err := h.internalHTTPURL(baseURL)
+		if err != nil {
+			return nil, nil, err
+		}
+		status, payload, err := h.internalCurl(http.MethodGet, internalURL, host, "", auth, nil, 10*time.Second)
+		if err != nil {
+			return nil, nil, err
+		}
+		return internalHTTPResponse(http.MethodGet, internalURL, status, payload), payload, nil
+	}
 	req, err := http.NewRequest(http.MethodGet, baseURL+"/", nil)
 	if err != nil {
 		return nil, nil, err
@@ -1217,6 +1432,28 @@ func (h *systemHarness) expectTCPHTTPContains(t *testing.T, port int, host, expe
 }
 
 func (h *systemHarness) requestTCPHTTP(port int, host, expected string, timeout time.Duration) error {
+	if h.probeMode == "internal" {
+		service := h.internalDataServiceForPort(port)
+		status, payload, err := h.internalCurl(
+			http.MethodGet,
+			fmt.Sprintf("http://%s:%d/", service, port),
+			host,
+			"",
+			nil,
+			nil,
+			timeout,
+		)
+		if err != nil {
+			return fmt.Errorf("request TCP ingress port %d through %s: %w", port, service, err)
+		}
+		if status != http.StatusOK {
+			return fmt.Errorf("TCP tunnel status=%d body=%s", status, payload)
+		}
+		if !bytes.Contains(payload, []byte(expected)) {
+			return fmt.Errorf("TCP tunnel response missing %q:\n%s", expected, payload)
+		}
+		return nil
+	}
 	conn, err := net.DialTimeout("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)), 5*time.Second)
 	if err != nil {
 		return fmt.Errorf("dial TCP ingress port %d: %w", port, err)
@@ -1263,6 +1500,22 @@ func deterministicPayload(size int) []byte {
 }
 
 func (h *systemHarness) requestTCPUploadAck(port int, payload []byte, timeout time.Duration) ([]byte, error) {
+	if h.probeMode == "internal" {
+		service := h.internalDataServiceForPort(port)
+		seconds := int(timeout / time.Second)
+		if timeout%time.Second != 0 {
+			seconds++
+		}
+		if seconds < 1 {
+			seconds = 1
+		}
+		got, err := h.runComposeExec(h.composeEnv, "server", payload,
+			"socat", "-T"+strconv.Itoa(seconds), "-,ignoreeof", "TCP:"+service+":"+strconv.Itoa(port))
+		if err != nil {
+			return nil, fmt.Errorf("upload large TCP payload through %s:%d: %w", service, port, err)
+		}
+		return got, nil
+	}
 	conn, err := net.DialTimeout("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)), 5*time.Second)
 	if err != nil {
 		return nil, fmt.Errorf("dial TCP upload ingress port %d: %w", port, err)
@@ -1303,6 +1556,22 @@ func (h *systemHarness) expectUDPEcho(t *testing.T, port int, payload []byte, ti
 }
 
 func (h *systemHarness) requestUDP(port int, payload []byte, timeout time.Duration) ([]byte, error) {
+	if h.probeMode == "internal" {
+		service := h.internalDataServiceForPort(port)
+		seconds := int(timeout / time.Second)
+		if timeout%time.Second != 0 {
+			seconds++
+		}
+		if seconds < 1 {
+			seconds = 1
+		}
+		got, err := h.runComposeExec(h.composeEnv, "server", payload,
+			"socat", "-T"+strconv.Itoa(seconds), "-", "UDP4-DATAGRAM:"+service+":"+strconv.Itoa(port))
+		if err != nil {
+			return nil, fmt.Errorf("request UDP ingress port %d through %s: %w", port, service, err)
+		}
+		return got, nil
+	}
 	conn, err := net.DialTimeout("udp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)), 5*time.Second)
 	if err != nil {
 		return nil, fmt.Errorf("dial UDP ingress port %d: %w", port, err)
@@ -1392,6 +1661,18 @@ func (h *systemHarness) expectFastTunnelWhileSlowTunnelBusy(t *testing.T) {
 }
 
 func (h *systemHarness) holdTCPConnection(port int, duration time.Duration) error {
+	if h.probeMode == "internal" {
+		seconds := int((duration + 3*time.Second) / time.Second)
+		if seconds < 1 {
+			seconds = 1
+		}
+		service := h.internalDataServiceForPort(port)
+		command := fmt.Sprintf("printf 'hold slow tunnel open\\n' | socat -T%d - TCP:%s:%d >/dev/null", seconds, service, port)
+		if _, err := h.runComposeExec(h.composeEnv, "server", nil, "sh", "-c", command); err != nil {
+			return fmt.Errorf("hold slow TCP tunnel through %s:%d: %w", service, port, err)
+		}
+		return nil
+	}
 	conn, err := net.DialTimeout("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)), 5*time.Second)
 	if err != nil {
 		return fmt.Errorf("dial slow TCP ingress port %d: %w", port, err)
@@ -1420,6 +1701,35 @@ func (h *systemHarness) expectSOCKS5HTTPContains(t *testing.T, proxyPort int, ta
 }
 
 func (h *systemHarness) requestSOCKS5HTTP(proxyPort int, targetHost string, targetPort int, creds *socks5Credentials, expected string, timeout time.Duration) error {
+	if h.probeMode == "internal" {
+		service := h.internalDataServiceForPort(proxyPort)
+		extraArgs := []string{
+			"--socks5-hostname", service + ":" + strconv.Itoa(proxyPort),
+		}
+		if creds != nil {
+			extraArgs = append(extraArgs, "--proxy-user", creds.username+":"+creds.password)
+		}
+		status, payload, err := h.internalCurl(
+			http.MethodGet,
+			fmt.Sprintf("http://%s:%d/", targetHost, targetPort),
+			targetHost,
+			"",
+			nil,
+			nil,
+			timeout,
+			extraArgs...,
+		)
+		if err != nil {
+			return fmt.Errorf("request SOCKS5 port %d through %s: %w", proxyPort, service, err)
+		}
+		if status != http.StatusOK {
+			return fmt.Errorf("SOCKS5 HTTP status=%d body=%s", status, payload)
+		}
+		if !bytes.Contains(payload, []byte(expected)) {
+			return fmt.Errorf("SOCKS5 HTTP response missing %q:\n%s", expected, payload)
+		}
+		return nil
+	}
 	conn, err := net.DialTimeout("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(proxyPort)), 5*time.Second)
 	if err != nil {
 		return fmt.Errorf("dial SOCKS5 proxy port %d: %w", proxyPort, err)
@@ -1449,6 +1759,36 @@ func (h *systemHarness) requestSOCKS5HTTP(proxyPort int, targetHost string, targ
 
 func (h *systemHarness) socks5ConnectReply(t *testing.T, proxyPort int, targetHost string, targetPort int, creds *socks5Credentials) byte {
 	t.Helper()
+	if h.probeMode == "internal" {
+		method := socks5wire.MethodNoAuth
+		if creds != nil {
+			method = socks5wire.MethodUsernamePass
+		}
+		payload := []byte{socks5wire.Version, 0x01, method}
+		if creds != nil {
+			payload = append(payload, socks5wire.AuthVersion, byte(len(creds.username)))
+			payload = append(payload, creds.username...)
+			payload = append(payload, byte(len(creds.password)))
+			payload = append(payload, creds.password...)
+		}
+		request, err := buildSOCKS5ConnectRequest(targetHost, targetPort)
+		if err != nil {
+			t.Fatal(err)
+		}
+		payload = append(payload, request...)
+		response, err := h.internalSOCKS5Exchange(proxyPort, payload)
+		if err != nil {
+			t.Fatalf("internal SOCKS5 exchange on port %d: %v", proxyPort, err)
+		}
+		methodBytes := 2
+		if creds != nil {
+			methodBytes += 2 + len(creds.username) + 1 + len(creds.password)
+		}
+		if len(response) < methodBytes+4 {
+			t.Fatalf("internal SOCKS5 response too short: %x", response)
+		}
+		return response[methodBytes+1]
+	}
 	conn, err := net.DialTimeout("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(proxyPort)), 5*time.Second)
 	if err != nil {
 		t.Fatalf("dial SOCKS5 proxy port %d: %v", proxyPort, err)
@@ -1466,6 +1806,16 @@ func (h *systemHarness) socks5ConnectReply(t *testing.T, proxyPort int, targetHo
 
 func (h *systemHarness) expectSOCKS5NoAcceptableMethod(t *testing.T, proxyPort int) {
 	t.Helper()
+	if h.probeMode == "internal" {
+		response, err := h.internalSOCKS5Exchange(proxyPort, []byte{socks5wire.Version, 0x01, socks5wire.MethodNoAuth})
+		if err != nil {
+			t.Fatalf("internal SOCKS5 no-auth exchange on port %d: %v", proxyPort, err)
+		}
+		if !bytes.Equal(response, []byte{socks5wire.Version, socks5wire.MethodNoAcceptable}) {
+			t.Fatalf("SOCKS5 no-auth method should be rejected, got %#v", response)
+		}
+		return
+	}
 	conn, err := net.DialTimeout("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(proxyPort)), 5*time.Second)
 	if err != nil {
 		t.Fatalf("dial SOCKS5 auth proxy port %d: %v", proxyPort, err)
@@ -1488,6 +1838,20 @@ func (h *systemHarness) expectSOCKS5NoAcceptableMethod(t *testing.T, proxyPort i
 
 func (h *systemHarness) expectSOCKS5AuthFailure(t *testing.T, proxyPort int, username, password string) {
 	t.Helper()
+	if h.probeMode == "internal" {
+		payload := []byte{socks5wire.Version, 0x01, socks5wire.MethodUsernamePass, socks5wire.AuthVersion, byte(len(username))}
+		payload = append(payload, username...)
+		payload = append(payload, byte(len(password)))
+		payload = append(payload, password...)
+		response, err := h.internalSOCKS5Exchange(proxyPort, payload)
+		if err != nil {
+			t.Fatalf("internal SOCKS5 auth exchange on port %d: %v", proxyPort, err)
+		}
+		if len(response) < 4 || response[0] != socks5wire.Version || response[1] != socks5wire.MethodUsernamePass || response[2] != socks5wire.AuthVersion || response[3] == 0x00 {
+			t.Fatalf("SOCKS5 wrong credentials should fail, got %#v", response)
+		}
+		return
+	}
 	conn, err := net.DialTimeout("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(proxyPort)), 5*time.Second)
 	if err != nil {
 		t.Fatalf("dial SOCKS5 auth proxy port %d: %v", proxyPort, err)
@@ -1524,6 +1888,20 @@ func (h *systemHarness) expectSOCKS5AuthFailure(t *testing.T, proxyPort int, use
 
 func (h *systemHarness) expectSOCKS5SourceRejected(t *testing.T, proxyPort int) {
 	t.Helper()
+	if h.probeMode == "internal" {
+		service := h.internalDataServiceForPort(proxyPort)
+		if _, err := h.runComposeExec(h.composeEnv, "server", nil, "socat", "-T1", "-", "TCP:"+service+":"+strconv.Itoa(proxyPort)); err != nil {
+			t.Fatalf("internal SOCKS5 source-deny listener on port %d is unavailable: %v", proxyPort, err)
+		}
+		response, err := h.internalSOCKS5Exchange(proxyPort, []byte{socks5wire.Version, 0x01, socks5wire.MethodNoAuth})
+		if err != nil {
+			t.Fatalf("internal SOCKS5 source-deny exchange on port %d: %v", proxyPort, err)
+		}
+		if len(response) != 0 {
+			t.Fatalf("SOCKS5 source CIDR denial should close before negotiation, got response %#v", response)
+		}
+		return
+	}
 	conn, err := net.DialTimeout("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(proxyPort)), 5*time.Second)
 	if err != nil {
 		t.Fatalf("dial SOCKS5 source-deny proxy port %d: %v", proxyPort, err)
@@ -1678,6 +2056,13 @@ func readSOCKS5Reply(conn net.Conn) (byte, error) {
 }
 
 func (h *systemHarness) apiRequest(method, path, token string, body []byte) (*http.Response, error) {
+	if h.probeMode == "internal" {
+		status, payload, err := h.internalCurl(method, "http://proxy"+path, h.managementHost, token, nil, body, 10*time.Second)
+		if err != nil {
+			return nil, err
+		}
+		return internalHTTPResponse(method, "http://proxy"+path, status, payload), nil
+	}
 	var reader io.Reader
 	if body != nil {
 		reader = bytes.NewReader(body)
@@ -1730,6 +2115,11 @@ func getenvDefault(name, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+func getenvBool(name string) bool {
+	value := strings.TrimSpace(strings.ToLower(os.Getenv(name)))
+	return value == "1" || value == "true" || value == "yes"
 }
 
 func mustAtoi(t *testing.T, value string) int {

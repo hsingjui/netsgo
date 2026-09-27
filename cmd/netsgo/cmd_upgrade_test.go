@@ -334,8 +334,9 @@ func TestRunUpgradeCommand_ForceYesSkipsUnknownInstalledVersionConfirmation(t *t
 			gotInstalledVersion = installedVersion
 			gotTargetVersion = targetVersion
 			return &updater.Result{
-				Stopped: []string{"netsgo-server.service"},
-				Started: []string{"netsgo-server.service"},
+				Stopped:    []string{"netsgo-server.service"},
+				Started:    []string{"netsgo-server.service"},
+				BackupPath: "/var/lib/netsgo-upgrade/netsgo.pre-upgrade-v0.0.9",
 			}, nil
 		},
 		currentVersion: "v0.1.0",
@@ -369,6 +370,18 @@ func TestRunUpgradeCommand_ForceYesSkipsUnknownInstalledVersionConfirmation(t *t
 	}
 	if !strings.Contains(output, "已停止: netsgo-server.service") || !strings.Contains(output, "已启动: netsgo-server.service") {
 		t.Fatalf("expected service summary in output, got %q", output)
+	}
+	for _, want := range []string{
+		"旧版本备份: /var/lib/netsgo-upgrade/netsgo.pre-upgrade-v0.0.9",
+		"该备份仅包含二进制",
+		"手动恢复旧二进制:",
+		"sudo systemctl stop netsgo-server.service",
+		"sudo install -m 0755 /var/lib/netsgo-upgrade/netsgo.pre-upgrade-v0.0.9 /usr/local/bin/netsgo",
+		"sudo systemctl start netsgo-server.service",
+	} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("expected %q in rollback guidance, got %q", want, output)
+		}
 	}
 	if stderr.Len() != 0 {
 		t.Fatalf("expected no stderr output, got %q", stderr.String())

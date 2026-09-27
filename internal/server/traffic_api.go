@@ -8,9 +8,21 @@ import (
 )
 
 func (s *Server) handleGetClientTraffic(w http.ResponseWriter, r *http.Request) {
+	scope, scopeOK := requireResourceScope(w, r)
+	if !scopeOK {
+		return
+	}
 	clientID := r.PathValue("id")
 	if clientID == "" {
 		writeAPIError(w, http.StatusBadRequest, "missing_client_id", "missing client id")
+		return
+	}
+	if s.auth == nil || s.auth.adminStore == nil {
+		writeAPIError(w, http.StatusInternalServerError, "admin_store_unavailable", "admin store unavailable")
+		return
+	}
+	if _, ok := s.auth.adminStore.GetRegisteredClientForUser(scope.OwnerUserID, clientID); !ok {
+		writeAPIError(w, http.StatusNotFound, "client_not_found", "client not found")
 		return
 	}
 
@@ -44,11 +56,11 @@ func (s *Server) handleGetClientTraffic(w http.ResponseWriter, r *http.Request) 
 	s.flushTrafficObservations()
 
 	var result TrafficQueryResult
-	knownTunnels := s.knownTrafficTunnels(clientID, tunnelName)
+	knownTunnels := s.knownTrafficTunnelsForUser(scope.OwnerUserID, clientID, tunnelName)
 	if resolution == TrafficResolutionSecond {
-		result, err = s.buildRealtimeTrafficResult(clientID, tunnelName, from, to, knownTunnels)
+		result, err = s.buildRealtimeTrafficResultForUser(scope.OwnerUserID, clientID, tunnelName, from, to, knownTunnels)
 	} else {
-		result, err = s.trafficStore.QueryWithResolution(clientID, tunnelName, from, to, resolution)
+		result, err = s.trafficStore.QueryWithResolutionForUser(scope.OwnerUserID, clientID, tunnelName, from, to, resolution)
 		if err == nil && tunnelName == "" {
 			result = filterTrafficResultByKnownTunnels(result, knownTunnels)
 		}

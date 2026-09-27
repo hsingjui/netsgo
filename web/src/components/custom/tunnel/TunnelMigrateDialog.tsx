@@ -24,8 +24,10 @@ import { useMigrateTunnel } from '@/hooks/use-tunnel-mutations';
 import { getClientDisplayName } from '@/lib/client-utils';
 import { buildTunnelMigrationInput, getTunnelMigrationCandidates } from '@/lib/tunnel-migration';
 import type { Client, ProxyConfig } from '@/types';
+import type { ResourceScope } from '@/lib/resource-scope';
 
 interface TunnelMigrateDialogProps {
+  scope: ResourceScope;
   tunnel: ProxyConfig | null;
   clients?: Client[];
   open: boolean;
@@ -33,13 +35,14 @@ interface TunnelMigrateDialogProps {
 }
 
 export function TunnelMigrateDialog({
+  scope,
   tunnel,
   clients = [],
   open,
   onOpenChange,
 }: TunnelMigrateDialogProps) {
   const { t } = useTranslation();
-  const migrateTunnel = useMigrateTunnel();
+  const migrateTunnel = useMigrateTunnel(scope);
   const [selection, setSelection] = useState({ tunnelId: '', targetClientId: '' });
   const candidates = useMemo(
     () => getTunnelMigrationCandidates(tunnel, clients),

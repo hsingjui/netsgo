@@ -20,9 +20,10 @@ import (
 const testDataToken = "test-data-token-abc123"
 
 type unixDataTestServer struct {
-	httpServer *httptest.Server
-	httpClient *http.Client
-	wsURL      string
+	httpServer  *httptest.Server
+	httpClient  *http.Client
+	wsURL       string
+	ownerUserID string
 }
 
 func newUnixDataTestServer(t *testing.T, handler http.Handler) *unixDataTestServer {
@@ -50,7 +51,13 @@ func (ts *unixDataTestServer) Close() {
 func setupDataWSTest(t *testing.T) (*Server, *unixDataTestServer, func()) {
 	t.Helper()
 	s := New(0)
+	initTestAdminStore(t, s)
+	owner, err := s.auth.adminStore.ValidateAdminPassword("admin", "password123")
+	if err != nil {
+		t.Fatalf("load data test owner: %v", err)
+	}
 	ts := newUnixDataTestServer(t, s.newHTTPMux())
+	ts.ownerUserID = owner.ID
 	return s, ts, ts.Close
 }
 
@@ -94,13 +101,15 @@ func readHandshakeStatus(t *testing.T, conn *websocket.Conn) byte {
 	return payload[0]
 }
 
-func newPendingTestClient(clientID, token string) *ClientConn {
+func newPendingTestClient(clientID, token, ownerUserID string) *ClientConn {
 	return &ClientConn{
-		ID:         clientID,
-		proxies:    make(map[string]*ProxyTunnel),
-		dataToken:  token,
-		generation: 1,
-		state:      clientStatePendingData,
+		ID:          clientID,
+		OwnerUserID: ownerUserID,
+		OwnerEpoch:  1,
+		proxies:     make(map[string]*ProxyTunnel),
+		dataToken:   token,
+		generation:  1,
+		state:       clientStatePendingData,
 	}
 }
 
@@ -109,7 +118,7 @@ func TestDataChannel_HandshakeSuccess(t *testing.T) {
 	defer cleanup()
 
 	clientID := "test-client-123"
-	cc := newPendingTestClient(clientID, testDataToken)
+	cc := newPendingTestClient(clientID, testDataToken, ts.ownerUserID)
 	s.clients.Store(clientID, cc)
 
 	conn := dialDataWS(t, ts)
@@ -132,6 +141,62 @@ func TestDataChannel_HandshakeSuccess(t *testing.T) {
 	}
 	if cc.getState() != clientStateLive {
 		t.Fatalf("State should be promoted to live after successful handshake, got %s", cc.getState())
+	}
+}
+
+func TestDataChannel_HandshakeMissingStoreFailsClosed(t *testing.T) {
+	s := New(0)
+	ts := newUnixDataTestServer(t, s.newHTTPMux())
+	defer ts.Close()
+
+	clientID := "missing-store-client"
+	s.clients.Store(clientID, &ClientConn{
+		ID:          clientID,
+		OwnerUserID: "owner-unavailable",
+		proxies:     make(map[string]*ProxyTunnel),
+		dataToken:   testDataToken,
+		generation:  1,
+		state:       clientStatePendingData,
+	})
+
+	conn := dialDataWS(t, ts)
+	defer mustClose(t, conn)
+	if err := conn.WriteMessage(websocket.BinaryMessage, protocol.EncodeDataHandshake(clientID, testDataToken)); err != nil {
+		t.Fatalf("send handshake: %v", err)
+	}
+	if status := readHandshakeStatus(t, conn); status != protocol.DataHandshakeAuthFail {
+		t.Fatalf("missing store handshake status = 0x%02x, want auth failure", status)
+	}
+	if _, ok := s.clients.Load(clientID); ok {
+		t.Fatal("missing owner store must invalidate the pending logical session")
+	}
+}
+
+func TestDataChannel_HandshakeDisabledOwnerFailsClosed(t *testing.T) {
+	s, ts, cleanup := setupDataWSTest(t)
+	defer cleanup()
+
+	owner, err := s.auth.adminStore.CreateUser("data-disabled-owner", "Password123")
+	if err != nil {
+		t.Fatalf("create disabled-owner fixture: %v", err)
+	}
+	if _, _, err := s.auth.adminStore.SetUserStatus(ts.ownerUserID, owner.ID, UserStatusDisabled); err != nil {
+		t.Fatalf("disable fixture owner: %v", err)
+	}
+
+	clientID := "disabled-owner-client"
+	s.clients.Store(clientID, newPendingTestClient(clientID, testDataToken, owner.ID))
+
+	conn := dialDataWS(t, ts)
+	defer mustClose(t, conn)
+	if err := conn.WriteMessage(websocket.BinaryMessage, protocol.EncodeDataHandshake(clientID, testDataToken)); err != nil {
+		t.Fatalf("send handshake: %v", err)
+	}
+	if status := readHandshakeStatus(t, conn); status != protocol.DataHandshakeAuthFail {
+		t.Fatalf("disabled owner handshake status = 0x%02x, want auth failure", status)
+	}
+	if _, ok := s.clients.Load(clientID); ok {
+		t.Fatal("disabled owner must not retain a pending logical session")
 	}
 }
 
@@ -172,7 +237,7 @@ func TestDataChannel_Handshake_ReconnectClosesOldSession(t *testing.T) {
 	defer cleanup()
 
 	clientID := "reconnect-client"
-	cc := newPendingTestClient(clientID, testDataToken)
+	cc := newPendingTestClient(clientID, testDataToken, ts.ownerUserID)
 	cc.state = clientStateLive
 	s.clients.Store(clientID, cc)
 
@@ -222,7 +287,7 @@ func TestDataChannel_Handshake_WrongToken(t *testing.T) {
 	defer cleanup()
 
 	clientID := "token-test-client"
-	cc := newPendingTestClient(clientID, "correct-token")
+	cc := newPendingTestClient(clientID, "correct-token", ts.ownerUserID)
 	s.clients.Store(clientID, cc)
 
 	conn := dialDataWS(t, ts)
@@ -241,7 +306,7 @@ func TestDataChannel_Handshake_EmptyToken(t *testing.T) {
 	defer cleanup()
 
 	clientID := "empty-token-client"
-	cc := newPendingTestClient(clientID, "some-valid-token")
+	cc := newPendingTestClient(clientID, "some-valid-token", ts.ownerUserID)
 	s.clients.Store(clientID, cc)
 
 	conn := dialDataWS(t, ts)
@@ -261,7 +326,7 @@ func TestDataChannel_Handshake_ClientHasNoToken(t *testing.T) {
 	defer cleanup()
 
 	clientID := "no-token-client"
-	cc := newPendingTestClient(clientID, "")
+	cc := newPendingTestClient(clientID, "", ts.ownerUserID)
 	s.clients.Store(clientID, cc)
 
 	conn := dialDataWS(t, ts)
@@ -280,7 +345,7 @@ func TestDataChannel_Handshake_NonBinaryFrame(t *testing.T) {
 	defer cleanup()
 
 	clientID := "text-frame-client"
-	cc := newPendingTestClient(clientID, testDataToken)
+	cc := newPendingTestClient(clientID, testDataToken, ts.ownerUserID)
 	s.clients.Store(clientID, cc)
 
 	conn := dialDataWS(t, ts)
@@ -570,12 +635,16 @@ func TestAcceptClientOpenedDataStreams_WaitsForDecodeFailureHandler(t *testing.T
 
 func TestAcceptClientOpenedDataStreams_WaitsForActiveHandler(t *testing.T) {
 	s := New(0)
-	stored := testClientRelayStoredTunnel(t)
+	s.store = newTestTunnelStore(t)
+	stored := mustAddStableTunnelForServer(t, s, testClientRelayStoredTunnel(t))
 	s.c2c.set(stored)
+	ownerEpoch := s.lifecycleGate(stored.OwnerUserID).epoch
 
 	targetClientSession, targetServerSession := newDataTestYamuxSessionPair(t)
 	targetClient := &ClientConn{
 		ID:          stored.Target.ClientID,
+		OwnerUserID: stored.OwnerUserID,
+		OwnerEpoch:  ownerEpoch,
 		proxies:     make(map[string]*ProxyTunnel),
 		generation:  1,
 		state:       clientStateLive,
@@ -585,11 +654,15 @@ func TestAcceptClientOpenedDataStreams_WaitsForActiveHandler(t *testing.T) {
 
 	ingressClientSession, ingressServerSession := newDataTestYamuxSessionPair(t)
 	ingressClient := &ClientConn{
-		ID:         stored.Ingress.ClientID,
-		proxies:    make(map[string]*ProxyTunnel),
-		generation: 1,
-		state:      clientStateLive,
+		ID:          stored.Ingress.ClientID,
+		OwnerUserID: stored.OwnerUserID,
+		OwnerEpoch:  ownerEpoch,
+		proxies:     make(map[string]*ProxyTunnel),
+		generation:  1,
+		state:       clientStateLive,
+		dataSession: ingressServerSession,
 	}
+	s.clients.Store(ingressClient.ID, ingressClient)
 
 	var streamWG sync.WaitGroup
 	streamWG.Add(1)

@@ -376,7 +376,7 @@ func TestMarkUDPProxyRuntimeErrorIfCurrent_StaleRevisionDoesNotDemoteStore(t *te
 		Message: "keep current issue",
 	})
 
-	s.markUDPProxyRuntimeErrorIfCurrent(client, tunnel.Config.Name, tunnel, state, "late old UDP failure")
+	s.markUDPProxyRuntimeErrorIfCurrent(client, tunnel.Config.Name, tunnel, state, tunnel.Config, "late old UDP failure")
 
 	reloaded, err := s.store.GetTunnelByIDE(client.ID, stored.ID)
 	if err != nil {
@@ -391,6 +391,185 @@ func TestMarkUDPProxyRuntimeErrorIfCurrent_StaleRevisionDoesNotDemoteStore(t *te
 	}
 }
 
+func TestMarkUDPProxyRuntimeErrorIfCurrent_StaleGenerationOnlyClosesOldState(t *testing.T) {
+	s, _, _, cleanup := setupTestServerWithStores(t, true)
+	defer cleanup()
+	owner, err := s.auth.adminStore.ValidateAdminPassword("admin", "password123")
+	if err != nil {
+		t.Fatalf("resolve runtime owner: %v", err)
+	}
+
+	clientID := "stale-udp-generation-client"
+	mustRegisterTestTunnelClient(t, s.store, clientID, owner.ID)
+	ownerEpoch, releaseOwnerGate, err := s.acquireUserLifecycleRead(owner.ID, 0, true)
+	if err != nil {
+		t.Fatalf("capture runtime owner epoch: %v", err)
+	}
+	releaseOwnerGate()
+
+	oldPacketConn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen old UDP runtime: %v", err)
+	}
+	oldState := &UDPProxyState{
+		packetConn: oldPacketConn,
+		sessionIPs: make(map[string]int),
+		done:       make(chan struct{}),
+	}
+	oldClient := &ClientConn{
+		ID:          clientID,
+		OwnerUserID: owner.ID,
+		OwnerEpoch:  ownerEpoch,
+		generation:  1,
+		state:       clientStateLive,
+		proxies:     make(map[string]*ProxyTunnel),
+	}
+	oldTunnel := &ProxyTunnel{
+		Config: protocol.ProxyConfig{
+			ID:            "stale-udp-generation-id",
+			Name:          "stale-udp-generation",
+			Revision:      1,
+			Type:          protocol.ProxyTypeUDP,
+			LocalIP:       "127.0.0.1",
+			LocalPort:     5353,
+			RemotePort:    oldPacketConn.LocalAddr().(*net.UDPAddr).Port,
+			ClientID:      clientID,
+			OwnerClientID: clientID,
+			Topology:      protocol.TunnelTopologyServerExpose,
+			DesiredState:  protocol.ProxyDesiredStateRunning,
+			RuntimeState:  protocol.ProxyRuntimeStateExposed,
+		},
+		UDPState: oldState,
+		done:     make(chan struct{}),
+	}
+	oldClient.proxies[oldTunnel.Config.Name] = oldTunnel
+	s.clients.Store(clientID, oldClient)
+	mustAddStableTunnel(t, s.store, storedTunnelFromRuntimeForTest(oldClient, oldTunnel))
+	stored, err := s.store.GetTunnelByIDE(clientID, oldTunnel.Config.ID)
+	if err != nil {
+		t.Fatalf("load stored runtime: %v", err)
+	}
+
+	afterGate := make(chan struct{})
+	resumeFailure := make(chan struct{})
+	var resumeFailureOnce sync.Once
+	resumeRuntimeFailure := func() { resumeFailureOnce.Do(func() { close(resumeFailure) }) }
+	defer resumeRuntimeFailure()
+	var gateHookOnce sync.Once
+	s.userLifecycleHook = func(stage, userID string) {
+		if stage == "after_read_gate" && userID == owner.ID {
+			gateHookOnce.Do(func() {
+				close(afterGate)
+				<-resumeFailure
+			})
+		}
+	}
+	cleanupPublished := make(chan protocol.ProxyConfig, 1)
+	s.runtimeErrorCleanupHook = func(config protocol.ProxyConfig) {
+		cleanupPublished <- config
+	}
+	events := s.events.Subscribe()
+	defer s.events.Unsubscribe(events)
+
+	failureDone := make(chan struct{})
+	go func() {
+		s.markUDPProxyRuntimeErrorIfCurrent(oldClient, oldTunnel.Config.Name, oldTunnel, oldState, oldTunnel.Config, "late old generation failure")
+		close(failureDone)
+	}()
+	select {
+	case <-afterGate:
+	case <-time.After(2 * time.Second):
+		t.Fatal("runtime failure did not acquire the lifecycle gate")
+	}
+
+	newPacketConn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen replacement UDP runtime: %v", err)
+	}
+	newState := &UDPProxyState{
+		packetConn: newPacketConn,
+		sessionIPs: make(map[string]int),
+		done:       make(chan struct{}),
+	}
+	defer newState.Close()
+	s.clientTunnelMutationMu.Lock()
+	next := stored
+	next.Revision++
+	next.RuntimeState = protocol.ProxyRuntimeStateExposed
+	next.Error = ""
+	next.UpdatedAt = time.Now().UTC()
+	if err := s.store.ReplaceTunnelByID(clientID, stored.ID, stored.Revision, next); err != nil {
+		s.clientTunnelMutationMu.Unlock()
+		t.Fatalf("advance stored runtime revision: %v", err)
+	}
+	newConfig := storedTunnelToProxyConfig(next)
+	newConfig.RemotePort = newPacketConn.LocalAddr().(*net.UDPAddr).Port
+	newTunnel := &ProxyTunnel{Config: newConfig, UDPState: newState, done: make(chan struct{})}
+	newClient := &ClientConn{
+		ID:          clientID,
+		OwnerUserID: owner.ID,
+		OwnerEpoch:  ownerEpoch,
+		generation:  2,
+		state:       clientStateLive,
+		proxies:     map[string]*ProxyTunnel{newConfig.Name: newTunnel},
+	}
+	s.clients.Store(clientID, newClient)
+	s.clientTunnelMutationMu.Unlock()
+	s.unifiedRuntime.recordServerIssue(next.ID, next.Revision, protocol.TunnelIssue{
+		Code:    "replacement-runtime-issue",
+		Scope:   "server",
+		Message: "keep replacement issue",
+	})
+	resumeRuntimeFailure()
+
+	select {
+	case <-failureDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("stale runtime failure did not finish")
+	}
+	select {
+	case <-oldState.done:
+	default:
+		t.Fatal("old UDP runtime was not closed")
+	}
+	select {
+	case <-newState.done:
+		t.Fatal("stale runtime failure closed the replacement UDP runtime")
+	default:
+	}
+	current, ok := s.clients.Load(clientID)
+	if !ok || current != newClient {
+		t.Fatal("stale runtime failure replaced the current ClientConn")
+	}
+	newClient.proxyMu.RLock()
+	gotTunnel := newClient.proxies[newConfig.Name]
+	newClient.proxyMu.RUnlock()
+	if gotTunnel != newTunnel || gotTunnel.Config.RuntimeState != protocol.ProxyRuntimeStateExposed {
+		t.Fatalf("stale runtime failure changed the replacement runtime: %+v", gotTunnel)
+	}
+	reloaded, err := s.store.GetTunnelByIDE(clientID, stored.ID)
+	if err != nil {
+		t.Fatalf("reload replacement runtime: %v", err)
+	}
+	if reloaded.Revision != next.Revision || reloaded.RuntimeState != protocol.ProxyRuntimeStateExposed || reloaded.Error != "" {
+		t.Fatalf("stale runtime failure changed replacement storage: %+v", reloaded)
+	}
+	issues := s.unifiedRuntime.issuesForStoredTunnel(reloaded, true)
+	if len(issues) != 1 || issues[0].Code != "replacement-runtime-issue" {
+		t.Fatalf("stale runtime failure changed replacement issues: %+v", issues)
+	}
+	select {
+	case config := <-cleanupPublished:
+		t.Fatalf("stale runtime failure published cleanup: %+v", config)
+	default:
+	}
+	select {
+	case event := <-events:
+		t.Fatalf("stale runtime failure published event: %+v", event)
+	default:
+	}
+}
+
 func TestMarkUDPProxyRuntimeErrorIfCurrent_LegacyCleanupDoesNotDependOnStoreRow(t *testing.T) {
 	s := New(0)
 	s.store = newTestTunnelStore(t)
@@ -398,6 +577,7 @@ func TestMarkUDPProxyRuntimeErrorIfCurrent_LegacyCleanupDoesNotDependOnStoreRow(
 	defer mustClose(t, clientWS)
 	defer mustClose(t, serverWS)
 	client := &ClientConn{ID: "legacy-udp-error-client", conn: serverWS, proxies: make(map[string]*ProxyTunnel)}
+	s.clients.Store(client.ID, client)
 
 	packetConn, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
@@ -423,7 +603,7 @@ func TestMarkUDPProxyRuntimeErrorIfCurrent_LegacyCleanupDoesNotDependOnStoreRow(
 	}
 	client.proxies[tunnel.Config.Name] = tunnel
 
-	s.markUDPProxyRuntimeErrorIfCurrent(client, tunnel.Config.Name, tunnel, state, "legacy UDP listener failed")
+	s.markUDPProxyRuntimeErrorIfCurrent(client, tunnel.Config.Name, tunnel, state, tunnel.Config, "legacy UDP listener failed")
 
 	msg := readControlMessageOfType(t, clientWS, protocol.MsgTypeProxyClose)
 	var closeReq protocol.ProxyCloseRequest
@@ -531,13 +711,28 @@ func TestUDPProxy_E2E_ForwardAndReply(t *testing.T) {
 }
 
 func TestUDPProxyTrafficAccounting_RecordsPayloadBytesOnly(t *testing.T) {
-	s := New(0)
+	s, _, _, cleanup := setupTestServerWithStores(t, true)
+	defer cleanup()
+	owner, err := s.auth.adminStore.ValidateAdminPassword("admin", "password123")
+	if err != nil {
+		t.Fatalf("resolve UDP traffic owner: %v", err)
+	}
 	clientID := "udp-traffic-client"
-	client := &ClientConn{ID: clientID, proxies: make(map[string]*ProxyTunnel)}
+	mustRegisterTestTunnelClient(t, s.store, clientID, owner.ID)
+	ownerEpoch, releaseOwner, err := s.acquireUserLifecycleRead(owner.ID, 0, true)
+	if err != nil {
+		t.Fatalf("resolve UDP traffic owner epoch: %v", err)
+	}
+	releaseOwner()
+	client := &ClientConn{
+		ID:          clientID,
+		OwnerUserID: owner.ID,
+		OwnerEpoch:  ownerEpoch,
+		proxies:     make(map[string]*ProxyTunnel),
+	}
 	s.clients.Store(clientID, client)
 
-	trafficStore, trafficCleanup := newTestTrafficStore(t)
-	defer trafficCleanup()
+	trafficStore := newTestTrafficStoreForServer(t, s)
 	s.trafficStore = trafficStore
 
 	echoConn, err := net.ListenPacket("udp", "127.0.0.1:0")

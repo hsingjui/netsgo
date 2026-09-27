@@ -1,6 +1,7 @@
 package server
 
 import (
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -186,14 +187,143 @@ func mustAddStableTunnel(t *testing.T, store *TunnelStore, tunnel StoredTunnel) 
 	if tunnel.RuntimeState == "" {
 		tunnel.RuntimeState = protocol.ProxyRuntimeStateExposed
 	}
+	mustPrepareTestTunnelOwnership(t, store, tunnel)
 	if err := store.AddTunnel(tunnel); err != nil {
 		t.Fatalf("AddTunnel failed: %v", err)
 	}
 }
 
+func mustAddStableTunnelForServer(t *testing.T, s *Server, tunnel StoredTunnel) StoredTunnel {
+	t.Helper()
+	if s == nil || s.store == nil || s.store.db == nil {
+		t.Fatal("test server must have an initialized tunnel store")
+	}
+	if s.auth == nil {
+		t.Fatal("test server must have an initialized auth service")
+	}
+	if s.auth.adminStore == nil {
+		adminStore, err := newAdminStoreWithDB(s.store.path, s.store.db, false)
+		if err != nil {
+			t.Fatalf("create shared test admin store: %v", err)
+		}
+		s.auth.adminStore = adminStore
+		t.Cleanup(func() { _ = adminStore.Close() })
+	} else if s.auth.adminStore.db != s.store.db {
+		t.Fatal("test server admin and tunnel stores must share one database")
+	}
+
+	mustAddStableTunnel(t, s.store, tunnel)
+	if tunnel.ID != "" {
+		stored, err := s.store.GetTunnelByID(tunnel.ID)
+		if err != nil {
+			t.Fatalf("reload test tunnel %q: %v", tunnel.ID, err)
+		}
+		return stored
+	}
+	stored, ok := s.store.GetTunnel(tunnel.ClientID, tunnel.Name)
+	if !ok {
+		t.Fatalf("reload test tunnel %q for client %q", tunnel.Name, tunnel.ClientID)
+	}
+	return stored
+}
+
+func mustPrepareTestTunnelOwnership(t *testing.T, store *TunnelStore, tunnel StoredTunnel) {
+	t.Helper()
+	if store == nil || store.db == nil {
+		t.Fatal("test tunnel store must be initialized")
+	}
+
+	ownerClientID := tunnel.OwnerClientID
+	if ownerClientID == "" {
+		ownerClientID = tunnel.ClientID
+	}
+	ownerUserID := tunnel.OwnerUserID
+	if ownerUserID == "" && ownerClientID != "" {
+		var existingOwner sql.NullString
+		err := store.db.QueryRow(`SELECT owner_user_id FROM registered_clients WHERE id = ?`, ownerClientID).Scan(&existingOwner)
+		if err != nil && err != sql.ErrNoRows {
+			t.Fatalf("load test tunnel owner client %q: %v", ownerClientID, err)
+		}
+		if err == nil && existingOwner.Valid {
+			ownerUserID = existingOwner.String
+		}
+	}
+	if ownerUserID == "" {
+		err := store.db.QueryRow(`SELECT id FROM users WHERE status = ? ORDER BY is_admin DESC, created_at, id LIMIT 1`, string(UserStatusActive)).Scan(&ownerUserID)
+		if err != nil && err != sql.ErrNoRows {
+			t.Fatalf("load active test tunnel owner: %v", err)
+		}
+	}
+	if ownerUserID == "" {
+		ownerUserID = "test-tunnel-owner"
+	}
+	mustEnsureTestTunnelOwner(t, store, ownerUserID)
+
+	clientIDs := []string{tunnel.ClientID, ownerClientID, tunnel.Target.ClientID, tunnel.Ingress.ClientID}
+	seen := make(map[string]struct{}, len(clientIDs))
+	for _, clientID := range clientIDs {
+		if clientID == "" {
+			continue
+		}
+		if _, ok := seen[clientID]; ok {
+			continue
+		}
+		seen[clientID] = struct{}{}
+		mustRegisterTestTunnelClient(t, store, clientID, ownerUserID)
+	}
+}
+
+func mustEnsureTestTunnelOwner(t *testing.T, store *TunnelStore, ownerUserID string) {
+	t.Helper()
+	var status string
+	err := store.db.QueryRow(`SELECT status FROM users WHERE id = ?`, ownerUserID).Scan(&status)
+	if err == nil {
+		if UserStatus(status) != UserStatusActive {
+			t.Fatalf("test tunnel owner %q is not active", ownerUserID)
+		}
+		return
+	}
+	if err != sql.ErrNoRows {
+		t.Fatalf("load test tunnel owner %q: %v", ownerUserID, err)
+	}
+	now := formatTime(time.Now().UTC())
+	if _, err := store.db.Exec(`INSERT INTO users
+		(id, username, password_hash, is_admin, status, created_at, updated_at)
+		VALUES (?, ?, 'test-only-password-hash', 0, ?, ?, ?)`,
+		ownerUserID, "test-tunnel-owner:"+ownerUserID, string(UserStatusActive), now, now); err != nil {
+		t.Fatalf("create test tunnel owner %q: %v", ownerUserID, err)
+	}
+}
+
+func mustRegisterTestTunnelClient(t *testing.T, store *TunnelStore, clientID, ownerUserID string) {
+	t.Helper()
+	var existingOwner sql.NullString
+	err := store.db.QueryRow(`SELECT owner_user_id FROM registered_clients WHERE id = ?`, clientID).Scan(&existingOwner)
+	if err == nil {
+		if existingOwner.Valid && existingOwner.String != "" && existingOwner.String != ownerUserID {
+			t.Fatalf("test tunnel client %q belongs to %q, want %q", clientID, existingOwner.String, ownerUserID)
+		}
+		if !existingOwner.Valid || existingOwner.String == "" {
+			if _, err := store.db.Exec(`UPDATE registered_clients SET owner_user_id = ? WHERE id = ?`, ownerUserID, clientID); err != nil {
+				t.Fatalf("assign test tunnel client %q owner: %v", clientID, err)
+			}
+		}
+		return
+	}
+	if err != sql.ErrNoRows {
+		t.Fatalf("load test tunnel client %q: %v", clientID, err)
+	}
+	now := formatTime(time.Now().UTC())
+	if _, err := store.db.Exec(`INSERT INTO registered_clients
+		(id, owner_user_id, install_id, created_at, last_seen)
+		VALUES (?, ?, ?, ?, ?)`, clientID, ownerUserID, "test-install:"+clientID, now, now); err != nil {
+		t.Fatalf("register test tunnel client %q: %v", clientID, err)
+	}
+}
+
 func tunnelTargetMigrationReplacement(t *testing.T, store *TunnelStore, stored StoredTunnel, targetClientID string) StoredTunnel {
 	t.Helper()
-	mustRegisterTunnelMigrationTarget(t, store, targetClientID)
+	mustRegisterTunnelMigrationTarget(t, store, targetClientID, stored.OwnerUserID)
 	replacement := stored
 	replacement.ClientID = targetClientID
 	replacement.OwnerClientID = targetClientID
@@ -203,12 +333,12 @@ func tunnelTargetMigrationReplacement(t *testing.T, store *TunnelStore, stored S
 	return replacement
 }
 
-func mustRegisterTunnelMigrationTarget(t *testing.T, store *TunnelStore, clientID string) {
+func mustRegisterTunnelMigrationTarget(t *testing.T, store *TunnelStore, clientID, ownerUserID string) {
 	t.Helper()
-	now := formatTime(time.Now().UTC())
-	if _, err := store.db.Exec(`INSERT OR IGNORE INTO registered_clients (id, install_id, created_at, last_seen) VALUES (?, ?, ?, ?)`, clientID, "install-"+clientID, now, now); err != nil {
-		t.Fatalf("register migration target %q: %v", clientID, err)
+	if ownerUserID == "" {
+		t.Fatal("stored tunnel must have an owner before registering a migration target")
 	}
+	mustRegisterTestTunnelClient(t, store, clientID, ownerUserID)
 }
 
 func queryTunnelTargetResourceKey(t *testing.T, store *TunnelStore, id string) string {
@@ -576,16 +706,14 @@ func TestTunnelStore_AddTunnel_DiffClientSameNameAllowed(t *testing.T) {
 		ClientID:        "client-A",
 		Hostname:        "host-A",
 	})
-	if err := store.AddTunnel(StoredTunnel{
+	mustAddStableTunnel(t, store, StoredTunnel{
 		ProxyNewRequest: protocol.ProxyNewRequest{Name: "web"},
 		ClientID:        "client-B",
 		Hostname:        "host-B",
 		Binding:         TunnelBindingClientID,
 		DesiredState:    protocol.ProxyDesiredStateRunning,
 		RuntimeState:    protocol.ProxyRuntimeStateExposed,
-	}); err != nil {
-		t.Errorf("same name with different client_id should be allowed: %v", err)
-	}
+	})
 	allTunnels, err := store.GetAllTunnels()
 	if err != nil {
 		t.Fatalf("GetAllTunnels failed: %v", err)
@@ -1400,6 +1528,12 @@ func TestTunnelStore_GetAllTunnels_ReturnsCopy(t *testing.T) {
 
 func TestTunnelStore_ConcurrentAccess(t *testing.T) {
 	store := newTestTunnelStore(t)
+
+	for i := 0; i < 20; i++ {
+		mustPrepareTestTunnelOwnership(t, store, StoredTunnel{
+			ClientID: fmt.Sprintf("client-%d", i),
+		})
+	}
 
 	var wg sync.WaitGroup
 	for i := 0; i < 20; i++ {

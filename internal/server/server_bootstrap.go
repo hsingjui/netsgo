@@ -28,6 +28,9 @@ func (s *Server) initStore() error {
 		return err
 	}
 	s.serverDB = db
+	s.activityStore = newActivityStoreWithDB(path, db, false)
+	s.webhookStore = newWebhookStoreWithDB(db)
+	s.webhookStore.settings = s.webhookSettingsLoader()
 
 	store, err := newTunnelStoreWithDB(path, db, false)
 	if err != nil {
@@ -47,6 +50,8 @@ func (s *Server) initStore() error {
 	trafficStore := newTrafficStoreWithDB(path, db, false)
 	s.trafficStore = trafficStore
 	store.attachTrafficStore(trafficStore, s.trafficAccumulator)
+	store.activityStore = s.activityStore
+	adminStore.activityStore = s.activityStore
 
 	return nil
 }
@@ -74,6 +79,7 @@ func (s *Server) getStorePath() string {
 }
 
 func (s *Server) Start() error {
+	s.activityBootID = generateUUID()
 	s.startTime = time.Now()
 	s.done = make(chan struct{})
 	s.doneCloseOnce = sync.Once{}
@@ -103,7 +109,7 @@ func (s *Server) Start() error {
 	}
 
 	if err := s.initStore(); err != nil {
-		return fmt.Errorf("failed to initialize tunnel store: %w", err)
+		return fmt.Errorf("failed to initialize server storage: %w", err)
 	}
 
 	if s.auth.adminStore != nil {
@@ -121,6 +127,7 @@ func (s *Server) Start() error {
 			return fmt.Errorf("server is not initialized; use install or init flags to complete setup")
 		}
 	}
+	clientRateLimitSettings := ClientAuthRateLimitSettings{RequestsPerMinute: defaultClientAuthRateLimitPerMinute}
 	var serverConfig *ServerConfig
 	if s.auth.adminStore != nil {
 		cfg, err := s.auth.adminStore.GetServerConfigE()
@@ -128,9 +135,13 @@ func (s *Server) Start() error {
 			return fmt.Errorf("failed to read server config: %w", err)
 		}
 		serverConfig = &cfg
+		clientRateLimitSettings, err = s.auth.adminStore.GetClientAuthRateLimitSettings()
+		if err != nil {
+			return fmt.Errorf("failed to read client auth rate-limit settings: %w", err)
+		}
 	}
 
-	s.auth.initRateLimiters()
+	s.auth.initRateLimiters(clientRateLimitSettings)
 
 	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", s.Port))
 	if err != nil {
@@ -174,9 +185,14 @@ func (s *Server) Start() error {
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       120 * time.Second,
 	}
+	s.webhookDispatcher = newWebhookDispatcher(s.webhookStore, s.events)
+	s.webhookDispatcher.Start()
+	s.webhookDispatcher.Wake()
 
 	if s.auth.adminStore != nil {
 		go s.tokenCleanupLoop()
+		s.pruneActivityEvents()
+		go s.activityPruneLoop()
 	}
 	go s.serverStatusLoop()
 	go s.trafficRollupLoop()
@@ -184,6 +200,7 @@ func (s *Server) Start() error {
 	go s.trafficRealtimeLoop()
 	go s.unifiedTunnelReconcileLoop()
 	go s.p2pLeaseLoop()
+	go s.p2pProjectionRetryLoop()
 
 	serving = true
 	return s.httpServer.Serve(serveLn)
@@ -214,6 +231,14 @@ func logServerEndpoints(port int, tlsEnabled bool, hasWebUI bool, cfg *ServerCon
 }
 
 func (s *Server) cleanupFailedStartup() {
+	if s.webhookDispatcher != nil {
+		stopContext, cancel := context.WithTimeout(context.Background(), webhookRequestTimeout+time.Second)
+		_ = s.webhookDispatcher.Stop(stopContext)
+		cancel()
+	}
+	if s.auth != nil {
+		s.auth.stopRateLimiters()
+	}
 	s.closeDone()
 	if s.listener != nil {
 		_ = s.listener.Close()
@@ -254,6 +279,13 @@ func (s *Server) closeDone() {
 
 func (s *Server) Shutdown(ctx context.Context) (err error) {
 	log.Printf("🛑 Starting graceful shutdown...")
+	s.closeDone()
+	s.stopLongLivedAdmission()
+	if s.webhookDispatcher != nil {
+		if stopErr := s.webhookDispatcher.Stop(ctx); stopErr != nil && err == nil {
+			err = stopErr
+		}
+	}
 	defer func() {
 		if s.auth != nil && s.auth.adminStore != nil {
 			if closeErr := s.auth.adminStore.Close(); closeErr != nil {
@@ -287,13 +319,26 @@ func (s *Server) Shutdown(ctx context.Context) (err error) {
 		}
 	}()
 
-	s.closeDone()
+	select {
+	case <-s.p2pProjectionStop:
+	default:
+		close(s.p2pProjectionStop)
+	}
+	select {
+	case <-s.p2pProjectionDone:
+	case <-ctx.Done():
+		err = ctx.Err()
+	}
+	if s.auth != nil {
+		s.auth.stopRateLimiters()
+	}
 	if s.stunConn != nil {
 		_ = s.stunConn.Close()
 		s.stunConn = nil
 	}
 
 	if s.events != nil {
+		s.cancelAllSSE("server_shutdown")
 		s.events.Close()
 		log.Printf("📡 SSE event bus closed")
 	}
@@ -312,9 +357,21 @@ func (s *Server) Shutdown(ctx context.Context) (err error) {
 
 	s.closeManagedConns("server_shutdown")
 
-	if err := s.waitForLongLivedHandlers(ctx); err != nil {
-		log.Printf("⚠️ Timed out waiting for long-lived handlers to exit: %v", err)
-		return err
+	if s.httpServer != nil {
+		if shutdownErr := s.httpServer.Shutdown(ctx); shutdownErr != nil {
+			log.Printf("⚠️ HTTP server shutdown failed: %v", shutdownErr)
+			_ = s.httpServer.Close()
+			if err == nil {
+				err = shutdownErr
+			}
+		}
+	}
+
+	if waitErr := s.waitForLongLivedHandlers(ctx); waitErr != nil {
+		log.Printf("⚠️ Timed out waiting for long-lived handlers to exit: %v", waitErr)
+		if err == nil {
+			err = waitErr
+		}
 	}
 
 	if s.trafficStore != nil {
@@ -324,15 +381,8 @@ func (s *Server) Shutdown(ctx context.Context) (err error) {
 		}
 	}
 
-	if s.httpServer != nil {
-		if err := s.httpServer.Shutdown(ctx); err != nil {
-			log.Printf("⚠️ HTTP server shutdown failed: %v", err)
-			return err
-		}
-	}
-
 	log.Printf("✅ Graceful shutdown complete")
-	return nil
+	return err
 }
 
 func (s *Server) closeServerDB() error {
@@ -348,7 +398,6 @@ func (s *Server) closeServerDB() error {
 func (s *Server) tokenCleanupLoop() {
 	ticker := time.NewTicker(6 * time.Hour)
 	defer ticker.Stop()
-
 	for {
 		select {
 		case <-s.done:
@@ -359,6 +408,33 @@ func (s *Server) tokenCleanupLoop() {
 					log.Printf("⚠️ Failed to clean expired tokens: %v", err)
 				}
 			}
+		}
+	}
+}
+
+func (s *Server) pruneActivityEvents() {
+	if s.activityStore == nil || s.auth == nil || s.auth.adminStore == nil {
+		return
+	}
+	config, err := s.auth.adminStore.GetServerConfigE()
+	if err != nil {
+		log.Printf("⚠️ Failed to load activity retention policy: %v", err)
+		return
+	}
+	if _, err := s.activityStore.Prune(time.Now(), config.ActivityRetention); err != nil {
+		log.Printf("⚠️ Failed to prune activity events: %v", err)
+	}
+}
+
+func (s *Server) activityPruneLoop() {
+	ticker := time.NewTicker(6 * time.Hour)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-s.done:
+			return
+		case <-ticker.C:
+			s.pruneActivityEvents()
 		}
 	}
 }

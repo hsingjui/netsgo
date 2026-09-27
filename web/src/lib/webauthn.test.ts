@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'bun:test';
+import { describe, expect, it } from 'vitest';
 import { normalizeCreationOptions, normalizeRequestOptions, webAuthnEncodingForTests } from './webauthn';
 
 describe('WebAuthn base64url helpers', () => {

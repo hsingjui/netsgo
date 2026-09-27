@@ -19,6 +19,7 @@ import (
 type SessionManager struct {
 	managedConnMu     sync.Mutex
 	managedConns      map[*websocket.Conn]struct{}
+	closing           bool
 	longLivedHandlers sync.WaitGroup
 	nextGeneration    atomic.Uint64
 
@@ -38,16 +39,26 @@ func newSessionManager() *SessionManager {
 }
 
 // beginLongLivedHandler registers a long-lived connection goroutine and returns a done callback.
-func (sm *SessionManager) beginLongLivedHandler() func() {
+func (sm *SessionManager) beginLongLivedHandler() (func(), bool) {
+	sm.managedConnMu.Lock()
+	defer sm.managedConnMu.Unlock()
+	if sm.closing {
+		return func() {}, false
+	}
 	sm.longLivedHandlers.Add(1)
-	return sm.longLivedHandlers.Done
+	return sm.longLivedHandlers.Done, true
 }
 
 // trackManagedConn adds conn to the managed connection set and registers a longLivedHandler.
 // The returned function should be called when the handler goroutine exits.
-func (sm *SessionManager) trackManagedConn(conn *websocket.Conn) func() {
-	release := sm.beginLongLivedHandler()
+func (sm *SessionManager) trackManagedConn(conn *websocket.Conn) (func(), bool) {
 	sm.managedConnMu.Lock()
+	if sm.closing {
+		sm.managedConnMu.Unlock()
+		_ = conn.Close()
+		return func() {}, false
+	}
+	sm.longLivedHandlers.Add(1)
 	if sm.managedConns == nil {
 		sm.managedConns = make(map[*websocket.Conn]struct{})
 	}
@@ -58,8 +69,14 @@ func (sm *SessionManager) trackManagedConn(conn *websocket.Conn) func() {
 		sm.managedConnMu.Lock()
 		delete(sm.managedConns, conn)
 		sm.managedConnMu.Unlock()
-		release()
-	}
+		sm.longLivedHandlers.Done()
+	}, true
+}
+
+func (sm *SessionManager) beginShutdown() {
+	sm.managedConnMu.Lock()
+	sm.closing = true
+	sm.managedConnMu.Unlock()
 }
 
 // closeManagedConns sends CloseGoingAway to all managed connections and closes them.

@@ -12,9 +12,11 @@ import {
 import { useClientTraffic } from '@/hooks/use-client-traffic';
 import { hasTrafficSamples, useAggregatedTrafficRates } from '@/hooks/use-traffic-rates';
 import { formatTrafficRate } from '@/lib/format';
+import type { ResourceScope } from '@/lib/resource-scope';
 import type { ProxyConfig } from '@/types';
 
 interface TrafficRateChartProps {
+  scope: ResourceScope;
   clientId: string;
   tunnelFilter?: Pick<ProxyConfig, 'name' | 'type'>[];
 }
@@ -40,13 +42,13 @@ function getQueryTunnel(tunnelFilter: Pick<ProxyConfig, 'name' | 'type'>[] | und
   return tunnelFilter?.length === 1 ? tunnelFilter[0].name : undefined;
 }
 
-export function TrafficRateChart({ clientId, tunnelFilter }: TrafficRateChartProps) {
+export function TrafficRateChart({ scope, clientId, tunnelFilter }: TrafficRateChartProps) {
   const { t, i18n } = useTranslation();
   const chartConfig = useMemo<ChartConfig>(() => ({
     inRate: { label: t('traffic.inbound'), color: 'var(--chart-2)' },
     outRate: { label: t('traffic.outbound'), color: 'var(--chart-1)' },
   }), [t]);
-  const { data, isLoading, isError, error } = useClientTraffic(clientId, '24h', {
+  const { data, isLoading, isError, error } = useClientTraffic(scope, clientId, '24h', {
     tunnel: getQueryTunnel(tunnelFilter),
   });
   const chartData = useAggregatedTrafficRates(data, '24h', tunnelFilter);

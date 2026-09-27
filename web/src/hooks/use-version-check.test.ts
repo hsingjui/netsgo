@@ -1,10 +1,11 @@
-import { describe, expect, test } from 'bun:test';
+import { describe, expect, test } from 'vitest';
 
 import { versionCheckQueryKey } from './use-version-check';
+import { SELF_RESOURCE_SCOPE } from '@/lib/resource-scope';
 
 describe('versionCheckQueryKey', () => {
   test('includes target, version, install method, os and arch', () => {
-    expect([...versionCheckQueryKey({
+    expect([...versionCheckQueryKey(SELF_RESOURCE_SCOPE, {
       kind: 'client',
       id: 'client-1',
       version: 'v0.1.0',
@@ -12,6 +13,8 @@ describe('versionCheckQueryKey', () => {
       os: 'linux',
       arch: 'amd64',
     })]).toEqual([
+      'users',
+      'self',
       'version-check',
       'client',
       'client-1',
@@ -23,10 +26,12 @@ describe('versionCheckQueryKey', () => {
   });
 
   test('falls back to binary install method for missing capability', () => {
-    expect([...versionCheckQueryKey({
+    expect([...versionCheckQueryKey(SELF_RESOURCE_SCOPE, {
       kind: 'server',
       version: 'v0.1.0',
     })]).toEqual([
+      'users',
+      'self',
       'version-check',
       'server',
       'server',

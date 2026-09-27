@@ -23,6 +23,38 @@ func newTestTrafficStore(t *testing.T) (*TrafficStore, func()) {
 	return ts, func() { _ = ts.Close() }
 }
 
+func newTestTrafficStoreForServer(t *testing.T, s *Server) *TrafficStore {
+	t.Helper()
+	if s == nil || s.auth == nil || s.auth.adminStore == nil {
+		t.Fatal("test server must have an initialized admin store")
+	}
+	return newTrafficStoreWithDB(s.auth.adminStore.path, s.auth.adminStore.db, false)
+}
+
+func newTestTrafficStoreForTunnelStore(t *testing.T, store *TunnelStore) *TrafficStore {
+	t.Helper()
+	if store == nil || store.db == nil {
+		t.Fatal("test tunnel store must be initialized")
+	}
+	return newTrafficStoreWithDB(store.path, store.db, false)
+}
+
+func mustRegisterTrafficAPIClient(t *testing.T, s *Server, installID string) RegisteredClient {
+	t.Helper()
+	if s == nil || s.auth == nil || s.auth.adminStore == nil {
+		t.Fatal("test server must have an initialized admin store")
+	}
+	var ownerUserID string
+	if err := s.auth.adminStore.db.QueryRow(`SELECT id FROM users WHERE username = ?`, "admin").Scan(&ownerUserID); err != nil {
+		t.Fatalf("load traffic API test owner: %v", err)
+	}
+	client, err := s.auth.adminStore.GetOrCreateClientForUser(ownerUserID, installID, protocol.ClientInfo{Hostname: installID}, "127.0.0.1")
+	if err != nil {
+		t.Fatalf("register traffic API client: %v", err)
+	}
+	return *client
+}
+
 func mustSingleSeries(t *testing.T, result TrafficQueryResult, tunnelName string) TunnelTrafficSeries {
 	t.Helper()
 	if len(result.Items) != 1 {
@@ -1011,17 +1043,19 @@ func TestTrafficAPI_Query(t *testing.T) {
 	s, handler, token, cleanup := setupTestServerWithStores(t, true)
 	defer cleanup()
 
-	ts, trafficCleanup := newTestTrafficStore(t)
-	defer trafficCleanup()
+	ts := newTestTrafficStoreForServer(t, s)
 	s.trafficStore = ts
 
-	clientID := "test-client-001"
+	client := mustRegisterTrafficAPIClient(t, s, "test-client-001")
+	clientID := client.ID
 	now := time.Now().UTC()
 	stored := testStoredServerExposeTCPTunnel("traffic-query-web-id", "web", clientID, 8080, 18080, now)
+	stored.OwnerUserID = client.OwnerUserID
 	mustAddStableTunnel(t, s.store, stored)
 	ts.ApplyDeltas([]TrafficDelta{{
 		TunnelID:     stored.ID,
 		ClientID:     clientID,
+		OwnerUserID:  client.OwnerUserID,
 		TunnelName:   stored.Name,
 		TunnelType:   stored.Type,
 		MinuteStart:  minuteFloorUTC(now).Unix(),
@@ -1064,19 +1098,21 @@ func TestTrafficAPI_HistoricalQueryIgnoresRuntimeOnlyProxyCreateTunnels(t *testi
 	s, handler, token, cleanup := setupTestServerWithStores(t, true)
 	defer cleanup()
 
-	ts, trafficCleanup := newTestTrafficStore(t)
-	defer trafficCleanup()
+	ts := newTestTrafficStoreForServer(t, s)
 	s.trafficStore = ts
 
-	clientID := "test-client-historical-runtime"
+	client := mustRegisterTrafficAPIClient(t, s, "test-client-historical-runtime")
+	clientID := client.ID
 	now := time.Now().UTC()
 	stored := testStoredServerExposeTCPTunnel("traffic-history-stored-id", "stored-history", clientID, 8080, 18080, now)
+	stored.OwnerUserID = client.OwnerUserID
 	mustAddStableTunnel(t, s.store, stored)
 	runtimeID := "traffic-history-runtime-id"
 	ts.ApplyDeltas([]TrafficDelta{
 		{
 			TunnelID:     stored.ID,
 			ClientID:     clientID,
+			OwnerUserID:  client.OwnerUserID,
 			TunnelName:   stored.Name,
 			TunnelType:   stored.Type,
 			MinuteStart:  minuteFloorUTC(now).Unix(),
@@ -1086,6 +1122,7 @@ func TestTrafficAPI_HistoricalQueryIgnoresRuntimeOnlyProxyCreateTunnels(t *testi
 		{
 			TunnelID:     runtimeID,
 			ClientID:     clientID,
+			OwnerUserID:  client.OwnerUserID,
 			TunnelName:   "runtime-history",
 			TunnelType:   protocol.ProxyTypeTCP,
 			MinuteStart:  minuteFloorUTC(now).Unix(),
@@ -1142,22 +1179,19 @@ func TestTrafficAPI_HistoricalQueryKeepsDeletedTunnelWhenSelected(t *testing.T) 
 	s, handler, token, cleanup := setupTestServerWithStores(t, true)
 	defer cleanup()
 
-	path := filepath.Join(t.TempDir(), serverDBFileName)
-	s.store = newTestTunnelStoreAt(t, path)
-	ts, err := NewTrafficStore(path)
-	if err != nil {
-		t.Fatalf("NewTrafficStore failed: %v", err)
-	}
-	defer func() { _ = ts.Close() }()
+	ts := newTestTrafficStoreForServer(t, s)
 	s.trafficStore = ts
 
-	clientID := "test-client-deleted-history"
+	client := mustRegisterTrafficAPIClient(t, s, "test-client-deleted-history")
+	clientID := client.ID
 	now := minuteFloorUTC(time.Now().UTC())
 	stored := testStoredServerExposeTCPTunnel("traffic-deleted-id", "delete-history", clientID, 8080, 18080, now)
+	stored.OwnerUserID = client.OwnerUserID
 	mustAddStableTunnel(t, s.store, stored)
 	ts.ApplyDeltas([]TrafficDelta{{
 		TunnelID:     stored.ID,
 		ClientID:     clientID,
+		OwnerUserID:  client.OwnerUserID,
 		TunnelName:   stored.Name,
 		TunnelType:   stored.Type,
 		MinuteStart:  now.Unix(),
@@ -1211,19 +1245,21 @@ func TestTrafficAPI_RealtimeSecondQueryReturnsSixtyZeroFilledPoints(t *testing.T
 	s, handler, token, cleanup := setupTestServerWithStores(t, true)
 	defer cleanup()
 
-	ts, trafficCleanup := newTestTrafficStore(t)
-	defer trafficCleanup()
+	ts := newTestTrafficStoreForServer(t, s)
 	s.trafficStore = ts
 
-	clientID := "test-client-realtime"
+	client := mustRegisterTrafficAPIClient(t, s, "test-client-realtime")
+	clientID := client.ID
 	end := time.Unix(1_800_000, 0).UTC()
 	from := end.Add(-59 * time.Second)
 	sampleTime := end.Add(-2 * time.Second)
 	stored := testStoredServerExposeTCPTunnel("traffic-realtime-web-id", "web", clientID, 8080, 18080, from)
+	stored.OwnerUserID = client.OwnerUserID
 	mustAddStableTunnel(t, s.store, stored)
 	ts.ApplyDeltas([]TrafficDelta{{
 		TunnelID:     stored.ID,
 		ClientID:     clientID,
+		OwnerUserID:  client.OwnerUserID,
 		TunnelName:   stored.Name,
 		TunnelType:   stored.Type,
 		SecondStart:  sampleTime.Unix(),
@@ -1266,20 +1302,30 @@ func TestTrafficAPI_RealtimeSecondQueryReturnsSixtyZeroFilledPoints(t *testing.T
 }
 
 func TestCollectRealtimeTrafficEventIgnoresRuntimeOnlyProxyCreateTunnels(t *testing.T) {
-	s := New(0)
-	s.store = newTestTunnelStore(t)
-	ts, trafficCleanup := newTestTrafficStore(t)
-	defer trafficCleanup()
+	s, _, _, cleanup := setupTestServerWithStores(t, true)
+	defer cleanup()
+	ts := newTrafficStoreWithDB(s.store.path, s.store.db, false)
 	s.trafficStore = ts
 
 	clientID := "test-client-runtime-traffic"
+	var ownerUserID string
+	if err := s.auth.adminStore.db.QueryRow(`SELECT id FROM users WHERE username = ?`, "admin").Scan(&ownerUserID); err != nil {
+		t.Fatalf("load traffic test owner: %v", err)
+	}
+	registered, err := s.auth.adminStore.GetOrCreateClientForUser(ownerUserID, "install-"+clientID, protocol.ClientInfo{Hostname: clientID}, "127.0.0.1")
+	if err != nil {
+		t.Fatalf("register traffic test client: %v", err)
+	}
+	clientID = registered.ID
 	now := secondFloorUTC(time.Now().UTC()).Add(3 * time.Second)
 	sampleTime := secondFloorUTC(now).Add(-time.Second)
 	stored := testStoredServerExposeTCPTunnel("traffic-stored-id", "stored-web", clientID, 8080, 18080, sampleTime)
+	stored.OwnerUserID = ownerUserID
 	mustAddStableTunnel(t, s.store, stored)
 	s.clients.Store(clientID, &ClientConn{
-		ID:    clientID,
-		state: clientStateLive,
+		ID:          clientID,
+		OwnerUserID: ownerUserID,
+		state:       clientStateLive,
 		proxies: map[string]*ProxyTunnel{
 			"runtime-only": testRuntimeOnlyProxyTunnel("traffic-runtime-id", "runtime-only", clientID, 8081, 18081, sampleTime),
 		},
@@ -1288,6 +1334,7 @@ func TestCollectRealtimeTrafficEventIgnoresRuntimeOnlyProxyCreateTunnels(t *test
 		{
 			TunnelID:     stored.ID,
 			ClientID:     clientID,
+			OwnerUserID:  ownerUserID,
 			TunnelName:   stored.Name,
 			TunnelType:   stored.Type,
 			SecondStart:  sampleTime.Unix(),
@@ -1298,6 +1345,7 @@ func TestCollectRealtimeTrafficEventIgnoresRuntimeOnlyProxyCreateTunnels(t *test
 		{
 			TunnelID:     "traffic-runtime-id",
 			ClientID:     clientID,
+			OwnerUserID:  ownerUserID,
 			TunnelName:   "runtime-only",
 			TunnelType:   protocol.ProxyTypeTCP,
 			SecondStart:  sampleTime.Unix(),
@@ -1307,7 +1355,11 @@ func TestCollectRealtimeTrafficEventIgnoresRuntimeOnlyProxyCreateTunnels(t *test
 		},
 	})
 
-	event := s.collectRealtimeTrafficEvent(now)
+	eventsByOwner := s.collectRealtimeTrafficEvents(now)
+	event, ok := eventsByOwner[ownerUserID]
+	if !ok {
+		t.Fatalf("realtime event missing owner %q: %+v", ownerUserID, eventsByOwner)
+	}
 	if len(event.Clients) != 1 {
 		t.Fatalf("realtime event clients: want 1, got %d: %+v", len(event.Clients), event.Clients)
 	}
@@ -1320,14 +1372,15 @@ func TestTrafficAPI_QueryStoreError(t *testing.T) {
 	s, handler, token, cleanup := setupTestServerWithStores(t, true)
 	defer cleanup()
 
-	ts, trafficCleanup := newTestTrafficStore(t)
-	defer trafficCleanup()
+	ts := newTestTrafficStoreForServer(t, s)
 	s.trafficStore = ts
 
-	clientID := "test-client-store-error"
+	client := mustRegisterTrafficAPIClient(t, s, "test-client-store-error")
+	clientID := client.ID
 	now := minuteFloorUTC(time.Now().UTC())
 	mustInsertTrafficBucket(t, ts, TrafficBucket{
 		ClientID:     clientID,
+		OwnerUserID:  client.OwnerUserID,
 		TunnelName:   "web",
 		TunnelType:   "http",
 		Resolution:   TrafficResolutionMinute,
@@ -1360,11 +1413,11 @@ func TestTrafficAPI_DefaultTimeRange(t *testing.T) {
 	s, handler, token, cleanup := setupTestServerWithStores(t, true)
 	defer cleanup()
 
-	ts, trafficCleanup := newTestTrafficStore(t)
-	defer trafficCleanup()
+	ts := newTestTrafficStoreForServer(t, s)
 	s.trafficStore = ts
+	client := mustRegisterTrafficAPIClient(t, s, "test-client-default-range")
 
-	w := doMuxRequest(t, handler, http.MethodGet, "/api/clients/c1/traffic", token, nil)
+	w := doMuxRequest(t, handler, http.MethodGet, "/api/clients/"+client.ID+"/traffic", token, nil)
 	if w.Code != http.StatusOK {
 		t.Fatalf("Expected 200, got %d", w.Code)
 	}
@@ -1382,11 +1435,11 @@ func TestTrafficAPI_InvalidResolution(t *testing.T) {
 	s, handler, token, cleanup := setupTestServerWithStores(t, true)
 	defer cleanup()
 
-	ts, trafficCleanup := newTestTrafficStore(t)
-	defer trafficCleanup()
+	ts := newTestTrafficStoreForServer(t, s)
 	s.trafficStore = ts
+	client := mustRegisterTrafficAPIClient(t, s, "test-client-invalid-resolution")
 
-	w := doMuxRequest(t, handler, http.MethodGet, "/api/clients/c1/traffic?resolution=bad", token, nil)
+	w := doMuxRequest(t, handler, http.MethodGet, "/api/clients/"+client.ID+"/traffic?resolution=bad", token, nil)
 	if w.Code != http.StatusBadRequest {
 		t.Errorf("Invalid resolution expected 400, got %d", w.Code)
 	}
@@ -1396,14 +1449,14 @@ func TestTrafficAPI_InvalidTimeRange(t *testing.T) {
 	s, handler, token, cleanup := setupTestServerWithStores(t, true)
 	defer cleanup()
 
-	ts, trafficCleanup := newTestTrafficStore(t)
-	defer trafficCleanup()
+	ts := newTestTrafficStoreForServer(t, s)
 	s.trafficStore = ts
+	client := mustRegisterTrafficAPIClient(t, s, "test-client-invalid-time-range")
 
 	now := time.Now().UTC()
 	from := now.Unix()
 	to := now.Add(-time.Minute).Unix()
-	w := doMuxRequest(t, handler, http.MethodGet, "/api/clients/c1/traffic?from="+itoa(from)+"&to="+itoa(to), token, nil)
+	w := doMuxRequest(t, handler, http.MethodGet, "/api/clients/"+client.ID+"/traffic?from="+itoa(from)+"&to="+itoa(to), token, nil)
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("from > to should return 400, got %d", w.Code)
 	}
@@ -1413,14 +1466,14 @@ func TestTrafficAPI_TimeRangeTooLarge(t *testing.T) {
 	s, handler, token, cleanup := setupTestServerWithStores(t, true)
 	defer cleanup()
 
-	ts, trafficCleanup := newTestTrafficStore(t)
-	defer trafficCleanup()
+	ts := newTestTrafficStoreForServer(t, s)
 	s.trafficStore = ts
+	client := mustRegisterTrafficAPIClient(t, s, "test-client-time-range-too-large")
 
 	now := time.Now().UTC()
 	from := now.Add(-(trafficMaxRange + time.Hour)).Unix()
 	to := now.Unix()
-	w := doMuxRequest(t, handler, http.MethodGet, "/api/clients/c1/traffic?from="+itoa(from)+"&to="+itoa(to), token, nil)
+	w := doMuxRequest(t, handler, http.MethodGet, "/api/clients/"+client.ID+"/traffic?from="+itoa(from)+"&to="+itoa(to), token, nil)
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("Range exceeding 7 days should return 400, got %d", w.Code)
 	}

@@ -13,10 +13,6 @@ func CurrentBinaryPath() (string, error) {
 	return filepath.EvalSymlinks(path)
 }
 
-func IsBinaryInstalled() bool {
-	return isBinaryInstalledAt(BinaryPath)
-}
-
 func isBinaryInstalledAt(path string) bool {
 	info, err := os.Stat(path)
 	if err != nil || info.IsDir() {

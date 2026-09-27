@@ -50,85 +50,101 @@ func (s *Server) trafficRealtimeLoop() {
 			if s.trafficStore == nil || s.events == nil || !s.events.HasSubscribers() {
 				continue
 			}
-			event := s.collectRealtimeTrafficEvent(now)
-			if len(event.Clients) == 0 {
-				continue
+			eventsByOwner := s.collectRealtimeTrafficEvents(now)
+			ownerUserIDs := make([]string, 0, len(eventsByOwner))
+			for ownerUserID := range eventsByOwner {
+				ownerUserIDs = append(ownerUserIDs, ownerUserID)
 			}
-			s.events.PublishJSON("traffic_realtime", event)
+			sort.Strings(ownerUserIDs)
+			for _, ownerUserID := range ownerUserIDs {
+				event := eventsByOwner[ownerUserID]
+				if len(event.Clients) == 0 {
+					continue
+				}
+				s.events.PublishScopedJSON("traffic_realtime", ownerUserID, event)
+			}
 		}
 	}
 }
 
-func (s *Server) collectRealtimeTrafficEvent(now time.Time) realtimeTrafficEvent {
+// collectRealtimeTrafficEvents produces one browser payload per owner scope.
+// The owner remains EventBus transport metadata and is never serialized in the
+// traffic payload itself.
+func (s *Server) collectRealtimeTrafficEvents(now time.Time) map[string]realtimeTrafficEvent {
 	s.flushTrafficObservations()
 
 	from, to := realtimeTrafficWindow(now)
-	event := realtimeTrafficEvent{
-		GeneratedAt: now.UTC(),
-		Clients:     []realtimeTrafficClient{},
-	}
+	eventsByOwner := make(map[string]realtimeTrafficEvent)
 
 	s.RangeClients(func(clientID string, client *ClientConn) bool {
-		if !client.isLive() {
+		if !client.isLive() || client.OwnerUserID == "" {
 			return true
 		}
 
-		knownTunnels := s.knownTrafficTunnels(clientID, "")
+		knownTunnels := s.knownTrafficTunnelsForUser(client.OwnerUserID, clientID, "")
 		if len(knownTunnels) == 0 {
 			return true
 		}
 
-		result, err := s.buildRealtimeTrafficResult(clientID, "", from, to, knownTunnels)
+		result, err := s.buildRealtimeTrafficResultForUser(client.OwnerUserID, clientID, "", from, to, knownTunnels)
 		if err != nil {
-			log.Printf("⚠️ Failed to collect realtime traffic for client %s: %v", clientID, err)
+			log.Printf("⚠️ Failed to collect realtime traffic for user %s client %s: %v", client.OwnerUserID, clientID, err)
 			return true
 		}
 
+		event := eventsByOwner[client.OwnerUserID]
+		if event.GeneratedAt.IsZero() {
+			event = realtimeTrafficEvent{GeneratedAt: now.UTC(), Clients: []realtimeTrafficClient{}}
+		}
 		event.Clients = append(event.Clients, realtimeTrafficClient{
 			ClientID:   clientID,
 			Resolution: result.Resolution,
 			Items:      result.Items,
 		})
+		eventsByOwner[client.OwnerUserID] = event
 		return true
 	})
 
-	sort.Slice(event.Clients, func(i, j int) bool {
-		return event.Clients[i].ClientID < event.Clients[j].ClientID
-	})
-	return event
+	for ownerUserID, event := range eventsByOwner {
+		sort.Slice(event.Clients, func(i, j int) bool {
+			return event.Clients[i].ClientID < event.Clients[j].ClientID
+		})
+		eventsByOwner[ownerUserID] = event
+	}
+	return eventsByOwner
 }
 
-func (s *Server) buildRealtimeTrafficResult(clientID, tunnelName string, from, to time.Time, knownTunnels []trafficSeriesKey) (TrafficQueryResult, error) {
-	result, err := s.trafficStore.QueryWithResolution(clientID, tunnelName, from, to, TrafficResolutionSecond)
+func (s *Server) buildRealtimeTrafficResultForUser(ownerUserID, clientID, tunnelName string, from, to time.Time, knownTunnels []trafficSeriesKey) (TrafficQueryResult, error) {
+	result, err := s.trafficStore.QueryWithResolutionForUser(ownerUserID, clientID, tunnelName, from, to, TrafficResolutionSecond)
 	if err != nil {
 		return TrafficQueryResult{}, err
 	}
 	return fillRealtimeTrafficResult(result, knownTunnels, from, to)
 }
 
-func (s *Server) knownTrafficTunnels(clientID, tunnelName string) []trafficSeriesKey {
+func (s *Server) knownTrafficTunnelsForUser(ownerUserID, clientID, tunnelName string) []trafficSeriesKey {
+	if ownerUserID == "" || s == nil || s.store == nil {
+		return nil
+	}
 	known := make(map[trafficSeriesKey]struct{})
-	add := func(key trafficSeriesKey) {
+	stored, err := s.store.GetTunnelsByUserID(ownerUserID)
+	if err != nil {
+		log.Printf("⚠️ failed to load tunnels for realtime traffic user %s client %s: %v", ownerUserID, clientID, err)
+		return nil
+	}
+	for _, tunnel := range stored {
+		if tunnel.ClientID != clientID {
+			continue
+		}
+		key := trafficSeriesKey{TunnelID: tunnel.ID, TunnelName: tunnel.Name, TunnelType: tunnel.Type}
 		if key.TunnelName == "" || key.TunnelType == "" {
-			return
+			continue
 		}
 		if tunnelName != "" && key.TunnelName != tunnelName && key.TunnelID != tunnelName {
-			return
+			continue
 		}
 		known[key] = struct{}{}
 	}
-
-	if s.store != nil {
-		stored, err := s.store.GetTunnelsByClientID(clientID)
-		if err != nil {
-			log.Printf("⚠️ failed to load tunnels for realtime traffic client %s: %v", clientID, err)
-		} else {
-			for _, tunnel := range stored {
-				add(trafficSeriesKey{TunnelID: tunnel.ID, TunnelName: tunnel.Name, TunnelType: tunnel.Type})
-			}
-		}
-	}
-
 	keys := make([]trafficSeriesKey, 0, len(known))
 	for key := range known {
 		keys = append(keys, key)

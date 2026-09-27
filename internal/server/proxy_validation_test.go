@@ -27,9 +27,32 @@ func newProxyValidationTestServer(t *testing.T, port int, serverAddr string, all
 	}
 	s.auth.adminStore = adminStore
 
-	s.store = newTestTunnelStore(t)
+	s.store, err = newTunnelStoreWithDB(adminStore.path, adminStore.db, false)
+	if err != nil {
+		t.Fatalf("failed to create shared TunnelStore: %v", err)
+	}
 
 	return s
+}
+
+func newProxyValidationTestClient(t *testing.T, s *Server, clientID string) *ClientConn {
+	t.Helper()
+	owner, err := s.auth.adminStore.ValidateAdminPassword("admin", "password123")
+	if err != nil {
+		t.Fatalf("resolve proxy validation owner: %v", err)
+	}
+	mustRegisterTestTunnelClient(t, s.store, clientID, owner.ID)
+	epoch, release, err := s.acquireUserLifecycleRead(owner.ID, 0, true)
+	if err != nil {
+		t.Fatalf("resolve proxy validation owner epoch: %v", err)
+	}
+	release()
+	return &ClientConn{
+		ID:          clientID,
+		OwnerUserID: owner.ID,
+		OwnerEpoch:  epoch,
+		proxies:     make(map[string]*ProxyTunnel),
+	}
 }
 
 func TestValidateProxyRequest_TCPUDPRequireExplicitRemotePort(t *testing.T) {
@@ -134,10 +157,7 @@ func TestValidateProxyRequest_RejectsConflictsAcrossRuntimeAndStore(t *testing.T
 		RemotePort: 19090,
 	}, protocol.ProxyStatusStopped)
 
-	liveClient := &ClientConn{
-		ID:      "client-live",
-		proxies: make(map[string]*ProxyTunnel),
-	}
+	liveClient := newProxyValidationTestClient(t, s, "client-live")
 	liveClient.proxies["runtime-error"] = &ProxyTunnel{
 		Config: protocol.ProxyConfig{
 			Name:         "runtime-error",
@@ -251,10 +271,7 @@ func TestValidateProxyRequest_TCPUDPRejectsInvalidBindIP(t *testing.T) {
 func TestValidateProxyRequestWithExclusions_AllowsUpdatingSameTunnelPort(t *testing.T) {
 	s := newProxyValidationTestServer(t, 38080, "https://panel.example.com", nil)
 
-	client := &ClientConn{
-		ID:      "client-edit",
-		proxies: make(map[string]*ProxyTunnel),
-	}
+	client := newProxyValidationTestClient(t, s, "client-edit")
 	client.proxies["editable"] = &ProxyTunnel{
 		Config: protocol.ProxyConfig{
 			Name:         "editable",

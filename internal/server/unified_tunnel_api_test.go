@@ -135,6 +135,15 @@ func setLiveClientDefaultCapabilities(t *testing.T, s *Server, clientID string) 
 	client.SetInfo(info)
 }
 
+func useSharedUnifiedTestStore(t *testing.T, s *Server) {
+	t.Helper()
+	store, err := newTunnelStoreWithDB(s.auth.adminStore.path, s.auth.adminStore.db, false)
+	if err != nil {
+		t.Fatalf("create shared TunnelStore: %v", err)
+	}
+	s.store = store
+}
+
 func respondPreflight(t *testing.T, conn interface {
 	SetReadDeadline(time.Time) error
 	ReadJSON(any) error
@@ -334,6 +343,64 @@ func createUnifiedAPITestClientWithCapabilities(t *testing.T, s *Server, install
 	return *record
 }
 
+func createUnifiedAPITestClientForUser(t *testing.T, s *Server, ownerUserID, installID, hostname string) RegisteredClient {
+	t.Helper()
+	capabilities := protocol.DefaultClientCapabilities()
+	return createUnifiedAPITestClientForUserWithCapabilities(t, s, ownerUserID, installID, hostname, capabilities)
+}
+
+func createUnifiedAPITestClientForUserWithCapabilities(t *testing.T, s *Server, ownerUserID, installID, hostname string, capabilities protocol.ClientCapabilities) RegisteredClient {
+	t.Helper()
+	record, err := s.auth.adminStore.GetOrCreateClientForUser(ownerUserID, installID, protocol.ClientInfo{
+		Hostname:     hostname,
+		OS:           "linux",
+		Arch:         "amd64",
+		Version:      "0.1.0",
+		Capabilities: &capabilities,
+	}, "127.0.0.1:12345")
+	if err != nil {
+		t.Fatalf("failed to create scoped client record: %v", err)
+	}
+	return *record
+}
+
+func assertTunnelMutationUnknownClient(t *testing.T, resp *httptest.ResponseRecorder, wantStatus int, wantField string) {
+	t.Helper()
+	if resp.Code != wantStatus {
+		t.Fatalf("unknown client response: want %d, got %d body=%s", wantStatus, resp.Code, resp.Body.String())
+	}
+	var body tunnelMutationErrorResponse
+	if err := mustDecodeJSON(t, resp.Body, &body); err != nil {
+		t.Fatalf("decode unknown client response: %v", err)
+	}
+	if body.ErrorCode != protocol.TunnelMutationErrorCodeUnknownClient || body.Code != protocol.TunnelMutationErrorCodeUnknownClient || body.Field != wantField {
+		t.Fatalf("unknown client response mismatch: %+v want field=%q", body, wantField)
+	}
+}
+
+func assertNoTunnelPreflightFrame(t *testing.T, conn *websocket.Conn) {
+	t.Helper()
+	if err := conn.SetReadDeadline(time.Now().Add(200 * time.Millisecond)); err != nil {
+		t.Fatalf("set no-preflight read deadline: %v", err)
+	}
+	defer func() {
+		_ = conn.SetReadDeadline(time.Time{})
+	}()
+	for {
+		var msg protocol.Message
+		if err := conn.ReadJSON(&msg); err != nil {
+			var netErr net.Error
+			if errors.As(err, &netErr) && netErr.Timeout() {
+				return
+			}
+			t.Fatalf("read while checking for absent preflight frame: %v", err)
+		}
+		if msg.Type == protocol.MsgTypeTunnelPreflight {
+			t.Fatalf("cross-owner mutation sent tunnel_preflight frame: %+v", msg)
+		}
+	}
+}
+
 func unifiedCapabilityTestConfig(t *testing.T, endpointType string) string {
 	t.Helper()
 	switch endpointType {
@@ -443,6 +510,115 @@ func TestAPI_UnifiedTunnelCreateDerivesOwnerAndListsByClientRole(t *testing.T) {
 	}
 	if len(targetList) != 1 || targetList[0].ID != created.ID {
 		t.Fatalf("target list mismatch: %+v", targetList)
+	}
+}
+
+func TestAPI_UnifiedTunnelMutationsRejectCrossOwnerEndpointClients(t *testing.T) {
+	s, handler, token, cleanup := setupTestServerWithStores(t, true)
+	defer cleanup()
+
+	ownerA, err := s.auth.adminStore.ValidateAdminPassword("admin", "password123")
+	if err != nil {
+		t.Fatalf("load owner A: %v", err)
+	}
+	ownerB, err := s.auth.adminStore.CreateUser("cross-owner-endpoint-b", "Password123")
+	if err != nil {
+		t.Fatalf("create owner B: %v", err)
+	}
+	targetA := createUnifiedAPITestClientForUser(t, s, ownerA.ID, "install-cross-owner-target-a", "cross-owner-target-a")
+	unsupportedCaps := protocol.DefaultClientCapabilities()
+	unsupportedCaps.TargetTypes = []string{protocol.TargetTypeUDPService}
+	targetB := createUnifiedAPITestClientForUserWithCapabilities(t, s, ownerB.ID, "install-cross-owner-target-b", "cross-owner-target-b", unsupportedCaps)
+
+	createResp := doMuxRequest(t, handler, http.MethodPost, "/api/tunnels", token, unifiedCreatePayload("cross-owner-create", targetB.ID, reserveTCPPort(t)))
+	assertTunnelMutationUnknownClient(t, createResp, http.StatusBadRequest, "target.client_id")
+	if _, err := s.store.GetTunnelByIDE(targetB.ID, "cross-owner-create"); !errors.Is(err, ErrTunnelNotFound) {
+		t.Fatalf("cross-owner create must not persist under target B, got err=%v", err)
+	}
+
+	createAllowed := doMuxRequest(t, handler, http.MethodPost, "/api/tunnels", token, unifiedCreatePayload("cross-owner-existing", targetA.ID, reserveTCPPort(t)))
+	if createAllowed.Code != http.StatusCreated {
+		t.Fatalf("create owner A tunnel: want 201, got %d body=%s", createAllowed.Code, createAllowed.Body.String())
+	}
+	var created tunnelSpecAPI
+	if err := mustDecodeJSON(t, createAllowed.Body, &created); err != nil {
+		t.Fatalf("decode owner A tunnel: %v", err)
+	}
+	before, err := s.store.GetTunnelByIDE(targetA.ID, created.ID)
+	if err != nil {
+		t.Fatalf("load owner A tunnel before cross-owner mutations: %v", err)
+	}
+
+	update := []byte(`{"expected_revision":` + strconv.FormatInt(created.Revision, 10) + `,"spec":{
+		"name":"cross-owner-existing",
+		"topology":"server_expose",
+		"ingress":{"location":"server","type":"tcp_listen","config":{"bind_ip":"0.0.0.0","port":` + strconv.Itoa(reserveTCPPort(t)) + `,"allowed_source_cidrs":["0.0.0.0/0","::/0"]}},
+		"target":{"location":"client","client_id":"` + targetB.ID + `","type":"tcp_service","config":{"ip":"127.0.0.1","port":22}},
+		"transport_policy":"server_relay_only"
+	}}`)
+	updateResp := doMuxRequest(t, handler, http.MethodPut, "/api/tunnels/"+created.ID, token, update)
+	assertTunnelMutationUnknownClient(t, updateResp, http.StatusBadRequest, "target.client_id")
+	afterUpdate, err := s.store.GetTunnelByIDE(targetA.ID, created.ID)
+	if err != nil {
+		t.Fatalf("load owner A tunnel after rejected cross-owner update: %v", err)
+	}
+	assertStoredTunnelUnchangedAfterRejectedUpdate(t, before, afterUpdate)
+	if _, err := s.store.GetTunnelByIDE(targetB.ID, created.ID); !errors.Is(err, ErrTunnelNotFound) {
+		t.Fatalf("cross-owner update must not create target B tunnel, got err=%v", err)
+	}
+
+	migrateBody := []byte(`{"expected_revision":` + strconv.FormatInt(created.Revision, 10) + `,"target_client_id":"` + targetB.ID + `"}`)
+	migrateResp := doMuxRequest(t, handler, http.MethodPost, "/api/tunnels/"+created.ID+"/migrate", token, migrateBody)
+	assertMigrateErrorResponse(t, migrateResp, http.StatusNotFound, protocol.TunnelMutationErrorCodeUnknownClient, "target_client_id")
+	assertMigrateRejectDidNotMutate(t, s, before, targetA.ID, targetB.ID)
+}
+
+func TestAPI_UnifiedTunnelCreateRejectsCrossOwnerClientIngressBeforePreflight(t *testing.T) {
+	s := New(0)
+	initTestAdminStore(t, s)
+	useSharedUnifiedTestStore(t, s)
+	handler := s.StartHTTPOnly()
+	ts := httptest.NewServer(s.newHTTPMux())
+	defer ts.Close()
+	s.tunnels.preflightTimeout = 100 * time.Millisecond
+	token := loginAdminTokenLocal(t, handler, "admin", "password123")
+
+	ownerA, err := s.auth.adminStore.ValidateAdminPassword("admin", "password123")
+	if err != nil {
+		t.Fatalf("load owner A: %v", err)
+	}
+	ownerB, err := s.auth.adminStore.CreateUser("cross-owner-preflight-b", "Password123")
+	if err != nil {
+		t.Fatalf("create owner B: %v", err)
+	}
+	const ownerBKey = "cross-owner-preflight-key"
+	if _, err := s.auth.adminStore.AddAPIKeyForUser(ownerB.ID, "cross-owner-preflight", ownerBKey, []string{"connect"}, nil); err != nil {
+		t.Fatalf("create owner B API key: %v", err)
+	}
+	targetA := createUnifiedAPITestClientForUser(t, s, ownerA.ID, "install-cross-owner-preflight-target", "cross-owner-preflight-target")
+
+	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/ws/control"
+	ingressConn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatalf("dial owner B ingress control websocket: %v", err)
+	}
+	defer mustClose(t, ingressConn)
+	ingressAuth := doAuthWithInstallID(t, ingressConn, "cross-owner-preflight-ingress", "install-cross-owner-preflight-ingress", ownerBKey)
+	dataConn := connectDataWSForClient(t, ts, ingressAuth)
+	defer mustClose(t, dataConn)
+
+	create := []byte(`{
+		"name":"cross-owner-preflight",
+		"topology":"client_to_client",
+		"ingress":{"location":"client","client_id":"` + ingressAuth.ClientID + `","type":"tcp_listen","config":{"bind_ip":"127.0.0.1","port":` + strconv.Itoa(reserveTCPPort(t)) + `,"allowed_source_cidrs":["0.0.0.0/0","::/0"]}},
+		"target":{"location":"client","client_id":"` + targetA.ID + `","type":"tcp_service","config":{"ip":"127.0.0.1","port":22}},
+		"transport_policy":"server_relay_only"
+	}`)
+	resp := doMuxRequest(t, handler, http.MethodPost, "/api/tunnels", token, create)
+	assertTunnelMutationUnknownClient(t, resp, http.StatusBadRequest, "ingress.client_id")
+	assertNoTunnelPreflightFrame(t, ingressConn)
+	if _, err := s.store.GetTunnelByIDE(targetA.ID, "cross-owner-preflight"); !errors.Is(err, ErrTunnelNotFound) {
+		t.Fatalf("cross-owner preflight create must not persist config, got err=%v", err)
 	}
 }
 
@@ -1617,8 +1793,19 @@ func TestAPI_UnifiedTunnelMigrateConcurrentSameRevisionReturnsOneSuccessAndRevis
 		rounds   = 8
 		requests = 12
 	)
+	usedPorts := make(map[int]struct{}, rounds)
+	reserveUniqueTCPPort := func() int {
+		for {
+			port := reserveTCPPort(t)
+			if _, exists := usedPorts[port]; exists {
+				continue
+			}
+			usedPorts[port] = struct{}{}
+			return port
+		}
+	}
 	for round := 0; round < rounds; round++ {
-		createResp := doMuxRequest(t, handler, http.MethodPost, "/api/tunnels", token, unifiedCreatePayload(fmt.Sprintf("migrate-concurrent-%d", round), currentTarget.ID, reserveTCPPort(t)))
+		createResp := doMuxRequest(t, handler, http.MethodPost, "/api/tunnels", token, unifiedCreatePayload(fmt.Sprintf("migrate-concurrent-%d", round), currentTarget.ID, reserveUniqueTCPPort()))
 		if createResp.Code != http.StatusCreated {
 			t.Fatalf("round %d POST /api/tunnels: want 201, got %d body=%s", round, createResp.Code, createResp.Body.String())
 		}
@@ -1891,6 +2078,43 @@ func TestAPI_UnifiedTunnelMigrateRejectsUnsupportedTargetCapabilityWithoutMutati
 			t.Fatal("rejected migration must not create next-target runtime")
 		}
 	}
+}
+
+func TestAPI_UnifiedTunnelMigrateRejectsTargetWithoutDirectTransportWithoutMutation(t *testing.T) {
+	s, handler, token, cleanup := setupTestServerWithStores(t, true)
+	defer cleanup()
+
+	currentTarget := createUnifiedAPITestClient(t, s, "install-migrate-direct-current", "migrate-direct-current")
+	ingress := createUnifiedAPITestClient(t, s, "install-migrate-direct-ingress", "migrate-direct-ingress")
+	unsupportedCaps := protocol.DefaultClientCapabilities()
+	unsupportedCaps.P2P.Supported = false
+	nextTarget := createUnifiedAPITestClientWithCapabilities(t, s, "install-migrate-direct-next", "migrate-direct-next", unsupportedCaps)
+
+	createBody := []byte(`{
+		"name":"migrate-direct-policy",
+		"topology":"client_to_client",
+		"ingress":{"location":"client","client_id":"` + ingress.ID + `","type":"tcp_listen","config":{"bind_ip":"127.0.0.1","port":` + strconv.Itoa(reserveTCPPort(t)) + `,"allowed_source_cidrs":["0.0.0.0/0","::/0"]}},
+		"target":{"location":"client","client_id":"` + currentTarget.ID + `","type":"tcp_service","config":{"host":"127.0.0.1","port":22}},
+		"transport_policy":"direct_only"
+	}`)
+	createResp := doMuxRequest(t, handler, http.MethodPost, "/api/tunnels", token, createBody)
+	if createResp.Code != http.StatusCreated {
+		t.Fatalf("create direct tunnel: want 201, got %d body=%s", createResp.Code, createResp.Body.String())
+	}
+	var created tunnelSpecAPI
+	if err := mustDecodeJSON(t, createResp.Body, &created); err != nil {
+		t.Fatalf("decode direct tunnel: %v", err)
+	}
+	before, err := s.store.GetTunnelByIDE(currentTarget.ID, created.ID)
+	if err != nil {
+		t.Fatalf("load direct tunnel before rejected migration: %v", err)
+	}
+
+	body := []byte(`{"expected_revision":` + strconv.FormatInt(created.Revision, 10) + `,"target_client_id":"` + nextTarget.ID + `"}`)
+	resp := doMuxRequest(t, handler, http.MethodPost, "/api/tunnels/"+created.ID+"/migrate", token, body)
+
+	assertMigrateErrorResponse(t, resp, http.StatusBadRequest, protocol.TunnelMutationErrorCodeDirectTransportUnavailable, "target.client_id")
+	assertMigrateRejectDidNotMutate(t, s, before, currentTarget.ID, nextTarget.ID)
 }
 
 func TestAPI_UnifiedTunnelMigrateRejectsMalformedJSONEmptyTargetAndInvalidRevision(t *testing.T) {
@@ -2508,7 +2732,7 @@ func TestAPI_UnifiedTunnelResumeRequiresResumableState(t *testing.T) {
 func TestAPI_UnifiedTunnelUpdateUnprovisionsOldServerExposeTarget(t *testing.T) {
 	s := New(0)
 	initTestAdminStore(t, s)
-	s.store = newTestTunnelStore(t)
+	useSharedUnifiedTestStore(t, s)
 	ts := httptest.NewServer(s.newHTTPMux())
 	defer ts.Close()
 	token := loginAdminTokenLocal(t, s.StartHTTPOnly(), "admin", "password123")
@@ -2625,7 +2849,7 @@ func TestAPI_UnifiedTunnelMigrateOnlineServerExposeReprovisionsNewTarget(t *test
 func TestAPI_UnifiedTunnelDeleteUnprovisionsServerExposeTarget(t *testing.T) {
 	s := New(0)
 	initTestAdminStore(t, s)
-	s.store = newTestTunnelStore(t)
+	useSharedUnifiedTestStore(t, s)
 	ts := httptest.NewServer(s.newHTTPMux())
 	defer ts.Close()
 	token := loginAdminTokenLocal(t, s.StartHTTPOnly(), "admin", "password123")
@@ -2678,7 +2902,7 @@ func TestAPI_UnifiedTunnelDeleteUnprovisionsServerExposeTarget(t *testing.T) {
 func TestAPI_UnifiedTunnelDeleteUnprovisionsClientToClientParticipants(t *testing.T) {
 	s := New(0)
 	initTestAdminStore(t, s)
-	s.store = newTestTunnelStore(t)
+	useSharedUnifiedTestStore(t, s)
 	ts := httptest.NewServer(s.newHTTPMux())
 	defer ts.Close()
 	token := loginAdminTokenLocal(t, s.StartHTTPOnly(), "admin", "password123")
@@ -2734,7 +2958,7 @@ func TestAPI_UnifiedTunnelDeleteUnprovisionsClientToClientParticipants(t *testin
 func TestAPI_UnifiedTunnelUpdateUnprovisionsOldClientToClientParticipants(t *testing.T) {
 	s := New(0)
 	initTestAdminStore(t, s)
-	s.store = newTestTunnelStore(t)
+	useSharedUnifiedTestStore(t, s)
 	ts := httptest.NewServer(s.newHTTPMux())
 	defer ts.Close()
 	token := loginAdminTokenLocal(t, s.StartHTTPOnly(), "admin", "password123")
@@ -2866,7 +3090,7 @@ func TestAPI_UnifiedTunnelMigrateOnlineClientRelayReprovisionsParticipants(t *te
 func TestAPI_UnifiedTunnelStopUnprovisionsClientToClientParticipants(t *testing.T) {
 	s := New(0)
 	initTestAdminStore(t, s)
-	s.store = newTestTunnelStore(t)
+	useSharedUnifiedTestStore(t, s)
 	ts := httptest.NewServer(s.newHTTPMux())
 	defer ts.Close()
 	token := loginAdminTokenLocal(t, s.StartHTTPOnly(), "admin", "password123")
@@ -2923,7 +3147,7 @@ func TestAPI_UnifiedTunnelStopUnprovisionsClientToClientParticipants(t *testing.
 func TestAPI_UnifiedTunnelCreateDoesNotWaitForServerExposeProvisionAck(t *testing.T) {
 	s := New(0)
 	initTestAdminStore(t, s)
-	s.store = newTestTunnelStore(t)
+	useSharedUnifiedTestStore(t, s)
 	s.tunnels.tunnelReadyTimeout = time.Second
 	ts := httptest.NewServer(s.newHTTPMux())
 	defer ts.Close()
@@ -2962,7 +3186,7 @@ func TestAPI_UnifiedTunnelCreateDoesNotWaitForServerExposeProvisionAck(t *testin
 func TestAPI_UnifiedTunnelCreatePersistsProvisionRuntimeFailure(t *testing.T) {
 	s := New(0)
 	initTestAdminStore(t, s)
-	s.store = newTestTunnelStore(t)
+	useSharedUnifiedTestStore(t, s)
 	s.tunnels.tunnelReadyTimeout = 20 * time.Millisecond
 	ts := httptest.NewServer(s.newHTTPMux())
 	defer ts.Close()
@@ -3022,7 +3246,7 @@ func TestAPI_UnifiedTunnelCreatePersistsProvisionRuntimeFailure(t *testing.T) {
 func TestAPI_UnifiedTunnelServerExposeProvisionTimeoutProjectsIssue(t *testing.T) {
 	s := New(0)
 	initTestAdminStore(t, s)
-	s.store = newTestTunnelStore(t)
+	useSharedUnifiedTestStore(t, s)
 	s.tunnels.tunnelReadyTimeout = 20 * time.Millisecond
 	ts := httptest.NewServer(s.newHTTPMux())
 	defer ts.Close()
@@ -3105,7 +3329,7 @@ func TestAPI_UnifiedTunnelServerExposeProvisionTimeoutProjectsIssue(t *testing.T
 func TestAPI_UnifiedTunnelServerExposeListenFailureProjectsIssue(t *testing.T) {
 	s := New(0)
 	initTestAdminStore(t, s)
-	s.store = newTestTunnelStore(t)
+	useSharedUnifiedTestStore(t, s)
 	ts := httptest.NewServer(s.newHTTPMux())
 	defer ts.Close()
 	token := loginAdminTokenLocal(t, s.StartHTTPOnly(), "admin", "password123")
@@ -3174,7 +3398,7 @@ func TestAPI_UnifiedTunnelServerExposeListenFailureProjectsIssue(t *testing.T) {
 func TestAPI_UnifiedTunnelUpdateSameIngressPortSkipsSelfPreflightConflict(t *testing.T) {
 	s := New(0)
 	initTestAdminStore(t, s)
-	s.store = newTestTunnelStore(t)
+	useSharedUnifiedTestStore(t, s)
 	ts := httptest.NewServer(s.newHTTPMux())
 	defer ts.Close()
 	token := loginAdminTokenLocal(t, s.StartHTTPOnly(), "admin", "password123")
@@ -3236,7 +3460,7 @@ func TestAPI_UnifiedTunnelUpdateSameIngressPortSkipsSelfPreflightConflict(t *tes
 func TestAPI_UnifiedTunnelUpdatePreflightFailureKeepsOldClientToClientConfig(t *testing.T) {
 	s := New(0)
 	initTestAdminStore(t, s)
-	s.store = newTestTunnelStore(t)
+	useSharedUnifiedTestStore(t, s)
 	ts := httptest.NewServer(s.newHTTPMux())
 	defer ts.Close()
 	token := loginAdminTokenLocal(t, s.StartHTTPOnly(), "admin", "password123")
@@ -3599,14 +3823,17 @@ func TestServer_TunnelRuntimeReportSchedulesReconcile(t *testing.T) {
 	s := New(0)
 	s.store = newTestTunnelStore(t)
 	stored := testClientRelayStoredTunnel(t)
-	mustAddStableTunnel(t, s.store, stored)
+	stored = mustAddStableTunnelForServer(t, s, stored)
 	s.c2c.set(stored)
+	ownerEpoch := s.lifecycleGate(stored.OwnerUserID).epoch
 
 	caps := protocol.DefaultClientCapabilities()
 	_, targetSession := newTestClientRelayDataSession(t)
 	_, ingressSession := newTestClientRelayDataSession(t)
 	targetClient := &ClientConn{
 		ID:          stored.Target.ClientID,
+		OwnerUserID: stored.OwnerUserID,
+		OwnerEpoch:  ownerEpoch,
 		Info:        protocol.ClientInfo{Capabilities: &caps},
 		generation:  1,
 		state:       clientStateLive,
@@ -3614,6 +3841,8 @@ func TestServer_TunnelRuntimeReportSchedulesReconcile(t *testing.T) {
 	}
 	ingressClient := &ClientConn{
 		ID:          stored.Ingress.ClientID,
+		OwnerUserID: stored.OwnerUserID,
+		OwnerEpoch:  ownerEpoch,
 		Info:        protocol.ClientInfo{Capabilities: &caps},
 		generation:  1,
 		state:       clientStateLive,
@@ -3975,7 +4204,7 @@ func TestAPI_UnifiedTunnelOnlineIngressPreflightFailureDoesNotPersist(t *testing
 func TestAPI_UnifiedTunnelSOCKS5ClientIngressPreflightUsesMinimalConfig(t *testing.T) {
 	s := New(0)
 	initTestAdminStore(t, s)
-	s.store = newTestTunnelStore(t)
+	useSharedUnifiedTestStore(t, s)
 	ts := httptest.NewServer(s.newHTTPMux())
 	defer ts.Close()
 	token := loginAdminTokenLocal(t, s.StartHTTPOnly(), "admin", "password123")
@@ -4114,13 +4343,19 @@ func TestReconcileUnifiedTunnelRoutesServerExposeThroughSingleEntry(t *testing.T
 		t.Fatalf("normalize stored tunnel: %v", err)
 	}
 	mustAddStableTunnel(t, s.store, stored)
+	stored, err := s.store.GetTunnelByID(stored.ID)
+	if err != nil {
+		t.Fatalf("reload stored tunnel owner: %v", err)
+	}
 
 	client := &ClientConn{
-		ID:         record.ID,
-		Info:       protocol.ClientInfo{Hostname: "reconcile-server-expose"},
-		proxies:    make(map[string]*ProxyTunnel),
-		generation: 1,
-		state:      clientStateLive,
+		ID:          record.ID,
+		OwnerUserID: stored.OwnerUserID,
+		OwnerEpoch:  s.lifecycleGate(stored.OwnerUserID).epoch,
+		Info:        protocol.ClientInfo{Hostname: "reconcile-server-expose"},
+		proxies:     make(map[string]*ProxyTunnel),
+		generation:  1,
+		state:       clientStateLive,
 	}
 	s.clients.Store(record.ID, client)
 

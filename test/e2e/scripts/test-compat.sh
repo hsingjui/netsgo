@@ -22,6 +22,7 @@ E2E_BASE_COMPOSE="${E2E_BASE_COMPOSE:?E2E_BASE_COMPOSE is required}"
 E2E_PROXY_COMPOSE="${E2E_PROXY_COMPOSE:?E2E_PROXY_COMPOSE is required}"
 PROXY_PORT="${PROXY_PORT:-19080}"
 UPSTREAM_PORT="${UPSTREAM_PORT:-19081}"
+E2E_PROBE_MODE="${E2E_PROBE_MODE:-internal}"
 COMPAT_BASELINE="${COMPAT_BASELINE:-v0.1.8}"
 E2E_CURRENT_IMAGE="${E2E_CURRENT_IMAGE:-netsgo-e2e:current}"
 E2E_STABLE_IMAGE="${E2E_STABLE_IMAGE:-netsgo-e2e:${COMPAT_BASELINE}}"
@@ -59,7 +60,8 @@ fi
 SMOKE_BASE_COMPOSE="${E2E_BASE_COMPOSE}"
 SMOKE_PROXY_COMPOSE="${E2E_PROXY_COMPOSE}"
 SMOKE_PROXY_PORT="${PROXY_PORT}"
-export SMOKE_BASE_COMPOSE SMOKE_PROXY_COMPOSE SMOKE_PROXY_PORT
+SMOKE_PROBE_MODE="${E2E_PROBE_MODE}"
+export SMOKE_BASE_COMPOSE SMOKE_PROXY_COMPOSE SMOKE_PROXY_PORT SMOKE_PROBE_MODE
 export NETSGO_E2E_TOOLS_IMAGE
 # Cross-version rows intentionally exercise the common relay contract. Client
 # capabilities alone cannot prove that an older Server understands the new
@@ -71,6 +73,7 @@ run_smoke() {
 	local project="$1"
 	SMOKE_PROJECT="${project}" \
 	SMOKE_ADMIN_PASS="$(random_admin_password)" \
+	SMOKE_PROBE_MODE="${E2E_PROBE_MODE}" \
 	bash "${NETSGO_E2E_DIR}/test/e2e/scripts/smoke-system.sh"
 }
 
@@ -83,6 +86,8 @@ run_main_system_e2e() {
 	NETSGO_E2E_COMPOSE_FILES="${E2E_BASE_COMPOSE},${E2E_PROXY_COMPOSE}" \
 	NETSGO_ADMIN_PASS="${admin_pass}" \
 	NETSGO_E2E_COMPOSE_BUILD=0 \
+	NETSGO_E2E_SKIP_LARGE_UPLOAD=1 \
+	NETSGO_E2E_SKIP_KEY_ROTATION=1 \
 	PROXY_PORT="${PROXY_PORT}" \
 	UPSTREAM_PORT="${UPSTREAM_PORT}" \
 	SERVER_TCP_PORT="${SERVER_TCP_PORT:-19093}" \
@@ -197,6 +202,8 @@ log "current image:   ${E2E_CURRENT_IMAGE}"
 log "stable image:    ${E2E_STABLE_IMAGE}"
 log "proxy:           ${E2E_PROXY}"
 log "mode:            ${MODE}"
+log "probe mode:      ${E2E_PROBE_MODE} (host remains available via E2E_PROBE_MODE=host)"
+log "compat skips:    1 MiB raw upload and client key rotation (not in ${COMPAT_BASELINE} contract)"
 log "scenarios:       ${total}"
 log "NOTE: smoke mode checks startup/connectivity."
 log "      full mode runs main TestSystemE2E matrix plus focused single-target and c2c clean-reject cases."

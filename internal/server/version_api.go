@@ -42,7 +42,19 @@ func (s *Server) handleAPIVersionCheck(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleAPIClientVersionCheck(w http.ResponseWriter, r *http.Request) {
+	scope, scopeOK := requireResourceScope(w, r)
+	if !scopeOK {
+		return
+	}
 	clientID := r.PathValue("id")
+	if s.auth == nil || s.auth.adminStore == nil {
+		writeAPIError(w, http.StatusInternalServerError, "admin_store_unavailable", "admin store unavailable")
+		return
+	}
+	if _, ok := s.auth.adminStore.GetRegisteredClientForUser(scope.OwnerUserID, clientID); !ok {
+		writeAPIError(w, http.StatusNotFound, "client_not_found", "client not found")
+		return
+	}
 	value, ok := s.clients.Load(clientID)
 	if !ok {
 		result := versionCheckFromUpdater("client", clientID, updater.CheckResult{

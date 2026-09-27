@@ -5,10 +5,12 @@ import { useTranslation } from 'react-i18next';
 import { dashboardRoute } from './dashboard';
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { cn } from '@/lib/utils';
+import { requireAdmin } from '@/lib/auth';
 
 export const adminRoute = createRoute({
   getParentRoute: () => dashboardRoute,
   path: '/admin',
+  beforeLoad: requireAdmin,
   component: AdminLayout,
 });
 

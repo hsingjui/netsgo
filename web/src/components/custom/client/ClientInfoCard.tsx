@@ -15,10 +15,12 @@ import { VersionUpdateIndicator } from '@/components/custom/common/VersionUpdate
 import { ClientBandwidthDialog } from '@/components/custom/client/ClientBandwidthDialog';
 import { Button } from '@/components/ui/button';
 import type { Client } from '@/types';
+import type { ResourceScope } from '@/lib/resource-scope';
 import { getClientDisplayName } from '@/lib/client-utils';
 import { useTranslation } from 'react-i18next';
 
 interface ClientInfoCardProps {
+  scope: ResourceScope;
   client: Client;
   onRequestDelete?: (client: Client) => void;
 }
@@ -43,7 +45,7 @@ function ProgressBar({ value, label, total, colorClass = 'bg-primary' }: { value
   );
 }
 
-export function ClientInfoCard({ client, onRequestDelete }: ClientInfoCardProps) {
+export function ClientInfoCard({ scope, client, onRequestDelete }: ClientInfoCardProps) {
   const { t } = useTranslation();
   const stats = client.stats;
   const info = client.info;
@@ -133,6 +135,7 @@ export function ClientInfoCard({ client, onRequestDelete }: ClientInfoCardProps)
           <div className="flex items-center justify-between gap-2">
             <span className="text-xs text-muted-foreground flex items-center gap-1.5"><Box className="w-4 h-4" />{t('clients.bandwidth')}</span>
             <ClientBandwidthDialog
+              scope={scope}
               client={client}
               trigger={
                 <Button variant="ghost" size="icon-xs" title={t('clients.editBandwidth')}>
@@ -155,6 +158,7 @@ export function ClientInfoCard({ client, onRequestDelete }: ClientInfoCardProps)
           <span className="group/version-update inline-flex min-w-0 items-center gap-1.5 text-xs text-muted-foreground">
             <span className="truncate">{info.version || '-'}</span>
             <VersionUpdateIndicator
+              scope={scope}
               target={{
                 kind: 'client',
                 id: client.id,

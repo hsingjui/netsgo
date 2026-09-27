@@ -1,6 +1,7 @@
 package client
 
 import (
+	"fmt"
 	"regexp"
 	"runtime"
 	"strings"
@@ -23,6 +24,9 @@ import (
 // Windows: C: → "C:"
 var reDiskBase = regexp.MustCompile(`(disk\d+|sd[a-z]+|nvme\d+n\d+|[A-Z]:)`)
 
+type networkIOCollector func(bool) ([]psnet.IOCountersStat, error)
+type systemUptimeCollector func() (uint64, error)
+
 func baseDiskName(device string) string {
 	m := reDiskBase.FindString(device)
 	if m != "" {
@@ -31,9 +35,23 @@ func baseDiskName(device string) string {
 	return device
 }
 
+func collectNetworkIOCounters(collect networkIOCollector) (counters []psnet.IOCountersStat, err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			counters = nil
+			err = fmt.Errorf("collect network I/O counters: %v", recovered)
+		}
+	}()
+	return collect(false)
+}
+
 // CollectSystemStats collects the current system runtime status.
 // processStart is the program start time, used to calculate the NetsGo process uptime.
 func CollectSystemStats(processStart time.Time) (*protocol.SystemStats, error) {
+	return collectSystemStats(processStart, host.Uptime)
+}
+
+func collectSystemStats(processStart time.Time, collectUptime systemUptimeCollector) (*protocol.SystemStats, error) {
 	stats := &protocol.SystemStats{
 		NumCPU: runtime.NumCPU(),
 	}
@@ -110,14 +128,14 @@ func CollectSystemStats(processStart time.Time) (*protocol.SystemStats, error) {
 	}
 
 	// Network I/O (aggregated across all interfaces)
-	netIO, err := psnet.IOCounters(false)
+	netIO, err := collectNetworkIOCounters(psnet.IOCounters)
 	if err == nil && len(netIO) > 0 {
 		stats.NetSent = netIO[0].BytesSent
 		stats.NetRecv = netIO[0].BytesRecv
 	}
 
 	// System uptime
-	uptime, err := host.Uptime()
+	uptime, err := collectUptime()
 	if err == nil {
 		stats.Uptime = uptime
 	}

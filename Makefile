@@ -1,4 +1,4 @@
-.PHONY: build build-web build-go build-desktop-sidecar build-desktop build-desktop-macos-local sign-desktop-macos-app package-desktop-macos-local clean docs dev-server dev-client dev-bench dev-web test test-race lint test-tdd-red test-tdd-red-client test-tdd-red-server test-system-e2e test-system-e2e-nginx test-system-e2e-caddy test-system-e2e-capability-loss test-p2p-double-nat-e2e test-playwright-e2e test-playwright-e2e-smoke test-playwright-e2e-full test-playwright-e2e-cdp test-playwright-e2e-cdp-smoke test-playwright-e2e-cdp-full test-playwright-e2e-cdp-run test-playwright-e2e-cdp-check test-playwright-e2e-run bench-data system-e2e-up system-e2e-logs system-e2e-down system-e2e-clean docker-build-e2e-current docker-build-e2e-capability-loss docker-build-e2e-prebuilt docker-build-e2e-stable test-baseline-e2e test-compat-e2e test-upgrade-e2e
+.PHONY: build build-web build-go build-desktop-sidecar build-desktop build-desktop-macos-local sign-desktop-macos-app package-desktop-macos-local clean docs dev-server dev-client dev-bench dev-web test test-race lint lint-go test-tdd-red test-tdd-red-client test-tdd-red-server test-system-e2e test-system-e2e-nginx test-system-e2e-caddy test-system-e2e-capability-loss test-p2p-double-nat-e2e test-playwright-e2e test-playwright-e2e-smoke test-playwright-e2e-full test-playwright-e2e-webhook test-playwright-e2e-cdp test-playwright-e2e-cdp-smoke test-playwright-e2e-cdp-full test-playwright-e2e-cdp-run test-playwright-e2e-cdp-check test-playwright-e2e-run bench-data system-e2e-up system-e2e-logs system-e2e-down system-e2e-clean docker-build-e2e-current docker-build-e2e-capability-loss docker-build-e2e-prebuilt docker-build-e2e-stable test-baseline-e2e test-compat-e2e test-upgrade-e2e
 
 # 编译输出目录
 BIN_DIR=bin
@@ -94,6 +94,7 @@ DEV_INIT_SERVER_ADDR    ?= http://localhost:$(DEV_PORT)
 E2E_PROXY ?= nginx
 E2E_PROJECT ?= netsgo-system-$(E2E_PROXY)
 E2E_CAPABILITY_LOSS_PROJECT ?= netsgo-system-capability-loss
+E2E_PROBE_MODE ?= internal
 E2E_PROXY_PORT ?= 19080
 E2E_UPSTREAM_PORT ?= 19081
 E2E_SERVER_TCP_PORT ?= 19093
@@ -136,6 +137,8 @@ PLAYWRIGHT_TCP_INGRESS_PORT ?= 19190
 PLAYWRIGHT_UDP_INGRESS_PORT ?= 19191
 PLAYWRIGHT_TCP_LIFECYCLE_INGRESS_PORT ?= 19192
 PLAYWRIGHT_TCP_EDIT_INGRESS_PORT ?= 19193
+PLAYWRIGHT_USER_A_TCP_INGRESS_PORT ?= 19194
+PLAYWRIGHT_USER_B_TCP_INGRESS_PORT ?= 19195
 LOCAL_CHROME_CDP_ENDPOINT ?= http://127.0.0.1:9222
 LOCAL_CHROME_CDP_SLOW_MO_MS ?= 250
 LOCAL_CHROME_CDP_FINISH_DELAY_MS ?= 5000
@@ -177,7 +180,8 @@ test:
 	go test ./...
 
 test-race:
-	go test -race ./...
+	# SQLite-backed server tests approach 20 minutes under the race detector on CI.
+	go test -race ./... -timeout=25m
 
 test-tdd-red: test-tdd-red-client test-tdd-red-server
 
@@ -187,8 +191,18 @@ test-tdd-red-client:
 test-tdd-red-server:
 	go test ./internal/server -run 'TestUnifiedReconcileRegistry(SerializesSameTunnelAndRerunsDirty|CoalescesMultipleDirtyCallsIntoSingleRerun)|TestUnifiedServerExpose(ReconcileRejectsStaleProvisionAckAfterRevisionAdvance|RejectedProvisionLeavesNoListenerOrAckWaiter)' -count=1
 
-lint:
+# 与 CI 保持一致的 golangci-lint 版本
+GOLANGCI_LINT_VERSION ?= v2.11
+
+lint: lint-go
 	cd web && bun run lint
+
+lint-go:
+	@if ! command -v golangci-lint >/dev/null 2>&1; then \
+		echo "golangci-lint not found, installing $(GOLANGCI_LINT_VERSION)..."; \
+		curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b $$(go env GOPATH)/bin $(GOLANGCI_LINT_VERSION); \
+	fi
+	golangci-lint run ./...
 
 bench-data:
 	go test ./pkg/mux -run '^$$' -bench 'BenchmarkDataChannelTransport_YamuxOverPipe_vs_WSConn' -benchmem
@@ -249,6 +263,7 @@ test-system-e2e-run:
 	NETSGO_E2E_COMPOSE_PROJECT=$(E2E_PROJECT) \
 	NETSGO_E2E_COMPOSE_FILES=$(E2E_BASE_COMPOSE),$(E2E_PROXY_COMPOSE) \
 	NETSGO_E2E_REQUIRE_P2P=1 \
+	E2E_PROBE_MODE=$(E2E_PROBE_MODE) \
 	go test -tags=e2e ./test/e2e -run 'TestSystem.*E2E' -count=1 -timeout 20m
 
 test-playwright-e2e: test-playwright-e2e-smoke
@@ -257,6 +272,9 @@ test-playwright-e2e-smoke: PLAYWRIGHT_ARGS=--grep @smoke
 test-playwright-e2e-smoke: test-playwright-e2e-run
 
 test-playwright-e2e-full: test-playwright-e2e-run
+
+test-playwright-e2e-webhook: PLAYWRIGHT_ARGS=--grep @webhook
+test-playwright-e2e-webhook: test-playwright-e2e-run
 
 test-playwright-e2e-cdp: test-playwright-e2e-cdp-smoke
 
@@ -281,16 +299,14 @@ test-playwright-e2e-run: build-web
 	@set -e; \
 	admin_pass="$${NETSGO_ADMIN_PASS:-NetsGo1-$$(openssl rand -hex 12 2>/dev/null || uuidgen)}"; \
 	playwright_cdp_endpoint="$${PLAYWRIGHT_CDP_ENDPOINT:-}"; \
-	if [ -z "$${playwright_cdp_endpoint}" ] && curl -fsS "$(LOCAL_CHROME_CDP_ENDPOINT)/json/version" >/dev/null 2>&1; then \
-		playwright_cdp_endpoint="$(LOCAL_CHROME_CDP_ENDPOINT)"; \
-		echo "Using local Chrome CDP endpoint: $${playwright_cdp_endpoint}"; \
-	fi; \
 	cleanup() { \
 		PLAYWRIGHT_SERVER_PORT=$(PLAYWRIGHT_SERVER_PORT) \
 		PLAYWRIGHT_TCP_INGRESS_PORT=$(PLAYWRIGHT_TCP_INGRESS_PORT) \
 		PLAYWRIGHT_UDP_INGRESS_PORT=$(PLAYWRIGHT_UDP_INGRESS_PORT) \
 		PLAYWRIGHT_TCP_LIFECYCLE_INGRESS_PORT=$(PLAYWRIGHT_TCP_LIFECYCLE_INGRESS_PORT) \
 		PLAYWRIGHT_TCP_EDIT_INGRESS_PORT=$(PLAYWRIGHT_TCP_EDIT_INGRESS_PORT) \
+		PLAYWRIGHT_USER_A_TCP_INGRESS_PORT=$(PLAYWRIGHT_USER_A_TCP_INGRESS_PORT) \
+		PLAYWRIGHT_USER_B_TCP_INGRESS_PORT=$(PLAYWRIGHT_USER_B_TCP_INGRESS_PORT) \
 		NETSGO_ADMIN_PASS="$${admin_pass}" \
 		docker compose -f $(PLAYWRIGHT_COMPOSE) -p $(PLAYWRIGHT_PROJECT) down -v --remove-orphans; \
 	}; \
@@ -300,8 +316,38 @@ test-playwright-e2e-run: build-web
 	PLAYWRIGHT_UDP_INGRESS_PORT=$(PLAYWRIGHT_UDP_INGRESS_PORT) \
 	PLAYWRIGHT_TCP_LIFECYCLE_INGRESS_PORT=$(PLAYWRIGHT_TCP_LIFECYCLE_INGRESS_PORT) \
 	PLAYWRIGHT_TCP_EDIT_INGRESS_PORT=$(PLAYWRIGHT_TCP_EDIT_INGRESS_PORT) \
+	PLAYWRIGHT_USER_A_TCP_INGRESS_PORT=$(PLAYWRIGHT_USER_A_TCP_INGRESS_PORT) \
+	PLAYWRIGHT_USER_B_TCP_INGRESS_PORT=$(PLAYWRIGHT_USER_B_TCP_INGRESS_PORT) \
 	NETSGO_ADMIN_PASS="$${admin_pass}" \
 	docker compose -f $(PLAYWRIGHT_COMPOSE) -p $(PLAYWRIGHT_PROJECT) up -d --build --remove-orphans; \
+	fixture_container="$$(PLAYWRIGHT_SERVER_PORT=$(PLAYWRIGHT_SERVER_PORT) \
+		PLAYWRIGHT_TCP_INGRESS_PORT=$(PLAYWRIGHT_TCP_INGRESS_PORT) \
+		PLAYWRIGHT_UDP_INGRESS_PORT=$(PLAYWRIGHT_UDP_INGRESS_PORT) \
+		PLAYWRIGHT_TCP_LIFECYCLE_INGRESS_PORT=$(PLAYWRIGHT_TCP_LIFECYCLE_INGRESS_PORT) \
+		PLAYWRIGHT_TCP_EDIT_INGRESS_PORT=$(PLAYWRIGHT_TCP_EDIT_INGRESS_PORT) \
+		PLAYWRIGHT_USER_A_TCP_INGRESS_PORT=$(PLAYWRIGHT_USER_A_TCP_INGRESS_PORT) \
+		PLAYWRIGHT_USER_B_TCP_INGRESS_PORT=$(PLAYWRIGHT_USER_B_TCP_INGRESS_PORT) \
+		NETSGO_ADMIN_PASS="$${admin_pass}" \
+		docker compose -f $(PLAYWRIGHT_COMPOSE) -p $(PLAYWRIGHT_PROJECT) ps -q multi-user-fixture)"; \
+	if [ -z "$${fixture_container}" ]; then \
+		echo "multi-user fixture container was not created" >&2; exit 1; \
+	fi; \
+	fixture_deadline="$$(($$(date +%s) + $${NETSGO_BOOTSTRAP_WAIT_TIMEOUT:-180}))"; \
+	while :; do \
+		fixture_state="$$(docker inspect -f '{{.State.Status}}' "$${fixture_container}" 2>/dev/null || true)"; \
+		case "$${fixture_state}" in \
+			exited|dead) break ;; \
+			running|created|restarting) ;; \
+			*) if [ "$$(date +%s)" -ge "$${fixture_deadline}" ]; then echo "multi-user fixture did not start" >&2; exit 1; fi ;; \
+		esac; \
+		if [ "$$(date +%s)" -ge "$${fixture_deadline}" ]; then echo "timed out waiting for multi-user fixture" >&2; exit 1; fi; \
+		sleep 1; \
+	done; \
+	fixture_exit="$$(docker inspect -f '{{.State.ExitCode}}' "$${fixture_container}")"; \
+	if [ "$${fixture_exit}" -ne 0 ]; then \
+		NETSGO_ADMIN_PASS="$${admin_pass}" docker compose -f $(PLAYWRIGHT_COMPOSE) -p $(PLAYWRIGHT_PROJECT) logs --no-color multi-user-fixture; \
+		exit "$${fixture_exit}"; \
+	fi; \
 	cd web && \
 	NETSGO_E2E_BASE_URL=http://127.0.0.1:$(PLAYWRIGHT_SERVER_PORT) \
 	NETSGO_ADMIN_PASS="$${admin_pass}" \
@@ -309,6 +355,8 @@ test-playwright-e2e-run: build-web
 	PLAYWRIGHT_UDP_INGRESS_PORT=$(PLAYWRIGHT_UDP_INGRESS_PORT) \
 	PLAYWRIGHT_TCP_LIFECYCLE_INGRESS_PORT=$(PLAYWRIGHT_TCP_LIFECYCLE_INGRESS_PORT) \
 	PLAYWRIGHT_TCP_EDIT_INGRESS_PORT=$(PLAYWRIGHT_TCP_EDIT_INGRESS_PORT) \
+	PLAYWRIGHT_USER_A_TCP_INGRESS_PORT=$(PLAYWRIGHT_USER_A_TCP_INGRESS_PORT) \
+	PLAYWRIGHT_USER_B_TCP_INGRESS_PORT=$(PLAYWRIGHT_USER_B_TCP_INGRESS_PORT) \
 	PLAYWRIGHT_CDP_ENDPOINT="$${playwright_cdp_endpoint}" \
 	PLAYWRIGHT_CDP_SLOW_MO_MS="$(LOCAL_CHROME_CDP_SLOW_MO_MS)" \
 	PLAYWRIGHT_CDP_FINISH_DELAY_MS="$(LOCAL_CHROME_CDP_FINISH_DELAY_MS)" \
@@ -348,6 +396,7 @@ COMPAT_ABORT_ON_FAILURE ?= false
 BASELINE_MODE ?= full
 BASELINE_REBUILD_IMAGE ?= false
 UPGRADE_RECOVERY_TIMEOUT_SECONDS ?= 120
+UPGRADE_ROLLBACK_MODE ?= auto
 
 docker-build-e2e-current: build-web
 	@echo "Building e2e image $(E2E_CURRENT_IMAGE) from current code..."
@@ -394,6 +443,7 @@ test-baseline-e2e:
 	E2E_STABLE_IMAGE="$(E2E_STABLE_IMAGE)" \
 	BASELINE_MODE="$(BASELINE_MODE)" \
 	BASELINE_REBUILD_IMAGE="$(BASELINE_REBUILD_IMAGE)" \
+	E2E_PROBE_MODE="$(E2E_PROBE_MODE)" \
 	NETSGO_E2E_DIR="$(CURDIR)" \
 	bash $(CURDIR)/test/e2e/scripts/test-baseline.sh
 
@@ -423,6 +473,7 @@ test-compat-e2e:
 	E2E_STABLE_IMAGE="$(E2E_STABLE_IMAGE)" \
 	COMPAT_MODE="$(COMPAT_MODE)" \
 	COMPAT_ABORT_ON_FAILURE="$(COMPAT_ABORT_ON_FAILURE)" \
+	E2E_PROBE_MODE="$(E2E_PROBE_MODE)" \
 	NETSGO_E2E_DIR="$(CURDIR)" \
 	bash $(CURDIR)/test/e2e/scripts/test-compat.sh
 
@@ -452,5 +503,7 @@ test-upgrade-e2e:
 	E2E_STABLE_IMAGE="$(E2E_STABLE_IMAGE)" \
 	NETSGO_E2E_TOOLS_IMAGE="$(E2E_STABLE_IMAGE)" \
 	UPGRADE_RECOVERY_TIMEOUT_SECONDS="$(UPGRADE_RECOVERY_TIMEOUT_SECONDS)" \
+	UPGRADE_ROLLBACK_MODE="$(UPGRADE_ROLLBACK_MODE)" \
+	E2E_PROBE_MODE="$(E2E_PROBE_MODE)" \
 	NETSGO_E2E_DIR="$(CURDIR)" \
 	bash $(CURDIR)/test/e2e/scripts/test-upgrade.sh

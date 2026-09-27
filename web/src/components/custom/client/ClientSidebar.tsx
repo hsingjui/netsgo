@@ -1,16 +1,17 @@
 import { useMemo } from 'react';
 import {
   Server as ServerIcon, LayoutDashboard,
-  Settings,
+  Settings, Activity, Users, Webhook,
   BookOpen, LayersPlus, Languages, LogOut
 } from 'lucide-react';
-import { Link, useMatch, useRouterState, useNavigate } from '@tanstack/react-router';
+import { Link, useRouterState, useNavigate } from '@tanstack/react-router';
 import type { Client } from '@/types';
 import { cn } from '@/lib/utils';
 import { getClientDisplayName } from '@/lib/client-utils';
 import { useAddClientDialog } from './add-client-dialog-context';
-import { api } from '@/lib/api';
 import { useAuthStore } from '@/stores/auth-store';
+import { logoutCurrentSession } from '@/lib/auth';
+import type { ResourceScope } from '@/lib/resource-scope';
 import { useTranslation } from 'react-i18next';
 import { SUPPORTED_LOCALES, type SupportedLocale } from '@/i18n';
 import {
@@ -41,6 +42,7 @@ import {
 } from '@/components/ui/sidebar';
 
 interface ClientSidebarProps {
+  scope: ResourceScope | null;
   clients: Client[];
   isLoading: boolean;
 }
@@ -54,31 +56,25 @@ const DOCS_URL = 'https://netsgo.zs.uy';
 
 const NAV_ITEM_CLASS = 'rounded-md font-medium text-muted-foreground hover:text-foreground';
 
-export function ClientSidebar({ clients, isLoading }: ClientSidebarProps) {
+export function ClientSidebar({ scope, clients, isLoading }: ClientSidebarProps) {
   const { t, i18n } = useTranslation();
   const { openAddClientDialog } = useAddClientDialog();
   const navigate = useNavigate();
-  const logout = useAuthStore((state) => state.logout);
+  const principal = useAuthStore((state) => state.user);
+  const isAdmin = principal?.is_admin === true;
 
   const handleLogout = async () => {
-    try {
-      await api.post('/api/auth/logout');
-    } catch {
-      // ignore logout failures and clear local state anyway
-    }
-    logout();
+    await logoutCurrentSession();
     navigate({ to: '/login' });
   };
 
-  // 从路由匹配获取当前选中的 clientId
-  const clientMatch = useMatch({ from: '/dashboard/clients/$clientId', shouldThrow: false });
-  const currentClientId = clientMatch?.params?.clientId;
-
   // 判断当前是否在概览页（路径精确为 /dashboard 且无 clientId）
   const pathname = useRouterState({ select: (s) => s.location.pathname });
-  const isAdmin = pathname.includes('/admin');
+  const isAdminSection = pathname.includes('/admin');
+  const isActivity = pathname.includes('/activity');
+  const isWebhooks = pathname.includes('/webhooks');
   const isClientPage = pathname.includes('/clients/');
-  const isOverview = !currentClientId && !isAdmin && !isClientPage;
+  const isOverview = !isAdminSection && !isActivity && !isWebhooks && !isClientPage && pathname !== '/dashboard/users';
   const currentLanguage = SUPPORTED_LOCALES.includes(i18n.resolvedLanguage as SupportedLocale)
     ? i18n.resolvedLanguage as SupportedLocale
     : 'en-US';
@@ -127,11 +123,52 @@ export function ClientSidebar({ clients, isLoading }: ClientSidebarProps) {
                 </Link>
               </SidebarMenuButton>
             </SidebarMenuItem>
+            {isAdmin ? (
+              <SidebarMenuItem>
+                <SidebarMenuButton
+                  asChild
+                  isActive={pathname === '/dashboard/users'}
+                  tooltip={t('users.navLabel')}
+                  className={NAV_ITEM_CLASS}
+                >
+                  <Link to="/dashboard/users">
+                    <Users className="h-4 w-4" />
+                    <span>{t('users.navLabel')}</span>
+                  </Link>
+                </SidebarMenuButton>
+              </SidebarMenuItem>
+            ) : null}
+            <SidebarMenuItem>
+              <SidebarMenuButton
+                asChild
+                isActive={isActivity}
+                tooltip={t('activity.navLabel')}
+                className={NAV_ITEM_CLASS}
+              >
+                <Link to="/dashboard/activity" search={{ scope: 'global', severity: ['info', 'warning', 'error'], category: [] }}>
+                  <Activity className="h-4 w-4" />
+                  <span>{t('activity.navLabel')}</span>
+                </Link>
+              </SidebarMenuButton>
+            </SidebarMenuItem>
+            <SidebarMenuItem>
+              <SidebarMenuButton
+                asChild
+                isActive={isWebhooks}
+                tooltip={t('webhooks.navLabel')}
+                className={NAV_ITEM_CLASS}
+              >
+                <Link to="/dashboard/webhooks">
+                  <Webhook className="h-4 w-4" />
+                  <span>{t('webhooks.navLabel')}</span>
+                </Link>
+              </SidebarMenuButton>
+            </SidebarMenuItem>
           </SidebarMenu>
         </SidebarGroup>
 
         {/* 客户端列表 */}
-        <SidebarGroup className="group/clients mt-4">
+        {scope ? <SidebarGroup className="group/clients mt-4">
           <SidebarGroupLabel className="text-[11px] font-bold text-muted-foreground/70 uppercase tracking-[0.2em] px-2 mb-1 transition-colors group-hover/clients:text-muted-foreground">
             {t('dashboard.clients')}
           </SidebarGroupLabel>
@@ -173,7 +210,7 @@ export function ClientSidebar({ clients, isLoading }: ClientSidebarProps) {
               <SidebarMenu>
                 {sortedClients.map((client) => {
                   const isOnline = client.online;
-                  const isSelected = currentClientId === client.id;
+                  const isSelected = pathname.endsWith(`/clients/${client.id}`);
 
                   return (
                     <SidebarMenuItem key={client.id}>
@@ -183,7 +220,23 @@ export function ClientSidebar({ clients, isLoading }: ClientSidebarProps) {
                         tooltip={client.display_name ? `${client.display_name} (${client.info.hostname})` : client.info.hostname}
                         className={cn(NAV_ITEM_CLASS, !isOnline && !isSelected && 'opacity-60')}
                       >
-                        <Link
+                        {scope.kind === 'admin-user' ? (
+                          <Link
+                            to="/dashboard/users/$userId/clients/$clientId"
+                            params={{ userId: scope.userId, clientId: client.id }}
+                          >
+                            {isOnline ? (
+                              <span className="relative flex h-2 w-2 shrink-0">
+                                <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75" />
+                                <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500" />
+                              </span>
+                            ) : (
+                              <span className="h-2 w-2 rounded-full bg-muted-foreground/50 shrink-0" />
+                            )}
+                            <ServerIcon className="opacity-70 shrink-0" />
+                            <span>{getClientDisplayName(client)}</span>
+                          </Link>
+                        ) : <Link
                           to="/dashboard/clients/$clientId"
                           params={{ clientId: client.id }}
                         >
@@ -197,7 +250,7 @@ export function ClientSidebar({ clients, isLoading }: ClientSidebarProps) {
                           )}
                           <ServerIcon className="opacity-70 shrink-0" />
                           <span>{getClientDisplayName(client)}</span>
-                        </Link>
+                        </Link>}
                       </SidebarMenuButton>
                       {(client.proxies?.length ?? 0) > 0 && (
                         <SidebarMenuBadge>
@@ -210,13 +263,13 @@ export function ClientSidebar({ clients, isLoading }: ClientSidebarProps) {
               </SidebarMenu>
             )}
           </SidebarGroupContent>
-        </SidebarGroup>
+        </SidebarGroup> : null}
       </SidebarContent>
 
       <SidebarFooter className="pb-[calc(1rem+var(--safe-area-bottom))]">
         <SidebarGroup className="text-muted-foreground/80">
           <SidebarMenu>
-            <SidebarMenuItem>
+            {isAdmin ? <SidebarMenuItem>
               <SidebarMenuButton
                 asChild
                 isActive={pathname.startsWith('/dashboard/admin')}
@@ -228,7 +281,7 @@ export function ClientSidebar({ clients, isLoading }: ClientSidebarProps) {
                   <span>{t('dashboard.systemSettings')}</span>
                 </Link>
               </SidebarMenuButton>
-            </SidebarMenuItem>
+            </SidebarMenuItem> : null}
             <SidebarMenuItem>
               <SidebarMenuButton
                 asChild

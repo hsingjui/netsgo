@@ -15,9 +15,11 @@ import {
 import { useClientTraffic } from '@/hooks/use-client-traffic';
 import { formatTrafficRate } from '@/lib/format';
 import { getTrafficSeriesKey, getTunnelSeriesKey } from '@/lib/tunnel-traffic-keys';
+import type { ResourceScope } from '@/lib/resource-scope';
 import type { ClientTrafficRange, ClientTrafficResponse, ProxyConfig, ProxyType } from '@/types';
 
 interface TrafficChartProps {
+  scope: ResourceScope;
   clientId: string;
   tunnels: ProxyConfig[];
 }
@@ -215,10 +217,10 @@ function buildTrafficTrendChartState(
   };
 }
 
-export function TrafficChart({ clientId, tunnels }: TrafficChartProps) {
+export function TrafficChart({ scope, clientId, tunnels }: TrafficChartProps) {
   const { t, i18n } = useTranslation();
   const [range, setRange] = useState<ClientTrafficRange>('60s');
-  const { data, isLoading, isError, error } = useClientTraffic(clientId, range);
+  const { data, isLoading, isError, error } = useClientTraffic(scope, clientId, range);
 
   const { chartConfig, chartData, tunnelSeries } = useMemo(
     () => buildTrafficTrendChartState(data, tunnels, range, t),

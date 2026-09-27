@@ -11,6 +11,7 @@ import { buildClientTrafficQueryKey, buildClientTrafficUrl } from '@/hooks/use-c
 import { useAddClientDialog } from '@/components/custom/client/add-client-dialog-context';
 import { TunnelDialog } from '@/components/custom/tunnel/TunnelDialog';
 import { api } from '@/lib/api';
+import type { ResourceScope } from '@/lib/resource-scope';
 import type { Client, ClientTrafficResponse } from '@/types';
 import {
   buildTopologyGraph,
@@ -21,10 +22,12 @@ import { TopologyCanvas } from './TopologyCanvas';
 import { TopologySidePanel } from './TopologySidePanel';
 
 export function TopologyHeaderActions({
+  scope,
   activeClientId,
   clients,
   onAddClient,
 }: {
+  scope: ResourceScope;
   activeClientId: string | null;
   clients: Client[];
   onAddClient: () => void;
@@ -34,6 +37,7 @@ export function TopologyHeaderActions({
   if (activeClientId) {
     return (
       <TunnelDialog
+        scope={scope}
         mode="create"
         clientId={activeClientId}
         clients={clients}
@@ -55,10 +59,10 @@ export function TopologyHeaderActions({
   );
 }
 
-export function NetworkTopology() {
+export function NetworkTopology({ scope }: { scope: ResourceScope }) {
   const { t } = useTranslation();
   const navigate = useNavigate();
-  const { data: clients, isLoading } = useClients();
+  const { data: clients, isLoading } = useClients(scope);
   const { openAddClientDialog } = useAddClientDialog();
   const [focusId, setFocusId] = useState<string | null>(null);
   const [hoveredTunnelId, setHoveredTunnelId] = useState<string | null>(null);
@@ -81,8 +85,8 @@ export function NetworkTopology() {
   );
   const trafficQueries = useQueries({
     queries: onlineClientIds.map((clientId) => ({
-      queryKey: buildClientTrafficQueryKey(clientId, '60s'),
-      queryFn: () => api.get<ClientTrafficResponse>(buildClientTrafficUrl(clientId, '60s')),
+      queryKey: buildClientTrafficQueryKey(scope, clientId, '60s'),
+      queryFn: () => api.get<ClientTrafficResponse>(buildClientTrafficUrl(scope, clientId, '60s')),
       staleTime: 30_000,
       refetchInterval: 10_000,
       refetchOnWindowFocus: false,
@@ -144,10 +148,19 @@ export function NetworkTopology() {
       <button
         type="button"
         className="min-w-0 truncate border-b border-dashed border-current/50 text-left transition-colors hover:text-primary"
-        onClick={() => navigate({
-          to: '/dashboard/clients/$clientId',
-          params: { clientId: topologyFocusNode.id },
-        })}
+        onClick={() => {
+          if (scope.kind === 'admin-user') {
+            navigate({
+              to: '/dashboard/users/$userId/clients/$clientId',
+              params: { userId: scope.userId, clientId: topologyFocusNode.id },
+            });
+            return;
+          }
+          navigate({
+            to: '/dashboard/clients/$clientId',
+            params: { clientId: topologyFocusNode.id },
+          });
+        }}
         title={topologyHeaderTitle}
       >
         {topologyHeaderTitle}
@@ -164,6 +177,7 @@ export function NetworkTopology() {
             {renderHeaderTitle()}
           </h3>
           <TopologyHeaderActions
+            scope={scope}
             activeClientId={activeTopologyFocusId}
             clients={clients ?? []}
             onAddClient={openAddClientDialog}

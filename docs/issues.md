@@ -10,6 +10,7 @@
 | [`endpoint-type-extensibility`](./issue/endpoint-type-extensibility.md) | Medium | Open for CHECK relaxation | CHECK 已扩展至 `socks5_listen` / `socks5_connect_handler`；剩余是是否移除 DB enum CHECK |
 | [`runtime-state-active-exposed`](./issue/runtime-state-active-exposed.md) | Low | Open | `active` / `exposed` 是同一运行态的双命名；可作为低风险命名收口 |
 | [`tunnel-resource-locks-hardening`](./issue/tunnel-resource-locks-hardening.md) | Low | Open for optional DB constraints | 运行时互斥已完成；剩余是可选 DB FK/CHECK 硬化 |
+| [`multi-user-support`](./issue/multi-user-support.md) | High | [FRAME] Planned | [FRAME] 超级管理员与普通用户、用户所有权隔离、暂停/软删除运行门禁、分页用户管理、用户详情资源视图与活动日志范围 |
 
 ## 原则
 

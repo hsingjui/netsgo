@@ -2,11 +2,14 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -89,6 +92,29 @@ func TestAuthMiddleware_InvalidFormat(t *testing.T) {
 
 	if w.Code != http.StatusUnauthorized {
 		t.Errorf("Invalid Authorization format should return 401, got %d", w.Code)
+	}
+}
+
+func TestAuthMiddleware_NilAuthReturnsStoreUnavailable(t *testing.T) {
+	s := &Server{}
+	req := httptest.NewRequest(http.MethodGet, "/protected", nil)
+	req.Header.Set("Authorization", "Bearer test-token")
+	w := httptest.NewRecorder()
+
+	handler := s.RequirePrincipal(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("nil auth status = %d, want %d", w.Code, http.StatusInternalServerError)
+	}
+	var response apiErrorResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode nil-auth error: %v", err)
+	}
+	if response.Code != "admin_store_unavailable" {
+		t.Fatalf("nil auth error code = %q, want admin_store_unavailable", response.Code)
 	}
 }
 
@@ -278,12 +304,6 @@ func TestAuthMiddleware_ValidTokenSuccess(t *testing.T) {
 		} else if info.SessionID != session.ID {
 			t.Errorf("Expected SessionID %s in context, got %s", session.ID, info.SessionID)
 		}
-
-		// 验证兼容接口
-		adminInfo := GetAdminFromContext(r.Context())
-		if adminInfo == nil || adminInfo.SessionID != session.ID {
-			t.Errorf("GetAdminFromContext failed to get info")
-		}
 	})
 
 	handler.ServeHTTP(w, req)
@@ -293,6 +313,298 @@ func TestAuthMiddleware_ValidTokenSuccess(t *testing.T) {
 	}
 	if !handlerCalled {
 		t.Errorf("Handler was not called")
+	}
+}
+
+func TestRequireAdminMutationRevalidatesAfterConcurrentDemotion(t *testing.T) {
+	store, cleanup := setupMockAdminStore(t)
+	defer cleanup()
+
+	s := New(0)
+	s.auth.adminStore = store
+	initialAdmin, err := store.ValidateUserPassword("admin", "password123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondAdmin, err := store.CreateUser("second-admin", "Password123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.SetUserAdmin(initialAdmin.ID, secondAdmin.ID, true); err != nil {
+		t.Fatal(err)
+	}
+	secondAdmin, err = store.GetUser(secondAdmin.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := mustCreateSession(t, store, secondAdmin.ID, secondAdmin.Username, secondAdmin.Role, "127.0.0.1", "test-client")
+	token, err := s.GenerateAdminToken(session)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	boundaryReached := make(chan struct{})
+	s.adminAuthorizationHook = func(stage string, principal *RequestPrincipal) {
+		if stage == "before_mutation_boundary" && principal.UserID == secondAdmin.ID {
+			close(boundaryReached)
+		}
+	}
+
+	// Hold the final authorization boundary so the request is admitted by
+	// RequirePrincipal first, then revoke its administrator role before it can
+	// enter the privileged handler.
+	s.adminAuthorizationMu.Lock()
+	called := false
+	req := httptest.NewRequest(http.MethodPost, "/protected", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("User-Agent", "test-client")
+	w := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		s.RequireAdmin(func(http.ResponseWriter, *http.Request) {
+			called = true
+		}).ServeHTTP(w, req)
+		close(done)
+	}()
+	select {
+	case <-boundaryReached:
+	case <-time.After(time.Second):
+		s.adminAuthorizationMu.Unlock()
+		t.Fatal("request did not reach the final administrator boundary")
+	}
+	if _, _, err := store.SetUserAdmin(initialAdmin.ID, secondAdmin.ID, false); err != nil {
+		s.adminAuthorizationMu.Unlock()
+		t.Fatal(err)
+	}
+	s.adminAuthorizationMu.Unlock()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("request did not finish after demotion")
+	}
+	if called {
+		t.Fatal("demoted administrator reached privileged mutation handler")
+	}
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want %d: %s", w.Code, http.StatusUnauthorized, w.Body.String())
+	}
+}
+
+func TestRequireAdminMutationDoesNotBlockRevocationWhileReadingBody(t *testing.T) {
+	store, cleanup := setupMockAdminStore(t)
+	defer cleanup()
+
+	s := New(0)
+	s.auth.adminStore = store
+	initialAdmin, err := store.ValidateUserPassword("admin", "password123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondAdmin, err := store.CreateUser("slow-body-admin", "Password123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.SetUserAdmin(initialAdmin.ID, secondAdmin.ID, true); err != nil {
+		t.Fatal(err)
+	}
+	secondAdmin, err = store.GetUser(secondAdmin.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	issueToken := func(user User) string {
+		session := mustCreateSession(t, store, user.ID, user.Username, user.Role, "127.0.0.1", "test-client")
+		token, err := s.GenerateAdminToken(session)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return token
+	}
+	initialToken := issueToken(*initialAdmin)
+	secondToken := issueToken(secondAdmin)
+
+	reader, writer := io.Pipe()
+	defer func() { _ = reader.Close() }()
+	called := false
+	slowReq := httptest.NewRequest(http.MethodPut, "/slow-config", reader)
+	slowReq.Header.Set("Authorization", "Bearer "+secondToken)
+	slowReq.Header.Set("User-Agent", "test-client")
+	slowResp := httptest.NewRecorder()
+	slowDone := make(chan struct{})
+	go func() {
+		s.RequireAdmin(func(http.ResponseWriter, *http.Request) {
+			called = true
+		}).ServeHTTP(slowResp, slowReq)
+		close(slowDone)
+	}()
+	if _, err := writer.Write([]byte(`{"value":`)); err != nil {
+		t.Fatal(err)
+	}
+
+	demoteResp := httptest.NewRecorder()
+	demoteReq := httptest.NewRequest(http.MethodPut, "/demote", nil)
+	demoteReq.Header.Set("Authorization", "Bearer "+initialToken)
+	demoteReq.Header.Set("User-Agent", "test-client")
+	demoteDone := make(chan struct{})
+	go func() {
+		s.RequireAdmin(func(w http.ResponseWriter, _ *http.Request) {
+			if _, _, err := store.SetUserAdmin(initialAdmin.ID, secondAdmin.ID, false); err != nil {
+				writeAPIError(w, http.StatusInternalServerError, "demote_failed", err.Error())
+				return
+			}
+			w.WriteHeader(http.StatusNoContent)
+		}).ServeHTTP(demoteResp, demoteReq)
+		close(demoteDone)
+	}()
+	select {
+	case <-demoteDone:
+	case <-time.After(time.Second):
+		_ = writer.CloseWithError(errors.New("test timed out"))
+		t.Fatal("administrator revocation blocked on an incomplete request body")
+	}
+	if demoteResp.Code != http.StatusNoContent {
+		_ = writer.CloseWithError(errors.New("demotion failed"))
+		t.Fatalf("demote status = %d: %s", demoteResp.Code, demoteResp.Body.String())
+	}
+	if _, err := writer.Write([]byte(`true}`)); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case <-slowDone:
+	case <-time.After(time.Second):
+		t.Fatal("slow request did not finish after its body completed")
+	}
+	if called {
+		t.Fatal("revoked administrator reached privileged mutation handler")
+	}
+	if slowResp.Code != http.StatusUnauthorized {
+		t.Fatalf("slow request status = %d, want %d: %s", slowResp.Code, http.StatusUnauthorized, slowResp.Body.String())
+	}
+}
+
+func TestSelfResourceMutationRevalidatesAfterConcurrentSessionRevocation(t *testing.T) {
+	store, cleanup := setupMockAdminStore(t)
+	defer cleanup()
+
+	s := New(0)
+	s.auth.adminStore = store
+	user, err := store.CreateUser("slow-body-user", "Password123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := mustCreateSession(t, store, user.ID, user.Username, user.Role, "127.0.0.1", "test-client")
+	token, err := s.GenerateAdminToken(session)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	reader, writer := io.Pipe()
+	defer func() { _ = reader.Close() }()
+	committed := false
+	req := httptest.NewRequest(http.MethodPut, "/api/keys/key-a/disable", reader)
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("User-Agent", "test-client")
+	resp := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		s.requireSelfResourceScope(func(w http.ResponseWriter, r *http.Request) {
+			var body map[string]bool
+			if err := decodeJSONRequestBody(r, &body); err != nil {
+				writeJSONRequestDecodeError(w, err)
+				return
+			}
+			scope, ok := requireResourceScope(w, r)
+			if !ok {
+				return
+			}
+			release, err := s.acquireResourceMutation(scope, true)
+			if err != nil {
+				writeResourceLifecycleError(w, err)
+				return
+			}
+			defer release()
+			committed = true
+		}).ServeHTTP(resp, req)
+		close(done)
+	}()
+	if _, err := writer.Write([]byte(`{"value":`)); err != nil {
+		t.Fatal(err)
+	}
+
+	revoked := make(chan error, 1)
+	go func() {
+		gate := s.lifecycleGate(user.ID)
+		gate.mu.Lock()
+		err := store.DeleteSessionsByUserID(user.ID)
+		gate.mu.Unlock()
+		revoked <- err
+	}()
+	select {
+	case err := <-revoked:
+		if err != nil {
+			_ = writer.CloseWithError(err)
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		_ = writer.CloseWithError(errors.New("test timed out"))
+		t.Fatal("session revocation blocked on an incomplete ordinary-user request body")
+	}
+
+	if _, err := writer.Write([]byte(`true}`)); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("ordinary-user mutation did not finish after its body completed")
+	}
+	if committed {
+		t.Fatal("revoked ordinary-user session reached the mutation commit")
+	}
+	if resp.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want %d: %s", resp.Code, http.StatusUnauthorized, resp.Body.String())
+	}
+}
+
+func TestAuthMiddleware_SessionEnvironmentMismatchActivityIsUnknownActor(t *testing.T) {
+	store, cleanup := setupMockAdminStore(t)
+	defer cleanup()
+	s := New(0)
+	s.auth.adminStore = store
+	s.ensureSharedStoreReferences()
+
+	session := mustCreateSession(t, store, "user-activity", "admin", "admin", "127.0.0.1", "original-agent")
+	tokenString, err := s.GenerateAdminToken(session)
+	if err != nil {
+		t.Fatalf("GenerateAdminToken() error = %v", err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/protected", nil)
+	req.RemoteAddr = "192.0.2.77:4321"
+	req.Header.Set("Authorization", "Bearer "+tokenString)
+	req.Header.Set("User-Agent", "stolen-agent")
+	w := httptest.NewRecorder()
+	s.RequireAuth(func(http.ResponseWriter, *http.Request) { t.Fatal("mismatched request reached handler") }).ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", w.Code)
+	}
+	page, err := s.activityStore.Query(ActivityQuery{Limit: 20})
+	if err != nil || len(page.Items) != 1 {
+		t.Fatalf("security activity = %+v, %v", page.Items, err)
+	}
+	item := page.Items[0]
+	if item.Action != "session_environment_mismatch" || item.Actor.Type != "unknown" || item.Actor.ID != "" || item.Actor.Name != "" {
+		t.Fatalf("mismatch activity = %+v", item)
+	}
+	if strings.Contains(string(item.Payload), "admin") || strings.Contains(string(item.Payload), "stolen-agent") || strings.Contains(string(item.Payload), session.ID) {
+		t.Fatalf("security payload leaked identity or UA: %s", item.Payload)
 	}
 }
 

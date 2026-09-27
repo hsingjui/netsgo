@@ -271,9 +271,19 @@ func TestReleaseIndexCacheCoalescedRefreshFailurePreservesRefreshFailed(t *testi
 }
 
 func TestAPI_ClientVersionCheckOfflineDoesNotFetchReleaseIndex(t *testing.T) {
-	s := New(8080)
-	s.clients.Store("client-1", &ClientConn{
-		ID: "client-1",
+	s, cleanup := setupTestServerWithDB(t, true)
+	defer cleanup()
+	owner, err := s.auth.adminStore.ValidateAdminPassword("admin", "password123")
+	if err != nil {
+		t.Fatalf("load test administrator: %v", err)
+	}
+	registered, err := s.auth.adminStore.GetOrCreateClientForUser(owner.ID, "offline-version-check", protocol.ClientInfo{Version: "v0.1.0"}, "127.0.0.1:1234")
+	if err != nil {
+		t.Fatalf("register client: %v", err)
+	}
+	s.clients.Store(registered.ID, &ClientConn{
+		ID:          registered.ID,
+		OwnerUserID: owner.ID,
 		Info: protocol.ClientInfo{
 			Version: "v0.1.0",
 		},
@@ -284,8 +294,8 @@ func TestAPI_ClientVersionCheckOfflineDoesNotFetchReleaseIndex(t *testing.T) {
 		return nil, nil
 	})
 
-	req := httptest.NewRequest(http.MethodGet, "/api/clients/client-1/version/check?force=true", nil)
-	req.SetPathValue("id", "client-1")
+	req := withTestResourceScope(httptest.NewRequest(http.MethodGet, "/api/clients/"+registered.ID+"/version/check?force=true", nil), owner.ID)
+	req.SetPathValue("id", registered.ID)
 	w := httptest.NewRecorder()
 	s.handleAPIClientVersionCheck(w, req)
 

@@ -34,12 +34,15 @@ type Result struct {
 	NewVersion string
 	Stopped    []string
 	Started    []string
+	BackupPath string
 }
 
-func rollbackUpdateOrUpgrade(orch *Orchestrator, started, stopped []string, backupPath string, restoreBinary bool, envSnapshots []serviceEnvSnapshot) error {
+func rollbackUpdateOrUpgrade(orch *Orchestrator, started, stopped []string, backupPath string, restoreBinary bool, envSnapshots []serviceEnvSnapshot, databaseSnapshot *serverDatabaseSnapshot) error {
 	var rollbackErr error
+	startedStopFailed := false
 	if len(started) > 0 {
 		if err := orch.StopStartedServices(started); err != nil {
+			startedStopFailed = true
 			rollbackErr = errors.Join(rollbackErr, err)
 		}
 	}
@@ -50,6 +53,13 @@ func rollbackUpdateOrUpgrade(orch *Orchestrator, started, stopped []string, back
 	}
 	if len(envSnapshots) > 0 {
 		if err := restoreServiceEnvSnapshots(envSnapshots); err != nil {
+			rollbackErr = errors.Join(rollbackErr, err)
+		}
+	}
+	if databaseSnapshot != nil {
+		if startedStopFailed {
+			rollbackErr = errors.Join(rollbackErr, fmt.Errorf("restore server database: skipped because upgraded services could not be stopped safely"))
+		} else if err := databaseSnapshot.restore(); err != nil {
 			rollbackErr = errors.Join(rollbackErr, err)
 		}
 	}
@@ -68,9 +78,9 @@ func recoverStoppedServicesOnPanic(orch *Orchestrator, stopped *[]string, armed 
 	}
 }
 
-func recoverUpdateOrUpgradeOnPanic(orch *Orchestrator, started, stopped *[]string, backupPath *string, restoreBinary *bool, envSnapshots *[]serviceEnvSnapshot) {
+func recoverUpdateOrUpgradeOnPanic(orch *Orchestrator, started, stopped *[]string, backupPath *string, restoreBinary *bool, envSnapshots *[]serviceEnvSnapshot, databaseSnapshot **serverDatabaseSnapshot) {
 	if r := recover(); r != nil {
-		_ = rollbackUpdateOrUpgrade(orch, *started, *stopped, *backupPath, *restoreBinary, *envSnapshots)
+		_ = rollbackUpdateOrUpgrade(orch, *started, *stopped, *backupPath, *restoreBinary, *envSnapshots, *databaseSnapshot)
 		panic(r)
 	}
 }

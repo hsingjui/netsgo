@@ -1,10 +1,13 @@
-import { describe, expect, test } from 'bun:test';
+import { describe, expect, test } from 'vitest';
 
 import { buildClientTrafficQueryKey, buildClientTrafficUrl } from './use-client-traffic';
+import { SELF_RESOURCE_SCOPE } from '@/lib/resource-scope';
 
 describe('buildClientTrafficQueryKey', () => {
   test('includes an empty tunnel slot for client-level traffic', () => {
-    expect([...buildClientTrafficQueryKey('client-1', '24h')]).toEqual([
+    expect([...buildClientTrafficQueryKey(SELF_RESOURCE_SCOPE, 'client-1', '24h')]).toEqual([
+      'users',
+      'self',
       'client-traffic',
       'client-1',
       '24h',
@@ -13,7 +16,9 @@ describe('buildClientTrafficQueryKey', () => {
   });
 
   test('separates single-tunnel traffic cache entries', () => {
-    expect([...buildClientTrafficQueryKey('client-1', '24h', { tunnel: 'api' })]).toEqual([
+    expect([...buildClientTrafficQueryKey(SELF_RESOURCE_SCOPE, 'client-1', '24h', { tunnel: 'api' })]).toEqual([
+      'users',
+      'self',
       'client-traffic',
       'client-1',
       '24h',
@@ -24,14 +29,14 @@ describe('buildClientTrafficQueryKey', () => {
 
 describe('buildClientTrafficUrl', () => {
   test('omits tunnel query parameter for client-level traffic', () => {
-    const url = buildClientTrafficUrl('client-1', '24h', {}, 1_800_000);
+    const url = buildClientTrafficUrl(SELF_RESOURCE_SCOPE, 'client-1', '24h', {}, 1_800_000);
 
     expect(url).toBe('/api/clients/client-1/traffic?from=1713600&to=1800000&resolution=minute');
     expect(url).not.toContain('tunnel=');
   });
 
   test('adds an encoded tunnel query parameter for single-tunnel traffic', () => {
-    const url = buildClientTrafficUrl('client-1', '24h', { tunnel: 'api edge/1' }, 1_800_000);
+    const url = buildClientTrafficUrl(SELF_RESOURCE_SCOPE, 'client-1', '24h', { tunnel: 'api edge/1' }, 1_800_000);
     const parsed = new URL(url, 'https://netsgo.test');
 
     expect(parsed.pathname).toBe('/api/clients/client-1/traffic');
@@ -42,7 +47,7 @@ describe('buildClientTrafficUrl', () => {
   });
 
   test('builds a 60-point second-resolution realtime window', () => {
-    const url = buildClientTrafficUrl('client-1', '60s', {}, 1_800_000);
+    const url = buildClientTrafficUrl(SELF_RESOURCE_SCOPE, 'client-1', '60s', {}, 1_800_000);
     const parsed = new URL(url, 'https://netsgo.test');
 
     expect(parsed.searchParams.get('from')).toBe('1799940');

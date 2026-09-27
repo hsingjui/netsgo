@@ -1,10 +1,11 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { describe, expect, test } from 'bun:test';
+import { describe, expect, test } from 'vitest';
 import { createElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 
 import { versionCheckQueryKey, type VersionCheckTarget } from '@/hooks/use-version-check';
 import type { VersionCheckResult } from '@/types';
+import { SELF_RESOURCE_SCOPE } from '@/lib/resource-scope';
 
 import { VersionUpdateContent, VersionUpdateIndicator } from './VersionUpdateIndicator';
 import { manualVersionCheckToast } from './version-update-toast';
@@ -38,12 +39,12 @@ function result(overrides: Partial<VersionCheckResult> = {}): VersionCheckResult
 
 function renderIndicator(target: VersionCheckTarget, data?: VersionCheckResult) {
   const client = new QueryClient();
-  if (data) client.setQueryData(versionCheckQueryKey(target), data);
+  if (data) client.setQueryData(versionCheckQueryKey(SELF_RESOURCE_SCOPE, target), data);
   return renderToStaticMarkup(
     createElement(
       QueryClientProvider,
       { client },
-      createElement(VersionUpdateIndicator, { target, label: 'Server version' }),
+      createElement(VersionUpdateIndicator, { scope: SELF_RESOURCE_SCOPE, target, label: 'Server version' }),
     ),
   );
 }

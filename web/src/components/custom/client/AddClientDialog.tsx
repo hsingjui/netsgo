@@ -16,9 +16,8 @@ import {
   TabsList,
   TabsTrigger,
 } from '@/components/ui/tabs';
-import { useAdminConfig } from '@/hooks/use-admin-config';
 import { useCreateAPIKey } from '@/hooks/use-admin-keys';
-import { useServerStatus } from '@/hooks/use-server-status';
+import { useResourceBootstrap } from '@/hooks/use-server-status';
 import { useTranslation } from 'react-i18next';
 import { cn } from '@/lib/utils';
 
@@ -31,6 +30,7 @@ import {
   INSTALL_SCRIPT_URL,
 } from './client-install-commands';
 import { ShikiCodeBlock } from './ShikiCodeBlock';
+import type { ResourceScope } from '@/lib/resource-scope';
 
 const EXPIRY_OPTIONS = [
   { labelKey: 'clients.expiry1h', value: '1h' },
@@ -44,6 +44,7 @@ type CommandTab = 'install' | 'docker' | 'compose' | 'run';
 type CopyTarget = 'key' | 'url' | CommandTab;
 
 interface AddClientDialogProps {
+  scope: ResourceScope;
   open: boolean;
   onOpenChange: (open: boolean) => void;
 }
@@ -76,7 +77,7 @@ async function writeClipboardText(value: string) {
   document.body.removeChild(textarea);
 }
 
-export function AddClientDialog({ open, onOpenChange }: AddClientDialogProps) {
+export function AddClientDialog({ scope, open, onOpenChange }: AddClientDialogProps) {
   const { t } = useTranslation();
   const [step, setStep] = useState<'config' | 'result'>('config');
   const [maxUses, setMaxUses] = useState(0);
@@ -89,13 +90,8 @@ export function AddClientDialog({ open, onOpenChange }: AddClientDialogProps) {
   const [isWaitingForStatus, setIsWaitingForStatus] = useState(false);
   const [statusLoadFailed, setStatusLoadFailed] = useState(false);
 
-  const createKey = useCreateAPIKey();
-  const { data: adminConfig } = useAdminConfig({
-    enabled: open,
-    refetchOnMount: 'always',
-    staleTime: 0,
-  });
-  const { data: status, refetch: refetchStatus } = useServerStatus({
+  const createKey = useCreateAPIKey(scope);
+  const { data: status, refetch: refetchStatus } = useResourceBootstrap(scope, {
     enabled: open,
     refetchOnMount: 'always',
     staleTime: 0,
@@ -157,8 +153,6 @@ export function AddClientDialog({ open, onOpenChange }: AddClientDialogProps) {
           setGeneratedKey(data.raw_key);
           setGeneratedServerVersion(commandVersion);
           setServerAddr(resolveAddClientServiceAddress({
-            effectiveServerAddr: adminConfig?.effective_server_addr,
-            adminServerAddr: adminConfig?.server_addr,
             keyServerAddr: data.server_addr,
             statusServerAddr,
             browserOrigin: window.location.origin,
@@ -167,7 +161,7 @@ export function AddClientDialog({ open, onOpenChange }: AddClientDialogProps) {
         },
       },
     );
-  }, [adminConfig, createKey, expiresIn, isWaitingForStatus, maxUses, refetchStatus, status]);
+  }, [createKey, expiresIn, isWaitingForStatus, maxUses, refetchStatus, status]);
 
   const copyToClipboard = useCallback(async (text: string, tag: CopyTarget) => {
     try {

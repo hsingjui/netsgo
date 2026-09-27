@@ -128,12 +128,13 @@ func (o *Orchestrator) RestartStoppedServices(stopped []string) error {
 }
 
 func (o *Orchestrator) StopStartedServices(started []string) error {
+	var stopErr error
 	for i := len(started) - 1; i >= 0; i-- {
 		if err := o.DisableAndStop(started[i]); err != nil {
-			return fmt.Errorf("rollback stop %s: %w", started[i], err)
+			stopErr = errors.Join(stopErr, fmt.Errorf("rollback stop %s: %w", started[i], err))
 		}
 	}
-	return nil
+	return stopErr
 }
 
 func (o *Orchestrator) StartServices(units []string, started *[]string) error {

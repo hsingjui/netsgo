@@ -26,15 +26,3 @@ func PrivateKeyFromPEM(raw []byte) (ed25519.PrivateKey, error) {
 func RawSignature(privateKey ed25519.PrivateKey, data []byte) []byte {
 	return ed25519.Sign(privateKey, data)
 }
-
-func PublicKeyPEM(privateKey ed25519.PrivateKey) ([]byte, error) {
-	pub, ok := privateKey.Public().(ed25519.PublicKey)
-	if !ok {
-		return nil, fmt.Errorf("derive Ed25519 public key")
-	}
-	der, err := x509.MarshalPKIXPublicKey(pub)
-	if err != nil {
-		return nil, fmt.Errorf("marshal public key: %w", err)
-	}
-	return pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: der}), nil
-}

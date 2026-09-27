@@ -462,11 +462,22 @@ export interface ConsoleSummary {
 }
 
 export interface ConsoleSnapshot {
-  clients?: Client[];
-  summary?: ConsoleSummary;
-  server_status?: ServerStatus;
-  generated_at?: string;
-  fresh_until?: string;
+  clients: Client[];
+  summary: ConsoleSummary;
+  bootstrap: ResourceBootstrap;
+  generated_at: string;
+  fresh_until: string;
+}
+
+/**
+ * Non-sensitive server metadata returned inside a user-scoped console
+ * snapshot. Resource dialogs must use this view instead of the administrator
+ * system-status endpoint.
+ */
+export interface ResourceBootstrap {
+  version: string;
+  server_addr: string;
+  allowed_ports: PortRange[];
 }
 
 // --- API ---
@@ -542,10 +553,49 @@ export interface APIKey {
   use_count: number;
 }
 
-export interface AdminUser {
+export interface Principal {
   id: string;
   username: string;
-  role: string;
+  is_admin: boolean;
+}
+
+export interface UserActionCapabilities {
+  can_change_admin?: boolean;
+  can_disable?: boolean;
+  can_enable?: boolean;
+  can_delete?: boolean;
+  can_update_username?: boolean;
+  can_update_password?: boolean;
+  can_revoke_sessions?: boolean;
+}
+
+export interface ManagedUser extends Principal {
+  status: 'active' | 'disabled' | string;
+  created_at: string;
+  updated_at: string;
+  last_login?: string;
+  operational: boolean;
+  actions?: UserActionCapabilities;
+}
+
+export interface UserDeletionImpact {
+  user_id: string;
+  api_keys: number;
+  clients: number;
+  tunnels: number;
+  traffic_buckets: number;
+  activity_events: number;
+  generated_at: string;
+}
+
+export interface UserListResponse {
+  items: ManagedUser[];
+  next_cursor?: string | null;
+  has_more: boolean;
+}
+
+/** Administrator-security endpoints may return this narrower account view. */
+export interface AdminUser extends Principal {
   created_at: string;
   last_login?: string;
 }
@@ -554,23 +604,15 @@ export interface AdminUser {
 
 
 export interface LoginResponse {
-  token: string;
-  user: {
-    id: string;
-    username: string;
-    role: string;
-  };
+  token?: string;
+  user: Principal;
   mfa_required?: false;
 }
 
 export interface MFALoginResponse {
   mfa_required: true;
   mfa_token: string;
-  user: {
-    id: string;
-    username: string;
-    role: string;
-  };
+  user: Principal;
 }
 
 export type AuthLoginResponse = LoginResponse | MFALoginResponse;
@@ -599,18 +641,20 @@ export interface RateLimitEntry {
   ip: string;
   request_count: number;
   max_requests: number;
-  failure_count: number;
-  max_failures: number;
   limited: boolean;
   reason?: string;
   retry_after_seconds: number;
   locked_until?: string;
   last_activity: string;
   window_seconds: number;
-  lockout_seconds: number;
 }
 
-export interface ClientAuthRateLimitsResponse {
+export interface ClientAuthRateLimitSettings {
+  enabled: boolean;
+  requests_per_minute: number;
+}
+
+export interface ClientAuthRateLimitsResponse extends ClientAuthRateLimitSettings {
   entries: RateLimitEntry[];
   generated_at: string;
 }
@@ -651,9 +695,110 @@ export interface PortRange {
   end: number;
 }
 
+export type ActivitySeverity = 'debug' | 'info' | 'warning' | 'error';
+
+export interface ActivityRetentionRule {
+  days: number;
+  min_count: number;
+}
+
+export interface ActivityRetentionPolicy {
+  debug: ActivityRetentionRule;
+  info: ActivityRetentionRule;
+  warning: ActivityRetentionRule;
+  error: ActivityRetentionRule;
+}
+
 export interface ServerConfig {
   server_addr: string;
   allowed_ports: PortRange[];
+  activity_retention: ActivityRetentionPolicy;
+}
+
+export type ActivityCategory = 'client' | 'tunnel' | 'p2p' | 'admin' | 'security';
+export type ActivityScope = 'global' | 'client' | 'tunnel';
+
+export interface ActivityActor {
+  type: 'admin' | 'user' | 'client' | 'system' | 'security' | 'unknown';
+  id?: string;
+  name?: string;
+  ip_hash?: string;
+  ip_prefix?: string;
+}
+
+export interface ActivityClientSubject {
+  client_id: string;
+  relation: 'owner' | 'ingress' | 'target' | 'peer' | 'subject' | 'related';
+  display_name?: string;
+  hostname?: string;
+  truncated?: boolean;
+}
+
+export interface ActivityTunnelSubject {
+  tunnel_id: string;
+  relation: 'subject' | 'related' | 'shared_session';
+  name?: string;
+  tunnel_type?: string;
+  topology?: string;
+  truncated?: boolean;
+}
+
+export interface ActivitySummaryArgs {
+  client_name?: string;
+  tunnel_name?: string;
+  resource_name?: string;
+  before?: string;
+  after?: string;
+  value?: number;
+  count?: number;
+  transport?: string;
+  topology?: string;
+}
+
+export interface ActivityPayloadV1 {
+  summary_key?: string;
+  summary_args?: ActivitySummaryArgs;
+  reason_code?: string;
+  before?: string;
+  after?: string;
+  revision?: number;
+  generation?: number;
+  sequence?: number;
+  session_id?: string;
+}
+
+export interface ActivityItem {
+  id: number;
+  occurred_at: string;
+  recorded_at: string;
+  severity: ActivitySeverity;
+  category: ActivityCategory;
+  action: string;
+  source: string;
+  actor: ActivityActor;
+  payload_version: number;
+  payload: ActivityPayloadV1;
+  clients: ActivityClientSubject[];
+  tunnels: ActivityTunnelSubject[];
+}
+
+export interface ActivityPage {
+  items: ActivityItem[];
+  next_cursor?: number;
+  has_more: boolean;
+  direction: 'before' | 'after';
+}
+
+export interface ActivityQuery {
+  scope?: ActivityScope;
+  scopeId?: string;
+  before?: number;
+  after?: number;
+  limit?: number;
+  severities?: ActivitySeverity[];
+  categories?: ActivityCategory[];
+  from?: string;
+  to?: string;
 }
 
 export interface AffectedTunnel {

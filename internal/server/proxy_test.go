@@ -1222,7 +1222,7 @@ func TestMarkTCPProxyRuntimeErrorIfCurrent_StaleListenerDoesNotDemote(t *testing
 
 	mustAddStableTunnel(t, s.store, storedTunnelFromRuntimeForTest(client, tunnel))
 
-	s.markTCPProxyRuntimeErrorIfCurrent(client, tunnel.Config.Name, tunnel, oldListener, "stale accept failure")
+	s.markTCPProxyRuntimeErrorIfCurrent(client, tunnel.Config.Name, tunnel, oldListener, tunnel.Config, "stale accept failure")
 
 	client.proxyMu.RLock()
 	got := client.proxies[tunnel.Config.Name].Config
@@ -1287,7 +1287,7 @@ func TestMarkTCPProxyRuntimeErrorIfCurrent_StaleRevisionDoesNotDemoteStore(t *te
 		Message: "keep current issue",
 	})
 
-	s.markTCPProxyRuntimeErrorIfCurrent(client, tunnel.Config.Name, tunnel, listener, "late old listener failure")
+	s.markTCPProxyRuntimeErrorIfCurrent(client, tunnel.Config.Name, tunnel, listener, tunnel.Config, "late old listener failure")
 
 	reloaded, err := s.store.GetTunnelByIDE(client.ID, stored.ID)
 	if err != nil {
@@ -1302,6 +1302,174 @@ func TestMarkTCPProxyRuntimeErrorIfCurrent_StaleRevisionDoesNotDemoteStore(t *te
 	}
 }
 
+func TestMarkTCPProxyRuntimeErrorIfCurrent_StaleOwnerEpochOnlyClosesOldListener(t *testing.T) {
+	s, _, _, cleanup := setupTestServerWithStores(t, true)
+	defer cleanup()
+	owner, err := s.auth.adminStore.ValidateAdminPassword("admin", "password123")
+	if err != nil {
+		t.Fatalf("resolve runtime owner: %v", err)
+	}
+
+	clientID := "stale-tcp-epoch-client"
+	mustRegisterTestTunnelClient(t, s.store, clientID, owner.ID)
+	ownerEpoch, releaseOwnerGate, err := s.acquireUserLifecycleRead(owner.ID, 0, true)
+	if err != nil {
+		t.Fatalf("capture runtime owner epoch: %v", err)
+	}
+	releaseOwnerGate()
+
+	oldListener := newScriptedListener(t)
+	oldClient := &ClientConn{
+		ID:          clientID,
+		OwnerUserID: owner.ID,
+		OwnerEpoch:  ownerEpoch,
+		generation:  1,
+		state:       clientStateLive,
+		proxies:     make(map[string]*ProxyTunnel),
+	}
+	oldTunnel := &ProxyTunnel{
+		Config: protocol.ProxyConfig{
+			ID:            "stale-tcp-epoch-id",
+			Name:          "stale-tcp-epoch",
+			Revision:      1,
+			Type:          protocol.ProxyTypeTCP,
+			LocalIP:       "127.0.0.1",
+			LocalPort:     8080,
+			RemotePort:    oldListener.addr.(*net.TCPAddr).Port,
+			ClientID:      clientID,
+			OwnerClientID: clientID,
+			Topology:      protocol.TunnelTopologyServerExpose,
+			DesiredState:  protocol.ProxyDesiredStateRunning,
+			RuntimeState:  protocol.ProxyRuntimeStateExposed,
+		},
+		Listener: oldListener,
+		done:     make(chan struct{}),
+	}
+	oldClient.proxies[oldTunnel.Config.Name] = oldTunnel
+	s.clients.Store(clientID, oldClient)
+	mustAddStableTunnel(t, s.store, storedTunnelFromRuntimeForTest(oldClient, oldTunnel))
+	stored, err := s.store.GetTunnelByIDE(clientID, oldTunnel.Config.ID)
+	if err != nil {
+		t.Fatalf("load stored runtime: %v", err)
+	}
+
+	beforeGate := make(chan struct{})
+	resumeFailure := make(chan struct{})
+	var resumeFailureOnce sync.Once
+	resumeRuntimeFailure := func() { resumeFailureOnce.Do(func() { close(resumeFailure) }) }
+	defer resumeRuntimeFailure()
+	var gateHookOnce sync.Once
+	s.userLifecycleHook = func(stage, userID string) {
+		if stage == "before_read_gate" && userID == owner.ID {
+			gateHookOnce.Do(func() {
+				close(beforeGate)
+				<-resumeFailure
+			})
+		}
+	}
+	cleanupPublished := make(chan protocol.ProxyConfig, 1)
+	s.runtimeErrorCleanupHook = func(config protocol.ProxyConfig) {
+		cleanupPublished <- config
+	}
+	events := s.events.Subscribe()
+	defer s.events.Unsubscribe(events)
+
+	failureDone := make(chan struct{})
+	go func() {
+		s.markTCPProxyRuntimeErrorIfCurrent(oldClient, oldTunnel.Config.Name, oldTunnel, oldListener, oldTunnel.Config, "late old epoch failure")
+		close(failureDone)
+	}()
+	select {
+	case <-beforeGate:
+	case <-time.After(2 * time.Second):
+		t.Fatal("runtime failure did not reach the lifecycle gate")
+	}
+
+	newListener := newScriptedListener(t)
+	defer func() { _ = newListener.Close() }()
+	gate := s.lifecycleGate(owner.ID)
+	gate.mu.Lock()
+	s.clientTunnelMutationMu.Lock()
+	gate.epoch++
+	next := stored
+	next.Revision++
+	next.RuntimeState = protocol.ProxyRuntimeStateExposed
+	next.Error = ""
+	next.UpdatedAt = time.Now().UTC()
+	if err := s.store.ReplaceTunnelByID(clientID, stored.ID, stored.Revision, next); err != nil {
+		s.clientTunnelMutationMu.Unlock()
+		gate.mu.Unlock()
+		t.Fatalf("advance stored runtime revision: %v", err)
+	}
+	newConfig := storedTunnelToProxyConfig(next)
+	newConfig.RemotePort = newListener.addr.(*net.TCPAddr).Port
+	newTunnel := &ProxyTunnel{Config: newConfig, Listener: newListener, done: make(chan struct{})}
+	newClient := &ClientConn{
+		ID:          clientID,
+		OwnerUserID: owner.ID,
+		OwnerEpoch:  gate.epoch,
+		generation:  2,
+		state:       clientStateLive,
+		proxies:     map[string]*ProxyTunnel{newConfig.Name: newTunnel},
+	}
+	s.clients.Store(clientID, newClient)
+	s.clientTunnelMutationMu.Unlock()
+	gate.mu.Unlock()
+	s.unifiedRuntime.recordServerIssue(next.ID, next.Revision, protocol.TunnelIssue{
+		Code:    "replacement-runtime-issue",
+		Scope:   "server",
+		Message: "keep replacement issue",
+	})
+	resumeRuntimeFailure()
+
+	select {
+	case <-failureDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("stale runtime failure did not finish")
+	}
+	if _, err := oldListener.Accept(); !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("old listener was not closed: %v", err)
+	}
+	select {
+	case _, open := <-newListener.acceptCh:
+		if !open {
+			t.Fatal("stale runtime failure closed the replacement listener")
+		}
+	default:
+	}
+	current, ok := s.clients.Load(clientID)
+	if !ok || current != newClient {
+		t.Fatal("stale runtime failure replaced the current ClientConn")
+	}
+	newClient.proxyMu.RLock()
+	gotTunnel := newClient.proxies[newConfig.Name]
+	newClient.proxyMu.RUnlock()
+	if gotTunnel != newTunnel || gotTunnel.Config.RuntimeState != protocol.ProxyRuntimeStateExposed {
+		t.Fatalf("stale runtime failure changed the replacement runtime: %+v", gotTunnel)
+	}
+	reloaded, err := s.store.GetTunnelByIDE(clientID, stored.ID)
+	if err != nil {
+		t.Fatalf("reload replacement runtime: %v", err)
+	}
+	if reloaded.Revision != next.Revision || reloaded.RuntimeState != protocol.ProxyRuntimeStateExposed || reloaded.Error != "" {
+		t.Fatalf("stale runtime failure changed replacement storage: %+v", reloaded)
+	}
+	issues := s.unifiedRuntime.issuesForStoredTunnel(reloaded, true)
+	if len(issues) != 1 || issues[0].Code != "replacement-runtime-issue" {
+		t.Fatalf("stale runtime failure changed replacement issues: %+v", issues)
+	}
+	select {
+	case config := <-cleanupPublished:
+		t.Fatalf("stale runtime failure published cleanup: %+v", config)
+	default:
+	}
+	select {
+	case event := <-events:
+		t.Fatalf("stale runtime failure published event: %+v", event)
+	default:
+	}
+}
+
 func TestMarkTCPProxyRuntimeErrorIfCurrent_LegacyCleanupDoesNotDependOnStoreRow(t *testing.T) {
 	s := New(0)
 	s.store = newTestTunnelStore(t)
@@ -1309,6 +1477,7 @@ func TestMarkTCPProxyRuntimeErrorIfCurrent_LegacyCleanupDoesNotDependOnStoreRow(
 	defer mustClose(t, clientWS)
 	defer mustClose(t, serverWS)
 	client := &ClientConn{ID: "legacy-runtime-error-client", conn: serverWS, proxies: make(map[string]*ProxyTunnel)}
+	s.clients.Store(client.ID, client)
 
 	listener := newScriptedListener(t)
 	tunnel := &ProxyTunnel{
@@ -1326,7 +1495,7 @@ func TestMarkTCPProxyRuntimeErrorIfCurrent_LegacyCleanupDoesNotDependOnStoreRow(
 	}
 	client.proxies[tunnel.Config.Name] = tunnel
 
-	s.markTCPProxyRuntimeErrorIfCurrent(client, tunnel.Config.Name, tunnel, listener, "legacy listener failed")
+	s.markTCPProxyRuntimeErrorIfCurrent(client, tunnel.Config.Name, tunnel, listener, tunnel.Config, "legacy listener failed")
 
 	msg := readControlMessageOfType(t, clientWS, protocol.MsgTypeProxyClose)
 	var closeReq protocol.ProxyCloseRequest
@@ -1345,6 +1514,7 @@ func TestMarkTCPProxyRuntimeErrorIfCurrent_UnprovisionsWhenStoreWriteFails(t *te
 	defer mustClose(t, clientWS)
 	defer mustClose(t, serverWS)
 	client := &ClientConn{ID: "unified-runtime-error-client", conn: serverWS, proxies: make(map[string]*ProxyTunnel)}
+	s.clients.Store(client.ID, client)
 
 	listener := newScriptedListener(t)
 	tunnel := &ProxyTunnel{
@@ -1367,7 +1537,7 @@ func TestMarkTCPProxyRuntimeErrorIfCurrent_UnprovisionsWhenStoreWriteFails(t *te
 	s.store.failSaveErr = errors.New("injected runtime error save failure")
 	s.store.failSaveCount = 1
 
-	s.markTCPProxyRuntimeErrorIfCurrent(client, tunnel.Config.Name, tunnel, listener, "listener failed")
+	s.markTCPProxyRuntimeErrorIfCurrent(client, tunnel.Config.Name, tunnel, listener, tunnel.Config, "listener failed")
 
 	msg := readControlMessageOfType(t, clientWS, protocol.MsgTypeTunnelUnprovision)
 	var unprovision protocol.TunnelUnprovisionRequest

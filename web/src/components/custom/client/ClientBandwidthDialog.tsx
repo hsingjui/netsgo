@@ -4,8 +4,9 @@ import { useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 
 import type { ReactNode } from 'react';
-import type { Client, ClientBandwidthSettingsResponse } from '@/types';
-import { api } from '@/lib/api';
+import type { Client } from '@/types';
+import { scopedClientApi } from '@/lib/api';
+import { invalidateResourceScope, type ResourceScope } from '@/lib/resource-scope';
 import { bpsToMbpsInput, parseMbpsInputToBps } from '@/lib/format';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -21,11 +22,12 @@ import {
 import { FoldVertical } from 'lucide-react';
 
 interface ClientBandwidthDialogProps {
+  scope: ResourceScope;
   client: Client;
   trigger?: ReactNode;
 }
 
-export function ClientBandwidthDialog({ client, trigger }: ClientBandwidthDialogProps) {
+export function ClientBandwidthDialog({ scope, client, trigger }: ClientBandwidthDialogProps) {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
   const [open, setOpen] = useState(false);
@@ -55,14 +57,11 @@ export function ClientBandwidthDialog({ client, trigger }: ClientBandwidthDialog
 
     setIsSaving(true);
     try {
-      await api.put<ClientBandwidthSettingsResponse>(
-        `/api/clients/${encodeURIComponent(client.id)}/bandwidth-settings`,
-        {
-          ingress_bps: parsedIngressBps,
-          egress_bps: parsedEgressBps,
-        },
-      );
-      await queryClient.invalidateQueries({ queryKey: ['clients'] });
+      await scopedClientApi.updateBandwidth(scope, client.id, {
+        ingress_bps: parsedIngressBps,
+        egress_bps: parsedEgressBps,
+      });
+      await invalidateResourceScope(queryClient, scope);
       setOpen(false);
       toast.success(t('tunnels.bandwidthSaved'));
     } catch (error) {

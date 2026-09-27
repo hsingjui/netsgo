@@ -9,6 +9,7 @@ import (
 // APIKey represents an authentication key used by a Client
 type APIKey struct {
 	ID           string     `json:"id"`
+	OwnerUserID  string     `json:"owner_user_id"`
 	Name         string     `json:"name"`
 	KeyHash      string     `json:"key_hash"`                // for persistence only; must not be returned to the frontend
 	LookupDigest string     `json:"lookup_digest,omitempty"` // for candidate lookup only; must not be returned to the frontend
@@ -20,17 +21,36 @@ type APIKey struct {
 	UseCount     int        `json:"use_count"` // number of times already used
 }
 
-// AdminUser represents a web admin account
+// UserStatus is the persisted lifecycle state for a web user.  Only an active
+// user may authenticate or operate owned resources.
+type UserStatus string
+
+const (
+	UserStatusActive   UserStatus = "active"
+	UserStatusDisabled UserStatus = "disabled"
+)
+
+// AdminUser is the legacy Go name for the unified web user record.  Role is a
+// derived compatibility field only; authorization must use IsAdmin and Status
+// loaded from users for every request.
 type AdminUser struct {
 	ID           string     `json:"id"`
 	Username     string     `json:"username"`
 	PasswordHash string     `json:"password_hash"` // for persistence only; must not be returned to the frontend
-	Role         string     `json:"role"`          // admin, viewer
+	Role         string     `json:"role"`          // derived: admin or user
+	IsAdmin      bool       `json:"is_admin"`
+	Status       UserStatus `json:"status"`
 	CreatedAt    time.Time  `json:"created_at"`
+	UpdatedAt    time.Time  `json:"updated_at"`
 	LastLogin    *time.Time `json:"last_login,omitempty"`
 	TOTPEnabled  bool       `json:"totp_enabled"`
 	TOTPSecret   string     `json:"totp_secret,omitempty"` // for persistence only; must not be returned to the frontend
 }
+
+// User is the authoritative identity type.  AdminUser remains as an alias to
+// avoid carrying a second in-memory identity model through existing security
+// and WebAuthn code.
+type User = AdminUser
 
 // AdminPasskey is a stored WebAuthn/passkey credential for the admin user.
 type AdminPasskey struct {
@@ -90,6 +110,7 @@ type adminPasskeyResponse struct {
 // RegisteredClient represents a Client record with a stable identity
 type RegisteredClient struct {
 	ID          string                `json:"id"`
+	OwnerUserID string                `json:"owner_user_id"`
 	InstallID   string                `json:"install_id"`
 	DisplayName string                `json:"display_name,omitempty"` // custom display name (falls back to hostname if empty)
 	Info        protocol.ClientInfo   `json:"info"`
@@ -103,8 +124,20 @@ type RegisteredClient struct {
 
 // ServerConfig holds server configuration (set during initialization)
 type ServerConfig struct {
-	ServerAddr   string      `json:"server_addr"`   // public-facing server address (e.g. https://tunnel.example.com)
-	AllowedPorts []PortRange `json:"allowed_ports"` // allowlist of ports available for tunneling
+	ServerAddr        string                  `json:"server_addr"`   // public-facing server address (e.g. https://tunnel.example.com)
+	AllowedPorts      []PortRange             `json:"allowed_ports"` // allowlist of ports available for tunneling
+	ActivityRetention ActivityRetentionPolicy `json:"activity_retention"`
+}
+
+const (
+	defaultClientAuthRateLimitPerMinute = 20
+	maxClientAuthRateLimitPerMinute     = 1000
+)
+
+// ClientAuthRateLimitSettings controls optional per-IP client authentication throttling.
+type ClientAuthRateLimitSettings struct {
+	Enabled           bool `json:"enabled"`
+	RequestsPerMinute int  `json:"requests_per_minute"`
 }
 
 // PortRange represents a port range (Start==End means a single port)
@@ -140,10 +173,29 @@ type ClientToken struct {
 
 // adminConfigResponse is the read response for `/api/admin/config`.
 type adminConfigResponse struct {
-	ServerAddr          string      `json:"server_addr"`
-	AllowedPorts        []PortRange `json:"allowed_ports"`
-	EffectiveServerAddr string      `json:"effective_server_addr"`
-	ServerAddrLocked    bool        `json:"server_addr_locked"`
+	ServerAddr          string                  `json:"server_addr"`
+	AllowedPorts        []PortRange             `json:"allowed_ports"`
+	ActivityRetention   ActivityRetentionPolicy `json:"activity_retention"`
+	EffectiveServerAddr string                  `json:"effective_server_addr"`
+	ServerAddrLocked    bool                    `json:"server_addr_locked"`
+}
+
+type activityRetentionRulePatch struct {
+	Days     *int `json:"days"`
+	MinCount *int `json:"min_count"`
+}
+
+type activityRetentionPatch struct {
+	Debug   *activityRetentionRulePatch `json:"debug"`
+	Info    *activityRetentionRulePatch `json:"info"`
+	Warning *activityRetentionRulePatch `json:"warning"`
+	Error   *activityRetentionRulePatch `json:"error"`
+}
+
+type adminConfigUpdateRequest struct {
+	ServerAddr        string                  `json:"server_addr"`
+	AllowedPorts      []PortRange             `json:"allowed_ports"`
+	ActivityRetention *activityRetentionPatch `json:"activity_retention"`
 }
 
 // adminConfigUpdateResponse carries unified responses for dry-run, successful save, and conflict scenarios.

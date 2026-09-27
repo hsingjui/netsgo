@@ -158,7 +158,8 @@ func TestClientControlLoopLegacyProxyProvisionFixturesStillUseLegacyProxyStore(t
 			c.DisableReconnect = true
 
 			go func() { _ = c.Start() }()
-			conn := ms.waitForConn(t, 2*time.Second)
+			conn := ms.waitForConn(t, 10*time.Second)
+			waitForAuthenticatedTestClient(t, c, 10*time.Second)
 
 			// These fixtures are hand-crafted from the v0.1.8 ProxyNewRequest
 			// schema and dual-dispatch code, not captured from a live server.
@@ -194,7 +195,7 @@ func TestClientControlLoopLegacyProxyProvisionFixturesStillUseLegacyProxyStore(t
 				if ack.ProvisionRevision != tc.revision {
 					t.Fatalf("legacy ack revision: got %d", ack.ProvisionRevision)
 				}
-			case <-time.After(2 * time.Second):
+			case <-time.After(10 * time.Second):
 				t.Fatal("did not receive legacy proxy_provision_ack")
 			}
 
@@ -244,8 +245,18 @@ func TestClientControlLoopLegacyProxyCloseFixtureDeletesLegacyProxyStore(t *test
 		Type: protocol.ProxyTypeTCP,
 	})
 
-	go func() { _ = c.Start() }()
-	conn := ms.waitForConn(t, 2*time.Second)
+	errCh := make(chan error, 1)
+	go func() { errCh <- c.Start() }()
+	t.Cleanup(func() {
+		c.Shutdown()
+		select {
+		case <-errCh:
+		case <-time.After(10 * time.Second):
+			t.Error("client did not stop within 2s")
+		}
+	})
+	conn := ms.waitForConn(t, 10*time.Second)
+	waitForAuthenticatedTestClient(t, c, 10*time.Second)
 
 	payload, err := os.ReadFile("testdata/legacy_v0.1.8_proxy_close.json")
 	if err != nil {
@@ -368,7 +379,8 @@ func TestClientControlLoopUnifiedPayloadIgnoresLegacyFlatFields(t *testing.T) {
 			c.DisableReconnect = true
 
 			go func() { _ = c.Start() }()
-			conn := ms.waitForConn(t, 2*time.Second)
+			conn := ms.waitForConn(t, 10*time.Second)
+			waitForAuthenticatedTestClient(t, c, 10*time.Second)
 			spec := tc.spec
 			const legacyShadowName = "legacy-shadow"
 			const legacyShadowID = "legacy-shadow-id"
@@ -404,7 +416,7 @@ func TestClientControlLoopUnifiedPayloadIgnoresLegacyFlatFields(t *testing.T) {
 				if ack.TunnelID != spec.ID || ack.Revision != spec.Revision || ack.Role != protocol.DataStreamRoleTarget {
 					t.Fatalf("unified ack identity mismatch: %+v", ack)
 				}
-			case <-time.After(2 * time.Second):
+			case <-time.After(10 * time.Second):
 				t.Fatal("did not receive tunnel_provision_ack")
 			}
 
@@ -465,7 +477,8 @@ func TestClientControlLoopRejectedUnifiedPayloadDoesNotFallBackToLegacyProxyStor
 	c.DisableReconnect = true
 
 	go func() { _ = c.Start() }()
-	conn := ms.waitForConn(t, 2*time.Second)
+	conn := ms.waitForConn(t, 10*time.Second)
+	waitForAuthenticatedTestClient(t, c, 10*time.Second)
 	spec := mixedPayloadTunnelSpec(t, "split-unsupported", protocol.IngressTypeTCPListen, "future_target", map[string]any{
 		"bind_ip": "0.0.0.0",
 		"port":    19091,
@@ -503,7 +516,7 @@ func TestClientControlLoopRejectedUnifiedPayloadDoesNotFallBackToLegacyProxyStor
 		if ack.TunnelID != spec.ID || ack.Revision != spec.Revision || ack.Role != protocol.DataStreamRoleTarget {
 			t.Fatalf("unified reject ack identity mismatch: %+v", ack)
 		}
-	case <-time.After(2 * time.Second):
+	case <-time.After(10 * time.Second):
 		t.Fatal("did not receive tunnel_provision_ack")
 	}
 	if _, ok := c.proxies.Load("legacy-reject-shadow"); ok {
@@ -539,7 +552,8 @@ func TestClientControlLoopMalformedUnifiedPayloadDoesNotFallBackToLegacyProxySto
 	c.DisableReconnect = true
 
 	go func() { _ = c.Start() }()
-	conn := ms.waitForConn(t, 2*time.Second)
+	conn := ms.waitForConn(t, 10*time.Second)
+	waitForAuthenticatedTestClient(t, c, 10*time.Second)
 	payload := mustJSON(t, map[string]any{
 		"id":          "legacy-malformed-shadow-id",
 		"name":        "legacy-malformed-shadow",

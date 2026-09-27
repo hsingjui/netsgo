@@ -1,4 +1,4 @@
-import { describe, expect, test } from 'bun:test';
+import { describe, expect, test } from 'vitest';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { createElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
@@ -9,6 +9,7 @@ import {
   getLatestTunnelMigrationTarget,
   getTunnelMigrationCandidates,
 } from '@/lib/tunnel-migration';
+import { SELF_RESOURCE_SCOPE } from '@/lib/resource-scope';
 
 import { TunnelListTable, type TunnelEntry } from './TunnelListTable';
 
@@ -59,6 +60,7 @@ function renderTable(tunnels: TunnelEntry[], clients?: Client[]) {
       QueryClientProvider,
       { client },
       createElement(TunnelListTable, {
+        scope: SELF_RESOURCE_SCOPE,
         tunnels,
         clients,
         title: 'Child tunnels',
@@ -180,6 +182,7 @@ describe('TunnelListTable', () => {
         QueryClientProvider,
         { client },
         createElement(TunnelListTable, {
+          scope: SELF_RESOURCE_SCOPE,
           tunnels: [
             createTunnel({
               traffic24hBytes: 1536,
@@ -250,6 +253,7 @@ describe('TunnelListTable', () => {
         QueryClientProvider,
         { client },
         createElement(TunnelListTable, {
+          scope: SELF_RESOURCE_SCOPE,
           tunnels: [createTunnel()],
           title: 'Child tunnels',
           showActions: false,
@@ -338,6 +342,7 @@ describe('TunnelListTable', () => {
         QueryClientProvider,
         { client },
         createElement(TunnelListTable, {
+          scope: SELF_RESOURCE_SCOPE,
           tunnels: [createTunnel({ clientName: 'edge-node' })],
           title: 'All tunnels',
           showActions: false,
@@ -364,6 +369,7 @@ describe('TunnelListTable', () => {
         QueryClientProvider,
         { client },
         createElement(TunnelListTable, {
+          scope: SELF_RESOURCE_SCOPE,
           tunnels: [createTunnel()],
           title: 'Child tunnels',
           showActions: true,
@@ -378,6 +384,7 @@ describe('TunnelListTable', () => {
         QueryClientProvider,
         { client: new QueryClient() },
         createElement(TunnelListTable, {
+          scope: SELF_RESOURCE_SCOPE,
           tunnels: [createTunnel()],
           title: 'All tunnels',
           showActions: true,
@@ -398,6 +405,7 @@ describe('TunnelListTable', () => {
         QueryClientProvider,
         { client },
         createElement(TunnelListTable, {
+          scope: SELF_RESOURCE_SCOPE,
           tunnels: [createTunnel({
             desired_state: 'stopped',
             runtime_state: 'stopped',

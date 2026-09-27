@@ -10,7 +10,37 @@ import (
 	"netsgo/pkg/protocol"
 )
 
-func (s *Server) restoreUnifiedServerExposeTunnel(client *ClientConn, stored StoredTunnel) error {
+func (s *Server) restoreUnifiedServerExposeTunnel(client *ClientConn, stored StoredTunnel, ownerEpoch uint64, task *unifiedTunnelReconcileTask) error {
+	resolvedOwnerEpoch, releaseOwnerGate, err := s.acquireStoredTunnelLifecycle(stored, ownerEpoch)
+	if err != nil {
+		return err
+	}
+	if ownerEpoch == 0 {
+		ownerEpoch = resolvedOwnerEpoch
+	}
+	s.clientTunnelMutationMu.Lock()
+	releaseRuntimeOperation := s.tunnelRuntimeOps.lock(tunnelRuntimeOperationKey(stored.ID, stored.OwnerClientID, stored.Name))
+	publicationLocked := true
+	releasePublication := func() {
+		if !publicationLocked {
+			return
+		}
+		publicationLocked = false
+		releaseRuntimeOperation()
+		s.clientTunnelMutationMu.Unlock()
+		releaseOwnerGate()
+	}
+	defer releasePublication()
+	if task != nil {
+		current, currentErr := s.unifiedTunnelReconcileTaskCurrentLocked(*task)
+		if currentErr != nil {
+			return currentErr
+		}
+		if !current {
+			return ErrUserLifecycleEpochChanged
+		}
+	}
+
 	runtimeConfig, err := serverExposeRuntimeProxyRequest(stored)
 	if err != nil {
 		return err
@@ -49,7 +79,30 @@ func (s *Server) restoreUnifiedServerExposeTunnel(client *ClientConn, stored Sto
 		Role:     protocol.DataStreamRoleTarget,
 		Spec:     tunnelSpecProtocolForRole(stored, protocol.ProxyRuntimeStatePending, protocol.DataStreamRoleTarget),
 	}
-	if err := s.waitForClientTunnelProvisionAck(client, req); err != nil {
+	releasePublication()
+	ackErr := s.waitForClientTunnelProvisionAckForTask(client, req, task)
+	_, nextReleaseOwnerGate, gateErr := s.acquireStoredTunnelLifecycle(stored, ownerEpoch)
+	if gateErr != nil {
+		s.discardTunnelRuntimeIfCurrent(client, stored.Name, tunnel, stored.ID, stored.Revision)
+		return gateErr
+	}
+	releaseOwnerGate = nextReleaseOwnerGate
+	s.clientTunnelMutationMu.Lock()
+	releaseRuntimeOperation = s.tunnelRuntimeOps.lock(tunnelRuntimeOperationKey(stored.ID, stored.OwnerClientID, stored.Name))
+	publicationLocked = true
+	if task != nil {
+		current, currentErr := s.unifiedTunnelReconcileTaskCurrentLocked(*task)
+		if currentErr != nil {
+			return currentErr
+		}
+		if !current {
+			s.discardTunnelRuntimeIfCurrent(client, stored.Name, tunnel, stored.ID, stored.Revision)
+			return ErrUserLifecycleEpochChanged
+		}
+	}
+
+	if ackErr != nil {
+		err := ackErr
 		if errors.Is(err, errTunnelProvisionAckCancelled) {
 			s.discardTunnelRuntimeIfCurrent(client, stored.Name, tunnel, stored.ID, stored.Revision)
 			_ = s.notifyServerExposeTargetUnprovision(client, storedTunnelToProxyConfig(stored), "provision_cancelled")

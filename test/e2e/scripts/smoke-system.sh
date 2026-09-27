@@ -7,7 +7,7 @@
 # This script uses --no-build. Images MUST be pre-built before invoking.
 #
 # Required env: SMOKE_BASE_COMPOSE, SMOKE_PROXY_COMPOSE, SMOKE_ADMIN_PASS
-# Optional env: SMOKE_PROJECT, SMOKE_PROXY_PORT, SMOKE_TIMEOUT,
+# Optional env: SMOKE_PROJECT, SMOKE_PROXY_PORT, SMOKE_TIMEOUT, SMOKE_PROBE_MODE,
 #   SMOKE_ADMIN_USER, SMOKE_MANAGEMENT_HOST, SMOKE_TARGET_HOSTNAME,
 #   SMOKE_INGRESS_HOSTNAME, and all port variables (PROXY_PORT, UPSTREAM_PORT,
 #   SERVER_SOCKS5_PORT, C2C_*).
@@ -23,6 +23,17 @@ SMOKE_MANAGEMENT_HOST="${SMOKE_MANAGEMENT_HOST:-panel.system.local}"
 SMOKE_PROXY_PORT="${SMOKE_PROXY_PORT:-19080}"
 SMOKE_TARGET_HOSTNAME="${SMOKE_TARGET_HOSTNAME:-system-target-client}"
 SMOKE_INGRESS_HOSTNAME="${SMOKE_INGRESS_HOSTNAME:-system-ingress-client}"
+SMOKE_PROBE_MODE="${SMOKE_PROBE_MODE:-${E2E_PROBE_MODE:-internal}}"
+SMOKE_PROBE_SERVICE="${SMOKE_PROBE_SERVICE:-server}"
+SMOKE_PROXY_SERVICE="${SMOKE_PROXY_SERVICE:-proxy}"
+
+case "${SMOKE_PROBE_MODE}" in
+	host|internal) ;;
+	*)
+		echo "[smoke] ERROR: unsupported SMOKE_PROBE_MODE=${SMOKE_PROBE_MODE}; expected host or internal" >&2
+		exit 1
+		;;
+esac
 
 # ---------- Bridge SMOKE_* → NETSGO_* for docker-compose.system.yml ----------
 # The compose file requires these NETSGO_* variables. Map from SMOKE_* if
@@ -65,7 +76,11 @@ api() {
 	shift 3 || true
 	local args=(-sS -X "${method}" -H "Host: ${SMOKE_MANAGEMENT_HOST}" -H "Content-Type: application/json")
 	[ -n "${token}" ] && args+=(-H "Authorization: Bearer ${token}")
-	curl "${args[@]}" "$@" "http://127.0.0.1:${SMOKE_PROXY_PORT}${path}"
+	if [ "${SMOKE_PROBE_MODE}" = "internal" ]; then
+		compose exec -T "${SMOKE_PROBE_SERVICE}" curl "${args[@]}" "$@" "http://${SMOKE_PROXY_SERVICE}${path}"
+	else
+		curl "${args[@]}" "$@" "http://127.0.0.1:${SMOKE_PROXY_PORT}${path}"
+	fi
 }
 
 compose() {
@@ -102,6 +117,7 @@ log "  server image:     ${NETSGO_SERVER_IMAGE:-<default>}"
 log "  target image:     ${NETSGO_TARGET_CLIENT_IMAGE:-<default>}"
 log "  ingress image:    ${NETSGO_INGRESS_CLIENT_IMAGE:-<default>}"
 log "  tools image:      ${NETSGO_E2E_TOOLS_IMAGE}"
+log "  probe mode:       ${SMOKE_PROBE_MODE}"
 compose up -d --no-build --remove-orphans server proxy tcp-backend tcp-backend-alt tcp-backend-slow udp-backend \
 	|| fail_with $? "compose up failed for infrastructure services"
 

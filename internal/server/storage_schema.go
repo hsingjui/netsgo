@@ -2,6 +2,7 @@ package server
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"io/fs"
 	"path"
@@ -19,6 +20,8 @@ const ServerDBFileName = serverDBFileName
 
 const serverMigrationDir = "migrations"
 
+const serverCompatibleMigrationTable = "schema_compatible_migrations"
+
 var migrationFileNamePattern = regexp.MustCompile(`^\d{3}_[a-z0-9]+(?:_[a-z0-9]+)*\.sql$`)
 
 func openServerDB(path string) (*sql.DB, error) {
@@ -26,11 +29,73 @@ func openServerDB(path string) (*sql.DB, error) {
 	if err != nil {
 		return nil, err
 	}
-	return storage.Open(path, migrations)
+	_, strict := partitionServerMigrations(migrations)
+	if err := storage.PreflightStrictMigrations(path, "schema_migrations", strict); err != nil {
+		return nil, err
+	}
+	db, err := storage.OpenConfigured(path)
+	if err != nil {
+		return nil, err
+	}
+	if err := storage.ApplyMigrationPlan(db, serverMigrationPlan(migrations)); err != nil {
+		_ = db.Close()
+		var orphanErr *multiUserMigrationOrphanRowsError
+		if errors.As(err, &orphanErr) {
+			return nil, fmt.Errorf(
+				"server database %q was not upgraded: %w; migration 012 was rolled back and was not recorded; back up the database, inspect user_id values in %s that are absent from admin_users, restore missing users or repair only rows whose correct disposition is confirmed, then restart NetsGo",
+				path,
+				err,
+				orphanErr.Table,
+			)
+		}
+		return nil, err
+	}
+	return db, nil
+}
+
+func serverMigrationPlan(migrations []storage.Migration) []storage.MigrationPlanItem {
+	plan := make([]storage.MigrationPlanItem, 0, len(migrations))
+	for _, migration := range migrations {
+		compatible := isCompatibleServerMigration(migration.Name)
+		ledger := "schema_migrations"
+		if compatible {
+			ledger = serverCompatibleMigrationTable
+		}
+		plan = append(plan, storage.MigrationPlanItem{
+			Migration: migration,
+			Ledger:    ledger,
+			Strict:    !compatible,
+		})
+	}
+	return plan
+}
+
+func partitionServerMigrations(migrations []storage.Migration) (compatible, strict []storage.Migration) {
+	for _, migration := range migrations {
+		if isCompatibleServerMigration(migration.Name) {
+			compatible = append(compatible, migration)
+			continue
+		}
+		strict = append(strict, migration)
+	}
+	return compatible, strict
+}
+
+func isCompatibleServerMigration(name string) bool {
+	return name == "010_client_auth_control" || name == "011_activity_events"
 }
 
 func serverMigrations() ([]storage.Migration, error) {
-	return loadMigrations(serverMigrationFS, serverMigrationDir)
+	migrations, err := loadMigrations(serverMigrationFS, serverMigrationDir)
+	if err != nil {
+		return nil, err
+	}
+	for index := range migrations {
+		if migrations[index].Name == "012_multi_user_ownership" {
+			migrations[index].ValidateTx = validateMultiUserOwnershipMigrationTx
+		}
+	}
+	return migrations, nil
 }
 
 func loadMigrations(fsys fs.FS, dir string) ([]storage.Migration, error) {

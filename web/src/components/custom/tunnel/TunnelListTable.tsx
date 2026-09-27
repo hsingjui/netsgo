@@ -29,6 +29,7 @@ import {
   useResumeTunnel, useStopTunnel, useDeleteTunnel,
 } from '@/hooks/use-tunnel-mutations';
 import type { Client, ProxyConfig } from '@/types';
+import type { ResourceScope } from '@/lib/resource-scope';
 import { formatBytes, formatNetSpeed } from '@/lib/format';
 import { useTranslation } from 'react-i18next';
 
@@ -43,6 +44,8 @@ export interface TunnelEntry extends ProxyConfig {
 type Traffic24hState = 'loading' | 'error' | 'ready';
 
 interface TunnelListTableProps {
+  /** User ownership scope for every read and mutation in this table. */
+  scope: ResourceScope;
   /** 隧道列表 */
   tunnels: TunnelEntry[];
   /** 可用于创建/编辑时选择参与客户端 */
@@ -86,6 +89,7 @@ function compareTunnelsByCreatedAtDesc(a: TunnelEntry, b: TunnelEntry) {
 
 
 export function TunnelListTable({
+  scope,
   tunnels,
   clients,
   title,
@@ -101,9 +105,9 @@ export function TunnelListTable({
   onClientClick,
 }: TunnelListTableProps) {
   const { t } = useTranslation();
-  const resumeTunnel = useResumeTunnel();
-  const stopTunnel = useStopTunnel();
-  const deleteTunnel = useDeleteTunnel();
+  const resumeTunnel = useResumeTunnel(scope);
+  const stopTunnel = useStopTunnel(scope);
+  const deleteTunnel = useDeleteTunnel(scope);
   const [searchQuery, setSearchQuery] = useState('');
   const [deleteTarget, setDeleteTarget] = useState<{ id: string; name: string; clientId: string } | null>(null);
   const [editTarget, setEditTarget] = useState<TunnelEntry | null>(null);
@@ -332,6 +336,7 @@ export function TunnelListTable({
             onCancel={() => setDeleteTarget(null)}
           />
           <TunnelDialog
+            scope={scope}
             mode="edit"
             tunnel={editTarget}
             clients={clients}
@@ -339,12 +344,14 @@ export function TunnelListTable({
             onOpenChange={(v) => { if (!v) setEditTarget(null); }}
           />
           <TunnelSpeedDialog
+            scope={scope}
             tunnel={speedTarget}
             clientId={speedTarget?.clientId ?? ''}
             open={speedTarget !== null}
             onOpenChange={(v) => { if (!v) setSpeedTarget(null); }}
           />
           <TunnelMigrateDialog
+            scope={scope}
             tunnel={migrateTarget}
             clients={clients}
             open={migrateTarget !== null}

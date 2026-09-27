@@ -7,10 +7,12 @@ import {
 } from '@/components/ui/dialog';
 import { TrafficRateChart } from '@/components/custom/chart/TrafficRateChart';
 import type { ProxyConfig } from '@/types';
+import type { ResourceScope } from '@/lib/resource-scope';
 import { useTranslation } from 'react-i18next';
 import { buildTunnelSpeedFilter } from '@/lib/tunnel-speed';
 
 interface TunnelSpeedDialogProps {
+  scope: ResourceScope;
   tunnel: ProxyConfig | null;
   clientId: string;
   open: boolean;
@@ -18,6 +20,7 @@ interface TunnelSpeedDialogProps {
 }
 
 export function TunnelSpeedDialog({
+  scope,
   tunnel,
   clientId,
   open,
@@ -36,7 +39,7 @@ export function TunnelSpeedDialog({
           </DialogTitle>
         </DialogHeader>
         <div className="min-w-0">
-          <TrafficRateChart clientId={clientId} tunnelFilter={buildTunnelSpeedFilter(tunnel)} />
+          <TrafficRateChart scope={scope} clientId={clientId} tunnelFilter={buildTunnelSpeedFilter(tunnel)} />
         </div>
       </DialogContent>
     </Dialog>

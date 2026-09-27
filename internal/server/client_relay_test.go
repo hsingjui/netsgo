@@ -196,8 +196,7 @@ func TestClientRelayRegistryStoresTunnelBandwidthRuntime(t *testing.T) {
 func TestClientRelayTCPTransfersBytes(t *testing.T) {
 	s := New(0)
 	s.store = newTestTunnelStore(t)
-	trafficStore, cleanupTraffic := newTestTrafficStore(t)
-	defer cleanupTraffic()
+	trafficStore := newTestTrafficStoreForTunnelStore(t, s.store)
 	s.trafficStore = trafficStore
 
 	stored := testClientRelayStoredTunnel(t)
@@ -419,8 +418,7 @@ func TestClientRelaySOCKS5CopiesDynamicTargetHeader(t *testing.T) {
 func TestClientRelaySOCKS5DialResultIsNotCountedAsPayload(t *testing.T) {
 	s := New(0)
 	s.store = newTestTunnelStore(t)
-	trafficStore, cleanupTraffic := newTestTrafficStore(t)
-	defer cleanupTraffic()
+	trafficStore := newTestTrafficStoreForTunnelStore(t, s.store)
 	s.trafficStore = trafficStore
 
 	stored := testClientRelayStoredTunnel(t)
@@ -592,8 +590,7 @@ func TestClientRelayRejectsWrongDirection(t *testing.T) {
 func TestClientRelayUDPTransfersFrames(t *testing.T) {
 	s := New(0)
 	s.store = newTestTunnelStore(t)
-	trafficStore, cleanupTraffic := newTestTrafficStore(t)
-	defer cleanupTraffic()
+	trafficStore := newTestTrafficStoreForTunnelStore(t, s.store)
 	s.trafficStore = trafficStore
 
 	stored := testClientRelayStoredTunnel(t)

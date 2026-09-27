@@ -9,6 +9,8 @@ import (
 	"netsgo/pkg/protocol"
 )
 
+const defaultControlWriteTimeout = 2 * time.Second
+
 func (c *ClientConn) GetInfo() protocol.ClientInfo {
 	c.infoMu.RLock()
 	defer c.infoMu.RUnlock()
@@ -52,12 +54,40 @@ func (c *ClientConn) BandwidthRuntime() *directionalBandwidthRuntime {
 }
 
 func (c *ClientConn) writeJSON(v any) error {
+	return c.writeJSONBefore(v, time.Time{})
+}
+
+func (c *ClientConn) writeJSONBefore(v any, deadline time.Time) error {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.conn == nil {
+	conn := c.conn
+	c.mu.Unlock()
+	if conn == nil {
 		return fmt.Errorf("client %s control channel unavailable", c.ID)
 	}
-	return c.conn.WriteJSON(v)
+	if deadline.IsZero() {
+		deadline = time.Now().Add(defaultControlWriteTimeout)
+	}
+	if err := conn.SetWriteDeadline(deadline); err != nil {
+		c.detachAndCloseControlConn(conn)
+		return fmt.Errorf("set control write deadline: %w", err)
+	}
+	defer func() { _ = conn.SetWriteDeadline(time.Time{}) }()
+	if err := conn.WriteJSON(v); err != nil {
+		c.detachAndCloseControlConn(conn)
+		return err
+	}
+	return nil
+}
+
+func (c *ClientConn) detachAndCloseControlConn(conn *websocket.Conn) {
+	c.mu.Lock()
+	if c.conn == conn {
+		c.conn = nil
+	}
+	c.mu.Unlock()
+	_ = conn.Close()
 }
 
 func (c *ClientConn) detachControlConn() *websocket.Conn {

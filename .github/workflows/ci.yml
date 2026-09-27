@@ -48,6 +48,9 @@ jobs:
       - name: Build web assets
         working-directory: web
         run: bun run build
+      - name: Test web
+        working-directory: web
+        run: bun run test
       - name: Pack web dist
         run: tar -czf /tmp/web-dist.tgz -C web dist
       - uses: actions/upload-artifact@v7
@@ -91,7 +94,7 @@ jobs:
         shell: bash
         run: tar -xzf web-dist-archive/web-dist.tgz -C web
       - name: Run govulncheck
-        run: go install golang.org/x/vuln/cmd/govulncheck@latest && govulncheck ./...
+        run: go install golang.org/x/vuln/cmd/govulncheck@v1.7.0 && govulncheck ./...
 
   test:
     runs-on: ubuntu-latest
@@ -171,10 +174,8 @@ jobs:
       - name: Install Playwright browser
         working-directory: web
         run: bunx playwright install --with-deps chromium
-      - name: Run Playwright client-to-client smoke E2E
-        env:
-          PLAYWRIGHT_RUNNER: xvfb-run -a
-        run: make test-playwright-e2e-smoke
+      - name: Run full Playwright E2E
+        run: make test-playwright-e2e-full
 
   cross-version-smoke:
     runs-on: ubuntu-latest

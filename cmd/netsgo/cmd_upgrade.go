@@ -120,6 +120,12 @@ func runUpgradeCommand(force, yes bool, deps upgradeCommandDeps) error {
 	_, _ = fmt.Fprintln(deps.stdout, "替换完成。")
 	_, _ = fmt.Fprintf(deps.stdout, "已停止: %s\n", formatRestartUnits(result.Stopped))
 	_, _ = fmt.Fprintf(deps.stdout, "已启动: %s\n", formatRestartUnits(result.Started))
+	_, _ = fmt.Fprintf(deps.stdout, "旧版本备份: %s\n", result.BackupPath)
+	_, _ = fmt.Fprintln(deps.stdout, "注意: 该备份仅包含二进制；Server 数据库若已迁移，请先备份数据库并确认旧版本兼容。")
+	_, _ = fmt.Fprintln(deps.stdout, "手动恢复旧二进制:")
+	_, _ = fmt.Fprintf(deps.stdout, "  sudo systemctl stop %s\n", strings.Join(result.Started, " "))
+	_, _ = fmt.Fprintf(deps.stdout, "  sudo install -m 0755 %s %s\n", result.BackupPath, svcmgr.BinaryPath)
+	_, _ = fmt.Fprintf(deps.stdout, "  sudo systemctl start %s\n", strings.Join(result.Started, " "))
 	return nil
 }
 

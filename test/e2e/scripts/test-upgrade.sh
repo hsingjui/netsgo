@@ -19,6 +19,10 @@
 #
 # This is an upgrade data-path harness. In-flight stream continuity and detailed
 # auth/policy matrices are intentionally covered by separate tests.
+# Server rollback cases are only meaningful when the stable baseline knows every
+# current strict migration. With an older released baseline, the server must
+# fail closed instead of opening a database whose schema it cannot understand;
+# those cases are reported as skipped by UPGRADE_ROLLBACK_MODE=auto.
 #
 # Required env (from Makefile): E2E_BASE_COMPOSE, E2E_PROXY_COMPOSE,
 #   PROXY_PORT, UPSTREAM_PORT, port env vars, COMPAT_BASELINE,
@@ -31,6 +35,9 @@ E2E_BASE_COMPOSE="${E2E_BASE_COMPOSE:?E2E_BASE_COMPOSE is required}"
 E2E_PROXY_COMPOSE="${E2E_PROXY_COMPOSE:?E2E_PROXY_COMPOSE is required}"
 PROXY_PORT="${PROXY_PORT:-19080}"
 UPSTREAM_PORT="${UPSTREAM_PORT:-19081}"
+E2E_PROBE_MODE="${E2E_PROBE_MODE:-internal}"
+E2E_PROBE_SERVICE="${E2E_PROBE_SERVICE:-server}"
+E2E_PROXY_SERVICE="${E2E_PROXY_SERVICE:-proxy}"
 SERVER_TCP_PORT="${SERVER_TCP_PORT:-19093}"
 SERVER_UDP_PORT="${SERVER_UDP_PORT:-19094}"
 SERVER_SOCKS5_PORT="${SERVER_SOCKS5_PORT:-19095}"
@@ -51,6 +58,7 @@ E2E_STABLE_IMAGE="${E2E_STABLE_IMAGE:-netsgo-e2e:${COMPAT_BASELINE}}"
 NETSGO_E2E_TOOLS_IMAGE="${NETSGO_E2E_TOOLS_IMAGE:-${E2E_STABLE_IMAGE}}"
 NETSGO_E2E_DIR="${NETSGO_E2E_DIR:-.}"
 RECOVERY_TIMEOUT_SECONDS="${UPGRADE_RECOVERY_TIMEOUT_SECONDS:-120}"
+ROLLBACK_MODE="${UPGRADE_ROLLBACK_MODE:-auto}"
 export SERVER_TCP_PORT SERVER_UDP_PORT SERVER_SOCKS5_PORT SERVER_TCP_ALT_PORT SERVER_UDP_ALT_PORT SERVER_SOCKS5_ALT_PORT
 export C2C_SOCKS5_PORT C2C_SOCKS5_DENY_PORT C2C_TCP_PORT C2C_TCP_ALT_PORT C2C_TCP_SLOW_PORT C2C_UDP_PORT C2C_SOCKS5_AUTH_PORT C2C_SOCKS5_SOURCE_DENY_PORT
 
@@ -65,6 +73,22 @@ UDP_BACKEND_HOST="udp-backend"
 UDP_BACKEND_PORT=18084
 
 log() { echo "[upgrade] $*"; }
+
+case "${E2E_PROBE_MODE}" in
+	host|internal) ;;
+	*)
+		log "ERROR: unsupported E2E_PROBE_MODE=${E2E_PROBE_MODE}; expected host or internal"
+		exit 1
+		;;
+esac
+
+case "${ROLLBACK_MODE}" in
+	auto|always|never) ;;
+	*)
+		log "ERROR: unsupported UPGRADE_ROLLBACK_MODE=${ROLLBACK_MODE}; expected auto, always, or never"
+		exit 1
+		;;
+esac
 
 random_admin_password() {
 	printf 'NetsGo1-%s' "$(openssl rand -hex 12 2>/dev/null || uuidgen)"
@@ -122,7 +146,11 @@ api() {
 	shift 3 || true
 	local args=(-sS -X "${method}" -H "Host: ${MANAGEMENT_HOST}" -H "Content-Type: application/json")
 	[ -n "${token}" ] && args+=(-H "Authorization: Bearer ${token}")
-	curl "${args[@]}" "$@" "http://127.0.0.1:${PROXY_PORT}${path}"
+	if [ "${E2E_PROBE_MODE}" = "internal" ]; then
+		compose exec -T "${E2E_PROBE_SERVICE}" curl "${args[@]}" "$@" "http://${E2E_PROXY_SERVICE}${path}"
+	else
+		curl "${args[@]}" "$@" "http://127.0.0.1:${PROXY_PORT}${path}"
+	fi
 }
 
 login_admin() {
@@ -460,7 +488,11 @@ verify_http() {
 	local end_ts="$(($(date +%s) + timeout))"
 	while [ "$(date +%s)" -lt "${end_ts}" ]; do
 		local resp
-		resp="$(curl -sS -H "Host: ${host}" "http://127.0.0.1:${PROXY_PORT}/" 2>/dev/null)" || resp=""
+		if [ "${E2E_PROBE_MODE}" = "internal" ]; then
+			resp="$(compose exec -T "${E2E_PROBE_SERVICE}" curl -sS -H "Host: ${host}" "http://${E2E_PROXY_SERVICE}/" 2>/dev/null)" || resp=""
+		else
+			resp="$(curl -sS -H "Host: ${host}" "http://127.0.0.1:${PROXY_PORT}/" 2>/dev/null)" || resp=""
+		fi
 		if echo "${resp}" | grep -qF "${expected}" 2>/dev/null; then
 			return 0
 		fi
@@ -472,9 +504,17 @@ verify_http() {
 verify_tcp_http() {
 	local port="$1" host="$2" expected="$3" timeout="${4:-15}"
 	local end_ts="$(($(date +%s) + timeout))"
+	local probe_service="server"
+	if [ "${E2E_PROBE_MODE}" = "internal" ]; then
+		probe_service="$(data_probe_service_for_port "${port}")"
+	fi
 	while [ "$(date +%s)" -lt "${end_ts}" ]; do
 		local resp=""
-		resp="$(curl -sS --max-time 5 -H "Host: ${host}" "http://127.0.0.1:${port}/" 2>/dev/null || true)"
+		if [ "${E2E_PROBE_MODE}" = "internal" ]; then
+			resp="$(compose exec -T "${E2E_PROBE_SERVICE}" curl -sS --max-time 5 -H "Host: ${host}" "http://${probe_service}:${port}/" 2>/dev/null || true)"
+		else
+			resp="$(curl -sS --max-time 5 -H "Host: ${host}" "http://127.0.0.1:${port}/" 2>/dev/null || true)"
+		fi
 		if echo "${resp}" | grep -qF "${expected}" 2>/dev/null; then
 			return 0
 		fi
@@ -486,9 +526,20 @@ verify_tcp_http() {
 verify_udp_echo() {
 	local port="$1" payload="$2" timeout="${3:-15}"
 	local end_ts="$(($(date +%s) + timeout))"
+	local probe_service="server"
+	if [ "${E2E_PROBE_MODE}" = "internal" ]; then
+		probe_service="$(data_probe_service_for_port "${port}")"
+	fi
 	while [ "$(date +%s)" -lt "${end_ts}" ]; do
 		local resp=""
-		if resp="$(printf '%s' "${payload}" | nc -u -w 5 127.0.0.1 "${port}" 2>/dev/null)"; then
+		if [ "${E2E_PROBE_MODE}" = "internal" ]; then
+			resp="$(printf '%s' "${payload}" | compose exec -T "${E2E_PROBE_SERVICE}" socat -T5 - "UDP4-DATAGRAM:${probe_service}:${port}" 2>/dev/null)"
+		elif resp="$(printf '%s' "${payload}" | nc -u -w 5 127.0.0.1 "${port}" 2>/dev/null)"; then
+			:
+		else
+			resp=""
+		fi
+		if [ -n "${resp}" ]; then
 			if [ "${resp}" = "${payload}" ]; then
 				return 0
 			fi
@@ -501,9 +552,20 @@ verify_udp_echo() {
 verify_socks5_http() {
 	local port="$1" host="$2" expected="$3" timeout="${4:-30}"
 	local end_ts="$(($(date +%s) + timeout))"
+	local probe_service="server"
+	if [ "${E2E_PROBE_MODE}" = "internal" ]; then
+		probe_service="$(data_probe_service_for_port "${port}")"
+	fi
 	while [ "$(date +%s)" -lt "${end_ts}" ]; do
 		local resp=""
-		if resp="$(curl -sS --socks5-hostname "127.0.0.1:${port}" "http://${host}:${BACKEND_PORT}/" 2>/dev/null)"; then
+		if [ "${E2E_PROBE_MODE}" = "internal" ]; then
+			resp="$(compose exec -T "${E2E_PROBE_SERVICE}" curl -sS --socks5-hostname "${probe_service}:${port}" "http://${host}:${BACKEND_PORT}/" 2>/dev/null)"
+		elif resp="$(curl -sS --socks5-hostname "127.0.0.1:${port}" "http://${host}:${BACKEND_PORT}/" 2>/dev/null)"; then
+			:
+		else
+			resp=""
+		fi
+		if [ -n "${resp}" ]; then
 			if echo "${resp}" | grep -qF "${expected}" 2>/dev/null; then
 				return 0
 			fi
@@ -511,6 +573,18 @@ verify_socks5_http() {
 		sleep 2
 	done
 	return 1
+}
+
+data_probe_service_for_port() {
+	local port="$1"
+	case "${port}" in
+		"${C2C_SOCKS5_PORT}"|"${C2C_SOCKS5_DENY_PORT}"|"${C2C_TCP_PORT}"|"${C2C_TCP_ALT_PORT}"|"${C2C_TCP_SLOW_PORT}"|"${C2C_UDP_PORT}"|"${C2C_SOCKS5_AUTH_PORT}"|"${C2C_SOCKS5_SOURCE_DENY_PORT}")
+			echo ingress-client
+			;;
+		*)
+			echo server
+			;;
+	esac
 }
 
 verify_server_expose_suite() {
@@ -590,6 +664,36 @@ if ! docker image inspect "${E2E_STABLE_IMAGE}" >/dev/null 2>&1; then
 	bash "${NETSGO_E2E_DIR}/test/e2e/scripts/build-e2e-stable.sh" "${COMPAT_BASELINE}" "${E2E_STABLE_IMAGE}"
 fi
 
+server_rollback_supported() {
+	case "${ROLLBACK_MODE}" in
+		always) return 0 ;;
+		never) return 1 ;;
+	esac
+
+	command -v git >/dev/null 2>&1 || {
+		log "rollback preflight: git is unavailable; cannot prove stable migration coverage"
+		return 1
+	}
+
+	local baseline_ref migration
+	baseline_ref="$(git rev-parse --verify "${COMPAT_BASELINE}^{commit}" 2>/dev/null || true)"
+	if [ -z "${baseline_ref}" ]; then
+		log "rollback preflight: ${COMPAT_BASELINE} is not present in the checkout"
+		return 1
+	fi
+
+	for migration in internal/server/migrations/*.sql; do
+		case "${migration##*/}" in
+			010_*|011_*) continue ;;
+		esac
+		if ! git cat-file -e "${baseline_ref}:${migration}" 2>/dev/null; then
+			log "rollback preflight: ${COMPAT_BASELINE} lacks current strict migration ${migration##*/}"
+			return 1
+		fi
+	done
+	return 0
+}
+
 log "============================================="
 log "UPGRADE E2E HARNESS"
 log "============================================="
@@ -598,6 +702,15 @@ log "current image:   ${E2E_CURRENT_IMAGE}"
 log "stable image:    ${E2E_STABLE_IMAGE}"
 log "tools image:     ${NETSGO_E2E_TOOLS_IMAGE}"
 log "proxy:           ${E2E_PROXY}"
+log "rollback mode:   ${ROLLBACK_MODE}"
+rollback_supported=false
+if server_rollback_supported; then
+	rollback_supported=true
+	log "rollback preflight: stable baseline can read current strict migration ledger"
+else
+	log "rollback preflight: server rollback cases will be skipped for this baseline"
+fi
+log "probe mode:      ${E2E_PROBE_MODE} (host remains available via E2E_PROBE_MODE=host)"
 log "NOTE: This is an upgrade data-path harness. In-flight stream continuity"
 log "      and detailed auth/policy matrices are covered by separate tests."
 log "      Set E2E_PLATFORM to override the default stable-image build platform."
@@ -605,6 +718,8 @@ log "============================================="
 
 passed=0
 failed=0
+skipped=0
+planned=9
 TUNNEL_HOST="upgrade-test.system.local"
 
 # ============================================================
@@ -1471,25 +1586,37 @@ run_case() {
 	PROJECT_NAME=""
 }
 
+skip_case() {
+	local name="$1" reason="$2"
+	skipped=$((skipped + 1))
+	log "SKIP: ${name} (${reason})"
+}
+
 run_case case_server_only
 run_case case_target_only
 run_case case_ingress_only
 run_case case_clients_only
-run_case case_server_rollback
-run_case case_current_write_rollback
+if [ "${rollback_supported}" = "true" ]; then
+	run_case case_server_rollback
+	run_case case_current_write_rollback
+else
+	skip_case case_server_rollback "stable baseline cannot read current strict migration ledger"
+	skip_case case_current_write_rollback "stable baseline cannot read current strict migration ledger"
+fi
 run_case case_all_upgrade
 run_case case_client_first_rolling
 run_case case_full_cold_upgrade
 
 # ========== Summary ==========
 
-total=$((passed + failed))
+executed=$((passed + failed))
 log ""
 log "============================================="
 log "UPGRADE E2E SUMMARY"
 log "============================================="
-log "passed: ${passed}/${total}"
-log "failed: ${failed}/${total}"
+log "passed: ${passed}/${executed} executed"
+log "failed: ${failed}/${executed} executed"
+log "skipped: ${skipped}/${planned} planned"
 log ""
 log "NOTE: Results cover upgrade data paths for HTTP, TCP, UDP, SOCKS5,"
 log "      rollback, current-write rollback, rolling, and cold-upgrade cases."

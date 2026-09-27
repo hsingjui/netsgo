@@ -1,11 +1,20 @@
 package server
 
 type realtimeSecondIndex struct {
-	byClient map[string]map[trafficSeriesKey]map[int64]TrafficBucket
+	byClient map[string]map[realtimeSecondSeriesKey]map[int64]TrafficBucket
+}
+
+// realtimeSecondSeriesKey keeps observations from distinct user owners apart
+// even before they reach SQLite. A ClientID is immutable to one owner in the
+// normal model, but retaining the owner here makes a bad or stale producer
+// unable to merge data across an authorization boundary.
+type realtimeSecondSeriesKey struct {
+	OwnerUserID string
+	Series      trafficSeriesKey
 }
 
 func newRealtimeSecondIndex() *realtimeSecondIndex {
-	return &realtimeSecondIndex{byClient: make(map[string]map[trafficSeriesKey]map[int64]TrafficBucket)}
+	return &realtimeSecondIndex{byClient: make(map[string]map[realtimeSecondSeriesKey]map[int64]TrafficBucket)}
 }
 
 func (idx *realtimeSecondIndex) Add(bucket TrafficBucket) error {
@@ -16,16 +25,16 @@ func (idx *realtimeSecondIndex) Add(bucket TrafficBucket) error {
 		return nil
 	}
 	if idx.byClient == nil {
-		idx.byClient = make(map[string]map[trafficSeriesKey]map[int64]TrafficBucket)
+		idx.byClient = make(map[string]map[realtimeSecondSeriesKey]map[int64]TrafficBucket)
 	}
 
 	seriesByClient := idx.byClient[bucket.ClientID]
 	if seriesByClient == nil {
-		seriesByClient = make(map[trafficSeriesKey]map[int64]TrafficBucket)
+		seriesByClient = make(map[realtimeSecondSeriesKey]map[int64]TrafficBucket)
 		idx.byClient[bucket.ClientID] = seriesByClient
 	}
 
-	seriesKey := trafficSeriesKeyFromBucket(bucket)
+	seriesKey := realtimeSecondSeriesKey{OwnerUserID: bucket.OwnerUserID, Series: trafficSeriesKeyFromBucket(bucket)}
 	bucketsBySecond := seriesByClient[seriesKey]
 	if bucketsBySecond == nil {
 		bucketsBySecond = make(map[int64]TrafficBucket)
@@ -45,6 +54,17 @@ func (idx *realtimeSecondIndex) Add(bucket TrafficBucket) error {
 }
 
 func (idx *realtimeSecondIndex) Query(clientID, tunnelName string, fromUnix, toUnix int64) []TrafficBucket {
+	return idx.query("", clientID, tunnelName, fromUnix, toUnix, false)
+}
+
+func (idx *realtimeSecondIndex) QueryForUser(ownerUserID, clientID, tunnelName string, fromUnix, toUnix int64) []TrafficBucket {
+	if ownerUserID == "" {
+		return nil
+	}
+	return idx.query(ownerUserID, clientID, tunnelName, fromUnix, toUnix, true)
+}
+
+func (idx *realtimeSecondIndex) query(ownerUserID, clientID, tunnelName string, fromUnix, toUnix int64, requireOwner bool) []TrafficBucket {
 	if idx == nil || idx.byClient == nil {
 		return nil
 	}
@@ -56,7 +76,10 @@ func (idx *realtimeSecondIndex) Query(clientID, tunnelName string, fromUnix, toU
 
 	buckets := []TrafficBucket{}
 	for key, bucketsBySecond := range seriesByClient {
-		if tunnelName != "" && key.TunnelName != tunnelName {
+		if requireOwner && key.OwnerUserID != ownerUserID {
+			continue
+		}
+		if tunnelName != "" && key.Series.TunnelName != tunnelName && key.Series.TunnelID != tunnelName {
 			continue
 		}
 		for second, bucket := range bucketsBySecond {
@@ -103,7 +126,7 @@ func (idx *realtimeSecondIndex) EvictTunnel(clientID, tunnelName string) {
 	}
 	seriesByClient := idx.byClient[clientID]
 	for key := range seriesByClient {
-		if key.TunnelName == tunnelName {
+		if key.Series.TunnelName == tunnelName {
 			delete(seriesByClient, key)
 		}
 	}
@@ -121,7 +144,7 @@ func (idx *realtimeSecondIndex) RenameTunnel(clientID, oldName, newName string) 
 	return nil
 }
 
-func (idx *realtimeSecondIndex) renamedTunnelBuckets(clientID, oldName, newName string) (map[trafficSeriesKey]map[int64]TrafficBucket, bool, error) {
+func (idx *realtimeSecondIndex) renamedTunnelBuckets(clientID, oldName, newName string) (map[realtimeSecondSeriesKey]map[int64]TrafficBucket, bool, error) {
 	if idx == nil || idx.byClient == nil || oldName == newName {
 		return nil, false, nil
 	}
@@ -132,7 +155,7 @@ func (idx *realtimeSecondIndex) renamedTunnelBuckets(clientID, oldName, newName 
 
 	hasOldName := false
 	for key := range seriesByClient {
-		if key.TunnelName == oldName {
+		if key.Series.TunnelName == oldName {
 			hasOldName = true
 			break
 		}
@@ -141,11 +164,11 @@ func (idx *realtimeSecondIndex) renamedTunnelBuckets(clientID, oldName, newName 
 		return nil, false, nil
 	}
 
-	renamed := make(map[trafficSeriesKey]map[int64]TrafficBucket, len(seriesByClient))
+	renamed := make(map[realtimeSecondSeriesKey]map[int64]TrafficBucket, len(seriesByClient))
 	for key, bucketsBySecond := range seriesByClient {
 		targetKey := key
-		if key.TunnelName == oldName {
-			targetKey.TunnelName = newName
+		if key.Series.TunnelName == oldName {
+			targetKey.Series.TunnelName = newName
 		}
 
 		targetBuckets := renamed[targetKey]
@@ -154,7 +177,7 @@ func (idx *realtimeSecondIndex) renamedTunnelBuckets(clientID, oldName, newName 
 			renamed[targetKey] = targetBuckets
 		}
 		for second, bucket := range bucketsBySecond {
-			if key.TunnelName == oldName {
+			if key.Series.TunnelName == oldName {
 				bucket.TunnelName = newName
 			}
 			if existing, ok := targetBuckets[second]; ok {

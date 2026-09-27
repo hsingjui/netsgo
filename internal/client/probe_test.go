@@ -2,9 +2,13 @@ package client
 
 import (
 	"encoding/json"
+	"errors"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
+
+	psnet "github.com/shirou/gopsutil/v4/net"
 )
 
 // ============================================================
@@ -78,13 +82,31 @@ func TestProbe_DiskValid(t *testing.T) {
 	}
 }
 
-func TestProbe_UptimePositive(t *testing.T) {
-	stats, err := CollectSystemStats(time.Time{})
+func TestProbe_UptimeCollection(t *testing.T) {
+	const wantUptime = uint64(12_345)
+	stats, err := collectSystemStats(time.Time{}, func() (uint64, error) {
+		return wantUptime, nil
+	})
 	if err != nil {
 		t.Fatalf("CollectSystemStats failed: %v", err)
 	}
-	if stats.Uptime == 0 {
-		t.Error("Uptime should not be 0 (the machine should have been running for at least a few seconds)")
+	if stats.Uptime != wantUptime {
+		t.Fatalf("Uptime = %d, want %d", stats.Uptime, wantUptime)
+	}
+}
+
+func TestProbe_UptimeCollectionErrorKeepsPartialStats(t *testing.T) {
+	stats, err := collectSystemStats(time.Time{}, func() (uint64, error) {
+		return 0, errors.New("system uptime unavailable")
+	})
+	if err != nil {
+		t.Fatalf("CollectSystemStats failed: %v", err)
+	}
+	if stats.Uptime != 0 {
+		t.Fatalf("Uptime = %d, want 0 when collection fails", stats.Uptime)
+	}
+	if stats.NumCPU != runtime.NumCPU() {
+		t.Fatalf("NumCPU = %d, want partial stats to remain populated with %d", stats.NumCPU, runtime.NumCPU())
 	}
 }
 
@@ -97,6 +119,28 @@ func TestProbe_NetCounters(t *testing.T) {
 	// Running the test itself generates network traffic, so at least one should be > 0
 	if stats.NetSent == 0 && stats.NetRecv == 0 {
 		t.Log("warning: both NetSent and NetRecv are 0, possibly due to an isolated environment (logged, not treated as a failure)")
+	}
+}
+
+func TestCollectNetworkIOCountersRecoversCollectorPanic(t *testing.T) {
+	counters, err := collectNetworkIOCounters(func(bool) ([]psnet.IOCountersStat, error) {
+		panic("malformed netstat output")
+	})
+	if err == nil || counters != nil {
+		t.Fatalf("panic recovery = (%v, %v), want nil counters and an error", counters, err)
+	}
+	if !strings.Contains(err.Error(), "malformed netstat output") {
+		t.Fatalf("panic recovery error = %q, want panic context", err)
+	}
+}
+
+func TestCollectNetworkIOCountersReturnsCollectorError(t *testing.T) {
+	want := errors.New("network counters unavailable")
+	counters, err := collectNetworkIOCounters(func(bool) ([]psnet.IOCountersStat, error) {
+		return nil, want
+	})
+	if counters != nil || !errors.Is(err, want) {
+		t.Fatalf("collector error = (%v, %v), want nil and %v", counters, err, want)
 	}
 }
 

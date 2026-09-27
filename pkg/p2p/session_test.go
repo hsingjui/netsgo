@@ -11,6 +11,13 @@ import (
 	"netsgo/pkg/protocol"
 )
 
+func TestP2PMuxConfigUsesFourMiBStreamWindow(t *testing.T) {
+	cfg := p2pMuxConfig()
+	if cfg.MaxStreamWindow != 4*1024*1024 {
+		t.Fatalf("MaxStreamWindow = %d, want %d", cfg.MaxStreamWindow, 4*1024*1024)
+	}
+}
+
 func TestSessionOpensYamuxStreamOverDetachedDataChannel(t *testing.T) {
 	var offerer, answerer *Session
 	offererCandidates := make(chan protocol.P2PSignal, 32)

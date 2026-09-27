@@ -124,6 +124,33 @@ func webAuthnUserFromPasskeys(user AdminUser, passkeys []AdminPasskey) (adminWeb
 	return adminWebAuthnUser{user: user, credentials: credentials}, nil
 }
 
+func (s *Server) passkeyLoginUserHandler(passkeys []AdminPasskey) webauthn.DiscoverableUserHandler {
+	return func(rawID, userHandle []byte) (webauthn.User, error) {
+		userID := string(userHandle)
+		user, err := s.auth.adminStore.GetAdminUserByID(userID)
+		if err != nil {
+			return nil, fmt.Errorf("passkey user not found")
+		}
+
+		credentialID := credentialIDString(rawID)
+		owned := make([]AdminPasskey, 0, len(passkeys))
+		ownsCredential := false
+		for _, passkey := range passkeys {
+			if passkey.UserID != userID {
+				continue
+			}
+			owned = append(owned, passkey)
+			if constantTimeStringEqual(passkey.CredentialID, credentialID) {
+				ownsCredential = true
+			}
+		}
+		if !ownsCredential {
+			return nil, fmt.Errorf("passkey credential not found")
+		}
+		return webAuthnUserFromPasskeys(user, owned)
+	}
+}
+
 func marshalWebAuthnSession(session *webauthn.SessionData) (string, error) {
 	raw, err := json.Marshal(session)
 	if err != nil {

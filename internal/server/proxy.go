@@ -135,7 +135,7 @@ func (s *Server) validateProxyRequestWithExclusions(client *ClientConn, req prot
 	}
 
 	if req.Type == protocol.ProxyTypeHTTP {
-		if err := validateDomain(req.Domain); err != nil {
+		if err := validateHTTPDomain(req.Domain); err != nil {
 			return newProxyRequestValidationError(err, protocol.TunnelMutationFieldDomain, protocol.TunnelMutationErrorCodeDomainInvalid, http.StatusBadRequest)
 		}
 		if err := checkDomainConflict(req.Domain, excludeName, excludeClientID, s); err != nil {
@@ -467,6 +467,81 @@ func (s *Server) proxyActivationClientCurrent(client *ClientConn) bool {
 	return client.isLive()
 }
 
+// withProxyRuntimeErrorPublication fences a late listener failure against the
+// logical Client session and its owning user's lifecycle. The caller still
+// validates the exact proxy activation while these locks are held.
+func (s *Server) withProxyRuntimeErrorPublication(
+	client *ClientConn,
+	config protocol.ProxyConfig,
+	publish func() bool,
+) bool {
+	if client == nil || publish == nil {
+		return false
+	}
+
+	ownerUserID := client.OwnerUserID
+	ownerEpoch := client.OwnerEpoch
+	generation := client.generation
+	releaseOwnerGate := func() {}
+	if ownerUserID != "" {
+		// Every authenticated Client captures a non-zero epoch. Treat a missing
+		// epoch as stale rather than silently taking a fresh lifecycle snapshot.
+		if ownerEpoch == 0 {
+			return false
+		}
+		_, release, err := s.acquireUserLifecycleRead(ownerUserID, ownerEpoch, true)
+		if err != nil {
+			return false
+		}
+		releaseOwnerGate = release
+	}
+	defer releaseOwnerGate()
+
+	s.clientTunnelMutationMu.Lock()
+	defer s.clientTunnelMutationMu.Unlock()
+	releaseRuntimeOperation := s.tunnelRuntimeOps.lock(tunnelRuntimeOperationKey(config.ID, client.ID, config.Name))
+	defer releaseRuntimeOperation()
+
+	current, ok := s.clients.Load(client.ID)
+	if !ok || current != client ||
+		client.generation != generation ||
+		client.OwnerUserID != ownerUserID ||
+		client.OwnerEpoch != ownerEpoch ||
+		!s.clientLifecycleCurrentLocked(client) {
+		return false
+	}
+	return publish()
+}
+
+func proxyRuntimeErrorIdentityMatches(current, expected protocol.ProxyConfig) bool {
+	return current.ID == expected.ID &&
+		current.Name == expected.Name &&
+		current.Revision == expected.Revision &&
+		current.Type == expected.Type &&
+		current.ClientID == expected.ClientID &&
+		current.OwnerClientID == expected.OwnerClientID &&
+		current.Topology == expected.Topology
+}
+
+func (s *Server) closeTCPRuntimeErrorListenerIfDetached(client *ClientConn, proxyName string, listener net.Listener) {
+	if listener == nil {
+		return
+	}
+	if client != nil {
+		currentClient, ok := s.clients.Load(client.ID)
+		if ok && currentClient == client {
+			client.proxyMu.RLock()
+			current := client.proxies[proxyName]
+			stillPublished := current != nil && current.Listener == listener
+			client.proxyMu.RUnlock()
+			if stillPublished {
+				return
+			}
+		}
+	}
+	_ = listener.Close()
+}
+
 func closeTunnelRuntimeResources(tunnel *ProxyTunnel) {
 	if tunnel == nil {
 		return
@@ -558,53 +633,70 @@ func (s *Server) markTCPProxyRuntimeErrorIfCurrent(
 	proxyName string,
 	tunnel *ProxyTunnel,
 	listener net.Listener,
+	expectedConfig protocol.ProxyConfig,
 	message string,
 ) {
+	if client == nil || tunnel == nil {
+		if listener != nil {
+			_ = listener.Close()
+		}
+		return
+	}
 	client.proxyMu.RLock()
 	current, exists := client.proxies[proxyName]
 	if !exists ||
 		current != tunnel ||
 		current.Listener != listener ||
+		!proxyRuntimeErrorIdentityMatches(current.Config, expectedConfig) ||
 		!isTunnelExposed(current.Config) {
 		client.proxyMu.RUnlock()
+		s.closeTCPRuntimeErrorListenerIfDetached(client, proxyName, listener)
 		return
 	}
-	operationConfig := current.Config
+	operationConfig := expectedConfig
 	client.proxyMu.RUnlock()
 
-	releaseRuntimeOperation := s.tunnelRuntimeOps.lock(tunnelRuntimeOperationKey(operationConfig.ID, client.ID, proxyName))
-	defer releaseRuntimeOperation()
-
-	client.proxyMu.Lock()
-	current, exists = client.proxies[proxyName]
-	if !exists ||
-		current != tunnel ||
-		current.Listener != listener ||
-		!isTunnelExposed(current.Config) {
+	handled := s.withProxyRuntimeErrorPublication(client, operationConfig, func() bool {
+		client.proxyMu.Lock()
+		current, exists = client.proxies[proxyName]
+		if !exists ||
+			current != tunnel ||
+			current.Listener != listener ||
+			!proxyRuntimeErrorIdentityMatches(current.Config, operationConfig) ||
+			!isTunnelExposed(current.Config) {
+			client.proxyMu.Unlock()
+			return false
+		}
+		closeTunnelRuntimeResources(current)
+		setProxyConfigStates(&current.Config, protocol.ProxyDesiredStateRunning, protocol.ProxyRuntimeStateError, message)
+		markTunnelRuntimeError(current, client.ID, message, time.Now())
+		config := current.Config
 		client.proxyMu.Unlock()
-		return
-	}
-	closeTunnelRuntimeResources(current)
-	setProxyConfigStates(&current.Config, protocol.ProxyDesiredStateRunning, protocol.ProxyRuntimeStateError, message)
-	markTunnelRuntimeError(current, client.ID, message, time.Now())
-	config := current.Config
-	client.proxyMu.Unlock()
 
-	updated, err := s.updateProxyConfigRuntimeIfCurrent(client.ID, config, protocol.ProxyRuntimeStateError, message)
-	if err != nil {
-		log.Printf("⚠️ TCP proxy [%s] failed to persist error state: %v", proxyName, err)
+		updated, err := s.updateProxyConfigRuntimeIfCurrent(client.ID, config, protocol.ProxyRuntimeStateError, message)
+		if err != nil {
+			log.Printf("⚠️ TCP proxy [%s] failed to persist error state: %v", proxyName, err)
+		}
+		if err == nil && !updated && config.Topology == protocol.TunnelTopologyServerExpose {
+			s.discardTunnelRuntimeIfCurrent(client, proxyName, tunnel, config.ID, config.Revision)
+			return true
+		}
+		if s.runtimeErrorCleanupHook != nil {
+			s.runtimeErrorCleanupHook(config)
+		}
+		if notifyErr := s.notifyRuntimeErrorUnprovision(client, tunnel, config); notifyErr != nil {
+			log.Printf("⚠️ TCP proxy [%s] failed to notify client of close: %v", proxyName, notifyErr)
+		}
+		if err != nil || !updated {
+			return true
+		}
+		s.recordServerExposeIngressIssue(config.ID, config.Revision, config.Type, message)
+		s.emitTunnelChangedIfStored(client.ID, config, "error")
+		return true
+	})
+	if !handled {
+		s.closeTCPRuntimeErrorListenerIfDetached(client, proxyName, listener)
 	}
-	if s.runtimeErrorCleanupHook != nil {
-		s.runtimeErrorCleanupHook(config)
-	}
-	if notifyErr := s.notifyRuntimeErrorUnprovision(client, tunnel, config); notifyErr != nil {
-		log.Printf("⚠️ TCP proxy [%s] failed to notify client of close: %v", proxyName, notifyErr)
-	}
-	if err != nil || !updated {
-		return
-	}
-	s.recordServerExposeIngressIssue(config.ID, config.Revision, config.Type, message)
-	s.emitTunnelChangedIfStored(client.ID, config, "error")
 }
 
 // proxyAcceptLoop continuously accepts external connections and forwards them via yamux.
@@ -620,7 +712,7 @@ func (s *Server) proxyAcceptLoop(client *ClientConn, tunnel *ProxyTunnel, listen
 				return // normal shutdown
 			default:
 				log.Printf("⚠️ proxy [%s] Accept failed: %v", activation.config.Name, err)
-				s.markTCPProxyRuntimeErrorIfCurrent(client, activation.config.Name, tunnel, listener, fmt.Sprintf("TCP proxy listener failed: %v", err))
+				s.markTCPProxyRuntimeErrorIfCurrent(client, activation.config.Name, tunnel, listener, activation.config, fmt.Sprintf("TCP proxy listener failed: %v", err))
 				return
 			}
 		}
@@ -642,7 +734,7 @@ func (s *Server) handleProxyConn(client *ClientConn, tunnel *ProxyTunnel, listen
 	stream, err := s.openStreamToClientForActivation(client, tunnel, activation)
 	if err != nil {
 		log.Printf("⚠️ proxy [%s] open stream failed: %v", activation.config.Name, err)
-		s.markTCPProxyRuntimeErrorIfCurrent(client, activation.config.Name, tunnel, listener, fmt.Sprintf("TCP proxy forwarding channel failed: %v", err))
+		s.markTCPProxyRuntimeErrorIfCurrent(client, activation.config.Name, tunnel, listener, activation.config, fmt.Sprintf("TCP proxy forwarding channel failed: %v", err))
 		return
 	}
 

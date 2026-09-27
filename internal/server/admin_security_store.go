@@ -25,17 +25,20 @@ const (
 	adminAuthChallengeKindPasskeyRegister = "passkey_register"
 	adminAuthChallengeKindPasskeyLogin    = "passkey_login"
 	adminAuthChallengeDefaultTTL          = 5 * time.Minute
+	adminPasskeyLoginBeginRateLimit       = 10
+	adminPasskeyLoginChallengeMaxActive   = 256
 	adminRecoveryCodeCount                = 10
 	adminRecoveryCodeRandomBytes          = 10
 	adminRecoveryCodePrefix               = "ng"
 )
 
 var (
-	errMFARequired      = errors.New("mfa verification required")
-	errMFAInvalid       = errors.New("invalid mfa code")
-	errCurrentPassword  = errors.New("current password is incorrect")
-	errPasskeyNotFound  = errors.New("passkey not found")
-	errPasskeyRPInvalid = errors.New("passkey relying party is unavailable")
+	errMFARequired                   = errors.New("mfa verification required")
+	errMFAInvalid                    = errors.New("invalid mfa code")
+	errCurrentPassword               = errors.New("current password is incorrect")
+	errPasskeyNotFound               = errors.New("passkey not found")
+	errPasskeyRPInvalid              = errors.New("passkey relying party is unavailable")
+	errPasskeyLoginChallengeCapacity = errors.New("passkey login challenge capacity reached")
 )
 
 type adminSecurityCredentialVerification struct {
@@ -47,7 +50,7 @@ func (s *AdminStore) GetAdminUserByID(userID string) (AdminUser, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	user, err := scanAdminUser(s.db.QueryRow(`SELECT `+adminUserSelectColumns()+` FROM admin_users WHERE id = ?`, userID))
+	user, err := scanAdminUser(s.db.QueryRow(`SELECT `+adminUserSelectColumns()+` FROM users WHERE id = ? AND is_admin = 1`, userID))
 	if err != nil {
 		return AdminUser{}, err
 	}
@@ -58,7 +61,7 @@ func (s *AdminStore) GetSingleAdminUser() (AdminUser, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	user, err := scanAdminUser(s.db.QueryRow(`SELECT ` + adminUserSelectColumns() + ` FROM admin_users ORDER BY created_at, id LIMIT 1`))
+	user, err := scanAdminUser(s.db.QueryRow(`SELECT ` + adminUserSelectColumns() + ` FROM users WHERE is_admin = 1 ORDER BY created_at, id LIMIT 1`))
 	if err != nil {
 		return AdminUser{}, err
 	}
@@ -76,7 +79,7 @@ func (s *AdminStore) VerifyAdminSecurityCredentials(userID, currentPassword, mfa
 	committed := false
 	defer rollbackUnlessCommitted(tx, &committed)
 
-	user, err := scanAdminUser(tx.QueryRow(`SELECT `+adminUserSelectColumns()+` FROM admin_users WHERE id = ?`, userID))
+	user, err := scanAdminUser(tx.QueryRow(`SELECT `+adminUserSelectColumns()+` FROM users WHERE id = ? AND is_admin = 1`, userID))
 	if err != nil {
 		if err == sql.ErrNoRows {
 			_ = bcrypt.CompareHashAndPassword(s.getDummyHash(), []byte(currentPassword))
@@ -128,92 +131,6 @@ func normalizeMFACode(code string) string {
 	return strings.ToUpper(strings.ReplaceAll(strings.TrimSpace(code), " ", ""))
 }
 
-func (s *AdminStore) UpdateAdminUsername(userID, username string) error {
-	username = strings.TrimSpace(username)
-	if username == "" {
-		return fmt.Errorf("admin username is required")
-	}
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	tx, err := s.db.Begin()
-	if err != nil {
-		return err
-	}
-	committed := false
-	defer rollbackUnlessCommitted(tx, &committed)
-
-	result, err := tx.Exec(`UPDATE admin_users SET username = ? WHERE id = ?`, username, userID)
-	if err != nil {
-		return err
-	}
-	count, err := result.RowsAffected()
-	if err != nil {
-		return err
-	}
-	if count == 0 {
-		return sql.ErrNoRows
-	}
-	if _, err := tx.Exec(`DELETE FROM admin_sessions WHERE user_id = ?`, userID); err != nil {
-		return err
-	}
-	if _, err := tx.Exec(`DELETE FROM admin_auth_challenges WHERE user_id = ?`, userID); err != nil {
-		return err
-	}
-	if err := s.maybeFailSave(); err != nil {
-		return err
-	}
-	return commitTx(tx, &committed)
-}
-
-func (s *AdminStore) UpdateAdminPassword(userID, currentPassword, newPassword string) error {
-	if err := validatePassword(newPassword); err != nil {
-		return fmt.Errorf("password does not meet requirements: %w", err)
-	}
-
-	hash, err := bcrypt.GenerateFromPassword([]byte(newPassword), s.bcryptCost)
-	if err != nil {
-		return fmt.Errorf("failed to hash password: %w", err)
-	}
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	tx, err := s.db.Begin()
-	if err != nil {
-		return err
-	}
-	committed := false
-	defer rollbackUnlessCommitted(tx, &committed)
-
-	user, err := scanAdminUser(tx.QueryRow(`SELECT `+adminUserSelectColumns()+` FROM admin_users WHERE id = ?`, userID))
-	if err != nil {
-		return err
-	}
-	if err := bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(newPassword)); err == nil {
-		return fmt.Errorf("new password must be different from the current password")
-	}
-	if currentPassword != "" {
-		if err := bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(currentPassword)); err != nil {
-			return errCurrentPassword
-		}
-	}
-	if _, err := tx.Exec(`UPDATE admin_users SET password_hash = ? WHERE id = ?`, string(hash), userID); err != nil {
-		return err
-	}
-	if _, err := tx.Exec(`DELETE FROM admin_sessions WHERE user_id = ?`, userID); err != nil {
-		return err
-	}
-	if _, err := tx.Exec(`DELETE FROM admin_auth_challenges WHERE user_id = ?`, userID); err != nil {
-		return err
-	}
-	if err := s.maybeFailSave(); err != nil {
-		return err
-	}
-	return commitTx(tx, &committed)
-}
-
 func (s *AdminStore) BeginTOTPSetup(user AdminUser, issuer string) (challengeID, secret, otpURL, qrDataURL string, err error) {
 	key, err := totp.Generate(totp.GenerateOpts{
 		Issuer:      issuer,
@@ -252,125 +169,6 @@ func encodePNGDataURL(img image.Image) (string, error) {
 		return "", err
 	}
 	return "data:image/png;base64," + base64.StdEncoding.EncodeToString(buf.Bytes()), nil
-}
-
-func (s *AdminStore) ConfirmTOTPSetup(userID, challengeID, code string) ([]string, error) {
-	challenge, err := s.GetAuthChallenge(challengeID, adminAuthChallengeKindTOTPSetup)
-	if err != nil {
-		return nil, err
-	}
-	if challenge.UserID != userID {
-		return nil, sql.ErrNoRows
-	}
-	var metadata struct {
-		Secret string `json:"secret"`
-	}
-	if err := json.Unmarshal([]byte(challenge.SessionJSON), &metadata); err != nil {
-		return nil, err
-	}
-	if metadata.Secret == "" || !totp.Validate(normalizeMFACode(code), metadata.Secret) {
-		return nil, errMFAInvalid
-	}
-	if _, err := s.ConsumeAuthChallenge(challengeID, userID, adminAuthChallengeKindTOTPSetup); err != nil {
-		return nil, err
-	}
-	codes, err := generateRecoveryCodes(adminRecoveryCodeCount)
-	if err != nil {
-		return nil, err
-	}
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	tx, err := s.db.Begin()
-	if err != nil {
-		return nil, err
-	}
-	committed := false
-	defer rollbackUnlessCommitted(tx, &committed)
-
-	if _, err := tx.Exec(`UPDATE admin_users SET totp_enabled = 1, totp_secret = ? WHERE id = ?`, metadata.Secret, userID); err != nil {
-		return nil, err
-	}
-	if err := replaceRecoveryCodesInTx(tx, userID, codes); err != nil {
-		return nil, err
-	}
-	if _, err := tx.Exec(`DELETE FROM admin_sessions WHERE user_id = ?`, userID); err != nil {
-		return nil, err
-	}
-	if _, err := tx.Exec(`DELETE FROM admin_auth_challenges WHERE user_id = ?`, userID); err != nil {
-		return nil, err
-	}
-	if err := s.maybeFailSave(); err != nil {
-		return nil, err
-	}
-	if err := commitTx(tx, &committed); err != nil {
-		return nil, err
-	}
-	return codes, nil
-}
-
-func (s *AdminStore) DisableTOTP(userID string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	tx, err := s.db.Begin()
-	if err != nil {
-		return err
-	}
-	committed := false
-	defer rollbackUnlessCommitted(tx, &committed)
-
-	if _, err := tx.Exec(`UPDATE admin_users SET totp_enabled = 0, totp_secret = '' WHERE id = ?`, userID); err != nil {
-		return err
-	}
-	if _, err := tx.Exec(`DELETE FROM admin_totp_recovery_codes WHERE user_id = ?`, userID); err != nil {
-		return err
-	}
-	if _, err := tx.Exec(`DELETE FROM admin_sessions WHERE user_id = ?`, userID); err != nil {
-		return err
-	}
-	if _, err := tx.Exec(`DELETE FROM admin_auth_challenges WHERE user_id = ?`, userID); err != nil {
-		return err
-	}
-	if err := s.maybeFailSave(); err != nil {
-		return err
-	}
-	return commitTx(tx, &committed)
-}
-
-func (s *AdminStore) RegenerateRecoveryCodes(userID string) ([]string, error) {
-	codes, err := generateRecoveryCodes(adminRecoveryCodeCount)
-	if err != nil {
-		return nil, err
-	}
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	tx, err := s.db.Begin()
-	if err != nil {
-		return nil, err
-	}
-	committed := false
-	defer rollbackUnlessCommitted(tx, &committed)
-
-	if err := replaceRecoveryCodesInTx(tx, userID, codes); err != nil {
-		return nil, err
-	}
-	if _, err := tx.Exec(`DELETE FROM admin_sessions WHERE user_id = ?`, userID); err != nil {
-		return nil, err
-	}
-	if _, err := tx.Exec(`DELETE FROM admin_auth_challenges WHERE user_id = ?`, userID); err != nil {
-		return nil, err
-	}
-	if err := s.maybeFailSave(); err != nil {
-		return nil, err
-	}
-	if err := commitTx(tx, &committed); err != nil {
-		return nil, err
-	}
-	return codes, nil
 }
 
 func (s *AdminStore) CountUnusedRecoveryCodes(userID string) (int, error) {
@@ -455,6 +253,9 @@ func consumeRecoveryCodeInTx(tx *sql.Tx, userID, code string) (matched bool, err
 }
 
 func (s *AdminStore) StoreAuthChallenge(userID, kind, sessionJSON string, metadata any, ttl time.Duration) (AdminAuthChallenge, error) {
+	if userID == "" && kind != adminAuthChallengeKindPasskeyLogin {
+		return AdminAuthChallenge{}, errors.New("authentication challenge user is required")
+	}
 	if ttl <= 0 {
 		ttl = adminAuthChallengeDefaultTTL
 	}
@@ -491,12 +292,25 @@ func (s *AdminStore) StoreAuthChallenge(userID, kind, sessionJSON string, metada
 	committed := false
 	defer rollbackUnlessCommitted(tx, &committed)
 
-	if _, err := tx.Exec(`DELETE FROM admin_auth_challenges WHERE user_id = ? AND kind = ?`, userID, kind); err != nil {
+	if _, err := tx.Exec(`DELETE FROM admin_auth_challenges WHERE expires_at <= ?`, formatTime(now)); err != nil {
 		return AdminAuthChallenge{}, err
+	}
+	if userID != "" {
+		if _, err := tx.Exec(`DELETE FROM admin_auth_challenges WHERE user_id = ? AND kind = ?`, userID, kind); err != nil {
+			return AdminAuthChallenge{}, err
+		}
+	} else if kind == adminAuthChallengeKindPasskeyLogin {
+		var active int
+		if err := tx.QueryRow(`SELECT COUNT(*) FROM admin_auth_challenges WHERE user_id IS NULL AND kind = ?`, kind).Scan(&active); err != nil {
+			return AdminAuthChallenge{}, err
+		}
+		if active >= adminPasskeyLoginChallengeMaxActive {
+			return AdminAuthChallenge{}, errPasskeyLoginChallengeCapacity
+		}
 	}
 	if _, err := tx.Exec(`INSERT INTO admin_auth_challenges (id, user_id, kind, session_json, metadata_json, created_at, expires_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		challenge.ID, challenge.UserID, challenge.Kind, challenge.SessionJSON, challenge.MetadataJSON, formatTime(challenge.CreatedAt), formatTime(challenge.ExpiresAt)); err != nil {
+		challenge.ID, nullIfEmpty(challenge.UserID), challenge.Kind, challenge.SessionJSON, challenge.MetadataJSON, formatTime(challenge.CreatedAt), formatTime(challenge.ExpiresAt)); err != nil {
 		return AdminAuthChallenge{}, err
 	}
 	if err := s.maybeFailSave(); err != nil {
@@ -562,10 +376,12 @@ func (s *AdminStore) GetAuthChallenge(id, kind string) (AdminAuthChallenge, erro
 
 func scanAdminAuthChallenge(row dbScanner) (AdminAuthChallenge, error) {
 	var challenge AdminAuthChallenge
+	var userID sql.NullString
 	var createdAt, expiresAt string
-	if err := row.Scan(&challenge.ID, &challenge.UserID, &challenge.Kind, &challenge.SessionJSON, &challenge.MetadataJSON, &createdAt, &expiresAt); err != nil {
+	if err := row.Scan(&challenge.ID, &userID, &challenge.Kind, &challenge.SessionJSON, &challenge.MetadataJSON, &createdAt, &expiresAt); err != nil {
 		return AdminAuthChallenge{}, err
 	}
+	challenge.UserID = userID.String
 	parsedCreatedAt, err := parseTime(createdAt)
 	if err != nil {
 		return AdminAuthChallenge{}, err
@@ -577,61 +393,6 @@ func scanAdminAuthChallenge(row dbScanner) (AdminAuthChallenge, error) {
 	challenge.CreatedAt = parsedCreatedAt
 	challenge.ExpiresAt = parsedExpiresAt
 	return challenge, nil
-}
-
-func (s *AdminStore) AddPasskey(userID, name, credentialID string, credential webauthn.Credential, rpID, origin string) (*AdminPasskey, error) {
-	name = strings.TrimSpace(name)
-	if name == "" {
-		name = "Passkey"
-	}
-	raw, err := json.Marshal(credential)
-	if err != nil {
-		return nil, err
-	}
-	now := time.Now()
-	passkeyID, err := generateUUIDE()
-	if err != nil {
-		return nil, err
-	}
-	passkey := AdminPasskey{
-		ID:             passkeyID,
-		UserID:         userID,
-		Name:           name,
-		CredentialID:   credentialID,
-		CredentialJSON: string(raw),
-		RPID:           rpID,
-		Origin:         origin,
-		CreatedAt:      now,
-	}
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	tx, err := s.db.Begin()
-	if err != nil {
-		return nil, err
-	}
-	committed := false
-	defer rollbackUnlessCommitted(tx, &committed)
-
-	if _, err := tx.Exec(`INSERT INTO admin_passkeys (id, user_id, name, credential_id, credential_json, rp_id, origin, created_at, last_used_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
-		passkey.ID, passkey.UserID, passkey.Name, passkey.CredentialID, passkey.CredentialJSON, passkey.RPID, passkey.Origin, formatTime(passkey.CreatedAt)); err != nil {
-		return nil, err
-	}
-	if _, err := tx.Exec(`DELETE FROM admin_sessions WHERE user_id = ?`, userID); err != nil {
-		return nil, err
-	}
-	if _, err := tx.Exec(`DELETE FROM admin_auth_challenges WHERE user_id = ?`, userID); err != nil {
-		return nil, err
-	}
-	if err := s.maybeFailSave(); err != nil {
-		return nil, err
-	}
-	if err := commitTx(tx, &committed); err != nil {
-		return nil, err
-	}
-	return &passkey, nil
 }
 
 func (s *AdminStore) ListPasskeys(userID string) (passkeys []AdminPasskey, err error) {
@@ -688,73 +449,6 @@ func (s *AdminStore) ListPasskeysByRP(rpID, origin string) (passkeys []AdminPass
 		return nil, err
 	}
 	return passkeys, nil
-}
-
-func (s *AdminStore) UpdatePasskeyName(userID, passkeyID, name string) error {
-	name = strings.TrimSpace(name)
-	if name == "" {
-		return fmt.Errorf("passkey name is required")
-	}
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	tx, err := s.db.Begin()
-	if err != nil {
-		return err
-	}
-	committed := false
-	defer rollbackUnlessCommitted(tx, &committed)
-
-	result, err := tx.Exec(`UPDATE admin_passkeys SET name = ? WHERE id = ? AND user_id = ?`, name, passkeyID, userID)
-	if err != nil {
-		return err
-	}
-	count, err := result.RowsAffected()
-	if err != nil {
-		return err
-	}
-	if count == 0 {
-		return errPasskeyNotFound
-	}
-	if err := s.maybeFailSave(); err != nil {
-		return err
-	}
-	return commitTx(tx, &committed)
-}
-
-func (s *AdminStore) DeletePasskey(userID, passkeyID string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	tx, err := s.db.Begin()
-	if err != nil {
-		return err
-	}
-	committed := false
-	defer rollbackUnlessCommitted(tx, &committed)
-
-	result, err := tx.Exec(`DELETE FROM admin_passkeys WHERE id = ? AND user_id = ?`, passkeyID, userID)
-	if err != nil {
-		return err
-	}
-	count, err := result.RowsAffected()
-	if err != nil {
-		return err
-	}
-	if count == 0 {
-		return errPasskeyNotFound
-	}
-	if _, err := tx.Exec(`DELETE FROM admin_sessions WHERE user_id = ?`, userID); err != nil {
-		return err
-	}
-	if _, err := tx.Exec(`DELETE FROM admin_auth_challenges WHERE user_id = ?`, userID); err != nil {
-		return err
-	}
-	if err := s.maybeFailSave(); err != nil {
-		return err
-	}
-	return commitTx(tx, &committed)
 }
 
 func (s *AdminStore) TouchPasskey(userID, credentialID string, credential webauthn.Credential) error {

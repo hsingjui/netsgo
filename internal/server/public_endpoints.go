@@ -47,6 +47,13 @@ func configuredPublicServerAddr(cfg *ServerConfig) (string, bool) {
 	return normalized, true
 }
 
+func resourceServerAddr(cfg *ServerConfig, fallback string) string {
+	if configured, ok := configuredPublicServerAddr(cfg); ok {
+		return configured
+	}
+	return fallback
+}
+
 func publicEndpointURLs(base string) (endpointURLs, error) {
 	normalized, err := validateServerAddr(base)
 	if err != nil {

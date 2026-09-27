@@ -131,7 +131,7 @@ func seedStoredTunnel(t *testing.T, s *Server, clientID string, req protocol.Pro
 		t.Fatalf("unknown test status: %s", status)
 	}
 
-	err := s.store.AddTunnel(StoredTunnel{
+	mustAddStableTunnelForServer(t, s, StoredTunnel{
 		ProxyNewRequest: req,
 		DesiredState:    desiredState,
 		RuntimeState:    runtimeState,
@@ -139,9 +139,6 @@ func seedStoredTunnel(t *testing.T, s *Server, clientID string, req protocol.Pro
 		Hostname:        clientID + ".local",
 		Binding:         TunnelBindingClientID,
 	})
-	if err != nil {
-		t.Fatalf("failed to write test tunnel: %v", err)
-	}
 }
 
 func loginAdminTokenLocal(t *testing.T, handler http.Handler, username, password string) string {
@@ -275,12 +272,17 @@ func TestAPI_ProtectedRoutes_LoginLogoutAndSingleSession(t *testing.T) {
 }
 
 func TestAPI_AdminKeys_CreateAndList(t *testing.T) {
+	t.Setenv("NETSGO_SERVER_ADDR", "https://Locked.EXAMPLE.com:443")
 	s, cleanup := setupTestServerWithDB(t, true)
 	defer cleanup()
+	admin, err := s.auth.adminStore.ValidateAdminPassword("admin", "password123")
+	if err != nil {
+		t.Fatalf("load test administrator: %v", err)
+	}
 
 	// 1. Create API key (POST)
 	body := []byte(`{"name":"test-key","permissions":["connect"]}`)
-	req := httptest.NewRequest(http.MethodPost, "/api/admin/keys", bytes.NewReader(body))
+	req := withTestResourceScope(httptest.NewRequest(http.MethodPost, "/api/admin/keys", bytes.NewReader(body)), admin.ID)
 	w := httptest.NewRecorder()
 	s.handleAPIAdminKeys(w, req)
 
@@ -305,6 +307,9 @@ func TestAPI_AdminKeys_CreateAndList(t *testing.T) {
 	if len(rawKey) != len("sk-")+32 {
 		t.Fatalf("raw_key length = %d, want %d", len(rawKey), len("sk-")+32)
 	}
+	if resp["server_addr"] != "https://locked.example.com" {
+		t.Fatalf("server_addr should use the effective env-locked address, got %v", resp["server_addr"])
+	}
 	if keyPayload, ok := resp["key"].(map[string]any); ok {
 		if _, exists := keyPayload["key_hash"]; exists {
 			t.Error("API response should not leak key_hash")
@@ -312,7 +317,7 @@ func TestAPI_AdminKeys_CreateAndList(t *testing.T) {
 	}
 
 	// 2. Get API keys (GET)
-	req2 := httptest.NewRequest(http.MethodGet, "/api/admin/keys", nil)
+	req2 := withTestResourceScope(httptest.NewRequest(http.MethodGet, "/api/admin/keys", nil), admin.ID)
 	w2 := httptest.NewRecorder()
 	s.handleAPIAdminKeys(w2, req2)
 
@@ -339,19 +344,24 @@ func TestAPI_AdminKeys_CreateAndList(t *testing.T) {
 func TestAPI_AdminKeys_CreateFailsWhenPersistFails(t *testing.T) {
 	s, cleanup := setupTestServerWithDB(t, true)
 	defer cleanup()
+	admin, err := s.auth.adminStore.ValidateAdminPassword("admin", "password123")
+	if err != nil {
+		t.Fatalf("load test administrator: %v", err)
+	}
 
 	s.auth.adminStore.failSaveErr = errors.New("save failed")
 	s.auth.adminStore.failSaveCount = 1
 
 	body := []byte(`{"name":"test-key","permissions":["connect"]}`)
-	req := httptest.NewRequest(http.MethodPost, "/api/admin/keys", bytes.NewReader(body))
+	req := withTestResourceScope(httptest.NewRequest(http.MethodPost, "/api/admin/keys", bytes.NewReader(body)), admin.ID)
 	w := httptest.NewRecorder()
 
 	s.handleAPIAdminKeys(w, req)
 
-	if w.Code != http.StatusBadRequest {
-		t.Fatalf("API key persistence failure should return 400, got %d", w.Code)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("API key persistence failure should return 503, got %d", w.Code)
 	}
+	requireUserAPIErrorCode(t, w.Body.Bytes(), "temporary_storage_failure")
 }
 
 func TestAPI_AdminConfig_GetAndUpdate(t *testing.T) {
@@ -866,6 +876,73 @@ func TestAPI_UpdateClientBandwidthSettingsContract(t *testing.T) {
 	}
 	if settings["egress_bps"] != float64(4096) {
 		t.Fatalf("egress_bps: want 4096, got %v", settings["egress_bps"])
+	}
+}
+
+func TestAPI_UpdateClientBandwidthSettingsSerializesWithClientSessionPublication(t *testing.T) {
+	s, cleanup := setupTestServerWithDB(t, true)
+	defer cleanup()
+
+	record, err := s.auth.adminStore.GetOrCreateClient("install-bandwidth-serialization", protocol.ClientInfo{
+		Hostname: "bandwidth-serialization",
+		OS:       "linux",
+		Arch:     "amd64",
+		Version:  "0.1.0",
+	}, "127.0.0.1:12345")
+	if err != nil {
+		t.Fatalf("failed to create client record: %v", err)
+	}
+
+	req := withTestResourceScope(
+		httptest.NewRequest(http.MethodPut, "/api/clients/"+record.ID+"/bandwidth-settings", bytes.NewReader([]byte(`{"ingress_bps":2048,"egress_bps":4096}`))),
+		record.OwnerUserID,
+	)
+	req.Header.Set("Content-Type", "application/json")
+	req.SetPathValue("id", record.ID)
+	resp := httptest.NewRecorder()
+
+	reachedLifecycleGate := make(chan struct{})
+	var gateOnce sync.Once
+	s.userLifecycleHook = func(stage, userID string) {
+		if stage == "after_read_gate" && userID == record.OwnerUserID {
+			gateOnce.Do(func() { close(reachedLifecycleGate) })
+		}
+	}
+
+	s.clientTunnelMutationMu.Lock()
+	mutationLocked := true
+	defer func() {
+		if mutationLocked {
+			s.clientTunnelMutationMu.Unlock()
+		}
+	}()
+
+	done := make(chan struct{})
+	go func() {
+		s.handleUpdateBandwidthSettings(resp, req)
+		close(done)
+	}()
+
+	select {
+	case <-reachedLifecycleGate:
+	case <-time.After(time.Second):
+		t.Fatal("bandwidth update did not reach the user lifecycle gate")
+	}
+	select {
+	case <-done:
+		t.Fatal("bandwidth update completed while client session publication lock was held")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	s.clientTunnelMutationMu.Unlock()
+	mutationLocked = false
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("bandwidth update did not complete after client session publication lock was released")
+	}
+	if resp.Code != http.StatusOK {
+		t.Fatalf("bandwidth update status = %d body=%s", resp.Code, resp.Body.String())
 	}
 }
 

@@ -116,16 +116,10 @@ func TestTrafficAccumulatorKeepsRelayAndDirectTransportSeparate(t *testing.T) {
 }
 
 func TestRecordStoredTunnelTrafficKeepsOldRelayStreamInRelayBucketAfterSelectorTurnsDirect(t *testing.T) {
-	s := New(0)
-	ts, cleanup := newTestTrafficStore(t)
-	defer cleanup()
-	s.trafficStore = ts
-	stored := StoredTunnel{
-		ProxyNewRequest: protocol.ProxyNewRequest{ID: "mixed", Name: "mixed", Type: protocol.ProxyTypeTCP},
-		OwnerClientID:   "owner",
-		Revision:        1,
-		ActualTransport: protocol.ActualTransportPeerDirect,
-	}
+	fixture := newTrafficOwnerFixture(t)
+	s := fixture.server
+	stored := fixture.tunnelA
+	stored.ActualTransport = protocol.ActualTransportPeerDirect
 	s.recordStoredTunnelTrafficAt(time.Now(), stored, 17, 19)
 	deltas := s.trafficAccumulator.Drain()
 	if len(deltas) != 1 || deltas[0].Transport != protocol.ActualTransportServerRelay || deltas[0].IngressBytes != 17 || deltas[0].EgressBytes != 19 {
@@ -206,24 +200,23 @@ func TestTrafficDeltaFactoriesPropagateTunnelRevision(t *testing.T) {
 }
 
 func TestServerFlushTrafficObservationsAppliesAccumulator(t *testing.T) {
-	s := New(0)
-	ts, cleanup := newTestTrafficStore(t)
-	defer cleanup()
-	s.trafficStore = ts
+	fixture := newTrafficOwnerFixture(t)
+	s := fixture.server
+	ts := fixture.store
 
 	base := secondFloorUTC(time.Now().UTC())
-	s.recordTrafficAt(base, "c1", "web", "http", 100, 10)
-	s.recordTrafficAt(base, "c1", "web", "http", 50, 5)
+	s.recordTrafficObservationAt(base, fixture.tunnelA.ID, fixture.clientA.ID, fixture.tunnelA.Name, fixture.tunnelA.Type, 100, 10)
+	s.recordTrafficObservationAt(base, fixture.tunnelA.ID, fixture.clientA.ID, fixture.tunnelA.Name, fixture.tunnelA.Type, 50, 5)
 
-	before := mustQueryWithResolution(t, ts, "c1", "web", base.Add(-time.Second), base.Add(time.Second), TrafficResolutionSecond)
+	before := mustQueryWithResolution(t, ts, fixture.clientA.ID, fixture.tunnelA.Name, base.Add(-time.Second), base.Add(time.Second), TrafficResolutionSecond)
 	if len(before.Items) != 0 {
 		t.Fatalf("traffic store should not see accumulator data before flush, got %+v", before.Items)
 	}
 
 	s.flushTrafficObservations()
 
-	after := mustQueryWithResolution(t, ts, "c1", "web", base.Add(-time.Second), base.Add(time.Second), TrafficResolutionSecond)
-	web := mustSingleSeries(t, after, "web")
+	after := mustQueryWithResolution(t, ts, fixture.clientA.ID, fixture.tunnelA.Name, base.Add(-time.Second), base.Add(time.Second), TrafficResolutionSecond)
+	web := mustSingleSeries(t, after, fixture.tunnelA.Name)
 	if len(web.Points) != 1 {
 		t.Fatalf("web points: want 1, got %+v", web.Points)
 	}
@@ -233,24 +226,24 @@ func TestServerFlushTrafficObservationsAppliesAccumulator(t *testing.T) {
 }
 
 func TestServerFlushTrafficObservationsDropsDeltaQueuedBeforeMigration(t *testing.T) {
-	store := newTestTunnelStore(t)
-	mustAddStableTunnel(t, store, StoredTunnel{
-		ProxyNewRequest: protocol.ProxyNewRequest{ID: "queued-before-migration", Name: "web", Type: protocol.ProxyTypeTCP, LocalIP: "127.0.0.1", LocalPort: 8080, RemotePort: 18080},
-		ClientID:        "client-old",
-	})
-	stored, err := store.GetTunnelByIDE("client-old", "queued-before-migration")
+	fixture := newTrafficOwnerFixture(t)
+	store := fixture.server.store
+	trafficStore := fixture.store
+	s := fixture.server
+	stored := fixture.tunnelA
+	newClient, err := s.auth.adminStore.GetOrCreateClientForUser(fixture.ownerA.ID, "traffic-migration-target-install", protocol.ClientInfo{Hostname: "traffic-migration-target"}, "127.0.0.3")
 	if err != nil {
-		t.Fatalf("GetTunnelByIDE failed: %v", err)
+		t.Fatalf("register migration target: %v", err)
 	}
-	trafficStore := newTrafficStoreWithDB(store.path, store.db, false)
-	s := New(0)
-	store.attachTrafficStore(trafficStore, s.trafficAccumulator)
-	s.store = store
-	s.trafficStore = trafficStore
 	now := secondFloorUTC(time.Now().UTC())
 
 	s.recordStoredTunnelTrafficAt(now, stored, 100, 40)
-	_, migrated, err := store.MigrateTunnelTargetByID(stored.ID, stored.Revision, tunnelTargetMigrationReplacement(t, store, stored, "client-new"))
+	replacement := stored
+	replacement.ClientID = newClient.ID
+	replacement.OwnerClientID = newClient.ID
+	replacement.Target.ClientID = newClient.ID
+	replacement.UpdatedAt = time.Time{}
+	_, migrated, err := store.MigrateTunnelTargetByID(stored.ID, stored.Revision, replacement)
 	if err != nil {
 		t.Fatalf("MigrateTunnelTargetByID failed: %v", err)
 	}
@@ -262,14 +255,14 @@ func TestServerFlushTrafficObservationsDropsDeltaQueuedBeforeMigration(t *testin
 		t.Fatalf("late old-revision traffic should be rejected before queueing, pending = %d", got)
 	}
 	s.flushTrafficObservations()
-	oldResult := mustQueryWithResolution(t, trafficStore, "client-old", stored.ID, now.Add(-time.Minute), now.Add(time.Minute), TrafficResolutionMinute)
+	oldResult := mustQueryWithResolution(t, trafficStore, fixture.clientA.ID, stored.ID, now.Add(-time.Minute), now.Add(time.Minute), TrafficResolutionMinute)
 	if len(oldResult.Items) != 0 {
 		t.Fatalf("queued old-revision traffic should be filtered after migration, got %+v", oldResult.Items)
 	}
 
 	s.recordStoredTunnelTrafficAt(now, migrated, 7, 3)
 	s.flushTrafficObservations()
-	newResult := mustQueryWithResolution(t, trafficStore, "client-new", migrated.ID, now.Add(-time.Minute), now.Add(time.Minute), TrafficResolutionMinute)
+	newResult := mustQueryWithResolution(t, trafficStore, newClient.ID, migrated.ID, now.Add(-time.Minute), now.Add(time.Minute), TrafficResolutionMinute)
 	series := mustSingleSeries(t, newResult, migrated.Name)
 	if len(series.Points) != 1 || series.Points[0].IngressBytes != 7 || series.Points[0].EgressBytes != 3 {
 		t.Fatalf("new revision traffic mismatch: %+v", series.Points)

@@ -1,5 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { api } from '@/lib/api';
+import { api, scopedClientApi } from '@/lib/api';
+import { scopedQueryKey, type ResourceScope } from '@/lib/resource-scope';
 import type { VersionCheckResult, VersionInstallMethod, VersionTargetKind } from '@/types';
 
 export interface VersionCheckTarget {
@@ -16,8 +17,9 @@ function normalizeMethod(method?: string): VersionInstallMethod {
   return method === 'service' || method === 'docker' || method === 'binary' ? method : 'binary';
 }
 
-export function versionCheckQueryKey(target: VersionCheckTarget) {
-  return [
+export function versionCheckQueryKey(scope: ResourceScope, target: VersionCheckTarget) {
+  return scopedQueryKey(
+    scope,
     'version-check',
     target.kind,
     target.id || target.kind,
@@ -25,35 +27,34 @@ export function versionCheckQueryKey(target: VersionCheckTarget) {
     normalizeMethod(target.installMethod),
     target.os || '',
     target.arch || '',
-  ] as const;
+  );
 }
 
-function endpoint(target: VersionCheckTarget, force: boolean) {
-  const qs = force ? '?force=true' : '';
+function endpoint(scope: ResourceScope, target: VersionCheckTarget, force: boolean) {
   if (target.kind === 'client') {
-    return `/api/clients/${encodeURIComponent(target.id || '')}/version/check${qs}`;
+    return scopedClientApi.versionCheck(scope, target.id || '', force);
   }
-  return `/api/version/check${qs}`;
+  return api.get<VersionCheckResult>(`/api/version/check${force ? '?force=true' : ''}`);
 }
 
-export function useVersionCheck(target: VersionCheckTarget) {
+export function useVersionCheck(scope: ResourceScope, target: VersionCheckTarget) {
   const enabled = Boolean(target.enabled ?? true) && Boolean(target.version) && (target.kind === 'server' || Boolean(target.id));
 
   return useQuery({
-    queryKey: versionCheckQueryKey(target),
-    queryFn: () => api.get<VersionCheckResult>(endpoint(target, false)),
+    queryKey: versionCheckQueryKey(scope, target),
+    queryFn: () => endpoint(scope, target, false) as Promise<VersionCheckResult>,
     enabled,
     retry: false,
     staleTime: 10 * 60 * 1000,
   });
 }
 
-export function useForceVersionCheck(target: VersionCheckTarget) {
+export function useForceVersionCheck(scope: ResourceScope, target: VersionCheckTarget) {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: () => api.get<VersionCheckResult>(endpoint(target, true)),
+    mutationFn: () => endpoint(scope, target, true) as Promise<VersionCheckResult>,
     onSuccess: (result) => {
-      queryClient.setQueryData(versionCheckQueryKey(target), result);
+      queryClient.setQueryData(versionCheckQueryKey(scope, target), result);
     },
   });
 }

@@ -6,12 +6,16 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-func (s *Server) beginLongLivedHandler() func() {
+func (s *Server) beginLongLivedHandler() (func(), bool) {
 	return s.sessions.beginLongLivedHandler()
 }
 
-func (s *Server) trackManagedConn(conn *websocket.Conn) func() {
+func (s *Server) trackManagedConn(conn *websocket.Conn) (func(), bool) {
 	return s.sessions.trackManagedConn(conn)
+}
+
+func (s *Server) stopLongLivedAdmission() {
+	s.sessions.beginShutdown()
 }
 
 func (s *Server) closeManagedConns(reason string) {

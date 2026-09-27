@@ -2,6 +2,7 @@ package storage
 
 import (
 	"database/sql"
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -109,6 +110,207 @@ func TestOpenWithNoMigrationsAllowsUnknownAppliedMigrations(t *testing.T) {
 	}
 	if err := db.Close(); err != nil {
 		t.Fatalf("Close() error = %v", err)
+	}
+}
+
+func TestApplyCompatibleMigrationsToleratesUnknownLedgerRows(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "netsgo.db"), nil)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	migrations := []Migration{{
+		Name: "001_add_compatible_value",
+		Up:   `CREATE TABLE compatible_value (id INTEGER PRIMARY KEY);`,
+	}}
+	if err := ApplyCompatibleMigrations(db, "compatible_migrations", migrations); err != nil {
+		t.Fatalf("first ApplyCompatibleMigrations() error = %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO compatible_migrations (name, applied_at) VALUES ('999_future_compatible', '2026-07-21T00:00:00Z')`); err != nil {
+		t.Fatalf("insert future compatible migration: %v", err)
+	}
+	if err := ApplyCompatibleMigrations(db, "compatible_migrations", migrations); err != nil {
+		t.Fatalf("future compatible ledger row should be tolerated: %v", err)
+	}
+
+	var count int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM compatible_value`).Scan(&count); err != nil {
+		t.Fatalf("query compatible table: %v", err)
+	}
+}
+
+func TestApplyCompatibleMigrationsRejectsInvalidLedgerName(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "netsgo.db"), nil)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	err = ApplyCompatibleMigrations(db, "schema_migrations; DROP TABLE schema_migrations", []Migration{{
+		Name: "001_invalid_table",
+		Up:   `SELECT 1;`,
+	}})
+	if err == nil || !strings.Contains(err.Error(), "invalid sqlite migration table name") {
+		t.Fatalf("ApplyCompatibleMigrations() error = %v", err)
+	}
+}
+
+func TestOpenRejectsUnknownStrictMigrationBeforeRunningAnyUpSQL(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "netsgo.db")
+	newerDB, err := Open(path, []Migration{{
+		Name: "001_initial",
+		Up:   `CREATE TABLE initial_value (id INTEGER PRIMARY KEY);`,
+	}})
+	if err != nil {
+		t.Fatalf("create newer DB: %v", err)
+	}
+	if _, err := newerDB.Exec(`INSERT INTO schema_migrations (name, applied_at) VALUES ('012_multi_user_ownership', '2026-08-04T00:00:00Z')`); err != nil {
+		t.Fatalf("record newer strict migration: %v", err)
+	}
+	if err := newerDB.Close(); err != nil {
+		t.Fatalf("close newer DB: %v", err)
+	}
+
+	olderDB, err := Open(path, []Migration{
+		{Name: "001_initial", Up: `CREATE TABLE initial_value (id INTEGER PRIMARY KEY);`},
+		{Name: "002_side_effect", Up: `CREATE TABLE must_not_exist (id INTEGER PRIMARY KEY);`},
+	})
+	if err == nil {
+		_ = olderDB.Close()
+		t.Fatal("Open() error = nil")
+	}
+	if !strings.Contains(err.Error(), `unknown applied migration "012_multi_user_ownership"`) {
+		t.Fatalf("Open() error = %q, want unknown strict migration", err)
+	}
+
+	verifyDB, err := OpenReadOnly(path)
+	if err != nil {
+		t.Fatalf("OpenReadOnly() error = %v", err)
+	}
+	defer func() { _ = verifyDB.Close() }()
+	exists, err := TableExists(verifyDB, "must_not_exist")
+	if err != nil {
+		t.Fatalf("TableExists() error = %v", err)
+	}
+	if exists {
+		t.Fatal("unknown strict migration should stop before any pending Up SQL")
+	}
+}
+
+func TestApplyMigrationPlanKeepsGlobalOrderAndSeparateLedgers(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "netsgo.db"), nil)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	if err := ApplyMigrationPlan(db, []MigrationPlanItem{
+		{
+			Migration: Migration{Name: "001_create_order", Up: `CREATE TABLE migration_order (position INTEGER PRIMARY KEY, name TEXT NOT NULL); INSERT INTO migration_order (position, name) VALUES (1, 'strict-001');`},
+			Ledger:    "schema_migrations",
+			Strict:    true,
+		},
+		{
+			Migration: Migration{Name: "010_compatible", Up: `INSERT INTO migration_order (position, name) VALUES (2, 'compatible-010');`},
+			Ledger:    "schema_compatible_migrations",
+			Strict:    false,
+		},
+		{
+			Migration: Migration{Name: "012_strict", Up: `INSERT INTO migration_order (position, name) VALUES (3, 'strict-012');`},
+			Ledger:    "schema_migrations",
+			Strict:    true,
+		},
+	}); err != nil {
+		t.Fatalf("ApplyMigrationPlan() error = %v", err)
+	}
+
+	var names []string
+	rows, err := db.Query(`SELECT name FROM migration_order ORDER BY position`)
+	if err != nil {
+		t.Fatalf("query migration order: %v", err)
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			t.Fatalf("scan migration order: %v", err)
+		}
+		names = append(names, name)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate migration order: %v", err)
+	}
+	if got, want := strings.Join(names, ","), "strict-001,compatible-010,strict-012"; got != want {
+		t.Fatalf("migration execution order = %q, want %q", got, want)
+	}
+
+	assertMigrationLedgerNames(t, db, "schema_migrations", []string{"001_create_order", "012_strict"})
+	assertMigrationLedgerNames(t, db, "schema_compatible_migrations", []string{"010_compatible"})
+}
+
+func TestApplyMigrationPlanRunsValidationBeforeRecordingLedger(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "netsgo.db"), nil)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	err = ApplyMigrationPlan(db, []MigrationPlanItem{{
+		Migration: Migration{
+			Name: "012_validation_failure",
+			Up:   `CREATE TABLE must_roll_back (id INTEGER PRIMARY KEY);`,
+			ValidateTx: func(*sql.Tx) error {
+				return errors.New("forced validation failure")
+			},
+		},
+		Ledger: "schema_migrations",
+		Strict: true,
+	}})
+	if err == nil || !strings.Contains(err.Error(), "forced validation failure") {
+		t.Fatalf("ApplyMigrationPlan() error = %v, want validation failure", err)
+	}
+	exists, err := TableExists(db, "must_roll_back")
+	if err != nil {
+		t.Fatalf("TableExists() error = %v", err)
+	}
+	if exists {
+		t.Fatal("failed migration SQL should roll back")
+	}
+	assertMigrationLedgerNames(t, db, "schema_migrations", nil)
+}
+
+func TestApplyMigrationPlanRejectsUnknownStrictBeforeCompatibleSideEffect(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "netsgo.db"), nil)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	if _, err := db.Exec(`INSERT INTO schema_migrations (name, applied_at) VALUES ('999_future_schema', '2026-08-04T00:00:00Z')`); err != nil {
+		t.Fatalf("insert unknown strict migration: %v", err)
+	}
+
+	err = ApplyMigrationPlan(db, []MigrationPlanItem{
+		{
+			Migration: Migration{Name: "001_known", Up: `CREATE TABLE strict_known (id INTEGER PRIMARY KEY);`},
+			Ledger:    "schema_migrations",
+			Strict:    true,
+		},
+		{
+			Migration: Migration{Name: "010_compatible_side_effect", Up: `CREATE TABLE compatible_side_effect (id INTEGER PRIMARY KEY);`},
+			Ledger:    "schema_compatible_migrations",
+			Strict:    false,
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), `unknown applied migration "999_future_schema"`) {
+		t.Fatalf("ApplyMigrationPlan() error = %v, want unknown strict migration", err)
+	}
+	exists, err := TableExists(db, "compatible_side_effect")
+	if err != nil {
+		t.Fatalf("TableExists() error = %v", err)
+	}
+	if exists {
+		t.Fatal("unknown strict migration should stop before compatible side effects")
 	}
 }
 
@@ -300,5 +502,28 @@ func assertPrivateFileMode(t *testing.T, path string) {
 	}
 	if got := info.Mode().Perm(); got != privateFileMode {
 		t.Fatalf("%s mode = %o, want %o", path, got, privateFileMode)
+	}
+}
+
+func assertMigrationLedgerNames(t *testing.T, db *sql.DB, table string, want []string) {
+	t.Helper()
+	rows, err := db.Query(`SELECT name FROM ` + table + ` ORDER BY name`)
+	if err != nil {
+		t.Fatalf("query migration ledger %s: %v", table, err)
+	}
+	defer func() { _ = rows.Close() }()
+	var got []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			t.Fatalf("scan migration ledger %s: %v", table, err)
+		}
+		got = append(got, name)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate migration ledger %s: %v", table, err)
+	}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("migration ledger %s = %#v, want %#v", table, got, want)
 	}
 }

@@ -7,6 +7,7 @@ import {
   type VersionCheckTarget,
 } from '@/hooks/use-version-check';
 import type { VersionCheckResult } from '@/types';
+import type { ResourceScope } from '@/lib/resource-scope';
 import { Button } from '@/components/ui/button';
 import { cn } from '@/lib/utils';
 import { CopyButton } from './CopyButton';
@@ -23,6 +24,7 @@ import {
 import { safeReleaseUrl, safeUpgradeCommand } from './version-update-security';
 
 interface VersionUpdateIndicatorProps {
+  scope: ResourceScope;
   target: VersionCheckTarget;
   label?: string;
 }
@@ -95,11 +97,11 @@ export function VersionUpdateContent({
   );
 }
 
-export function VersionUpdateIndicator({ target, label }: VersionUpdateIndicatorProps) {
+export function VersionUpdateIndicator({ scope, target, label }: VersionUpdateIndicatorProps) {
   const { t } = useTranslation();
   const displayLabel = label ?? t('updates.runtimeVersion');
-  const check = useVersionCheck(target);
-  const forceCheck = useForceVersionCheck(target);
+  const check = useVersionCheck(scope, target);
+  const forceCheck = useForceVersionCheck(scope, target);
   const data = forceCheck.data || check.data;
   const hasUpdate = Boolean(data?.update_available);
   const manualFailed = Boolean(forceCheck.data?.check_failed || forceCheck.error);

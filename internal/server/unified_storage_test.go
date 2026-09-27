@@ -171,9 +171,7 @@ func TestTunnelStorePreservesExplicitServerExposeBindIP(t *testing.T) {
 		CreatedAt:       time.Now().UTC(),
 		UpdatedAt:       time.Now().UTC(),
 	}
-	if err := store.AddTunnel(stored); err != nil {
-		t.Fatalf("AddTunnel failed: %v", err)
-	}
+	mustAddStableTunnel(t, store, stored)
 	got, err := store.GetTunnelByIDE("client-1", "bind-loopback")
 	if err != nil {
 		t.Fatalf("GetTunnelByIDE failed: %v", err)

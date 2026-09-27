@@ -9,6 +9,10 @@ import (
 )
 
 func (s *Server) handleUpdateDisplayName(w http.ResponseWriter, r *http.Request) {
+	scope, scopeOK := requireResourceScope(w, r)
+	if !scopeOK {
+		return
+	}
 	clientID := r.PathValue("id")
 	if clientID == "" {
 		writeAPIError(w, http.StatusBadRequest, "missing_client_id", "missing client id")
@@ -27,11 +31,23 @@ func (s *Server) handleUpdateDisplayName(w http.ResponseWriter, r *http.Request)
 		writeAPIError(w, http.StatusInternalServerError, "admin_store_unavailable", "admin store unavailable")
 		return
 	}
+	if _, ok := s.auth.adminStore.GetRegisteredClientForUser(scope.OwnerUserID, clientID); !ok {
+		writeAPIError(w, http.StatusNotFound, "client_not_found", "client not found")
+		return
+	}
+	releaseMutation, err := s.acquireResourceMutation(scope, true)
+	if err != nil {
+		writeResourceLifecycleError(w, err)
+		return
+	}
+	defer releaseMutation()
 
-	if err := s.auth.adminStore.UpdateClientDisplayName(clientID, req.DisplayName); err != nil {
+	activityID, err := s.auth.adminStore.UpdateClientDisplayNameWithActivity(clientID, req.DisplayName, s.activityActorForRequest(r))
+	if err != nil {
 		writeAPIError(w, http.StatusNotFound, "client_not_found", err.Error())
 		return
 	}
+	s.publishActivityID(activityID)
 
 	encodeJSON(w, http.StatusOK, map[string]any{
 		"success":      true,
@@ -53,6 +69,10 @@ func validateBandwidthSettings(settings protocol.BandwidthSettings) error {
 }
 
 func (s *Server) handleUpdateBandwidthSettings(w http.ResponseWriter, r *http.Request) {
+	scope, scopeOK := requireResourceScope(w, r)
+	if !scopeOK {
+		return
+	}
 	clientID := r.PathValue("id")
 	if clientID == "" {
 		writeAPIError(w, http.StatusBadRequest, "missing_client_id", "missing client id")
@@ -85,8 +105,19 @@ func (s *Server) handleUpdateBandwidthSettings(w http.ResponseWriter, r *http.Re
 		writeAPIError(w, http.StatusInternalServerError, "admin_store_unavailable", "admin store unavailable")
 		return
 	}
+	if _, ok := s.auth.adminStore.GetRegisteredClientForUser(scope.OwnerUserID, clientID); !ok {
+		writeAPIError(w, http.StatusNotFound, "client_not_found", "client not found")
+		return
+	}
+	releaseMutation, err := s.acquireResourceTunnelMutation(scope, true)
+	if err != nil {
+		writeResourceLifecycleError(w, err)
+		return
+	}
+	defer releaseMutation()
 
-	if err := s.auth.adminStore.UpdateClientBandwidthSettings(clientID, settings); err != nil {
+	activityID, err := s.auth.adminStore.UpdateClientBandwidthSettingsWithActivity(clientID, settings, s.activityActorForRequest(r))
+	if err != nil {
 		switch {
 		case errors.Is(err, ErrRegisteredClientNotFound):
 			writeAPIError(w, http.StatusNotFound, "client_not_found", "client not found")
@@ -102,6 +133,7 @@ func (s *Server) handleUpdateBandwidthSettings(w http.ResponseWriter, r *http.Re
 			return
 		}
 	}
+	s.publishActivityID(activityID)
 
 	encodeJSON(w, http.StatusOK, map[string]any{
 		"success":            true,
@@ -110,6 +142,10 @@ func (s *Server) handleUpdateBandwidthSettings(w http.ResponseWriter, r *http.Re
 }
 
 func (s *Server) handleDeleteClient(w http.ResponseWriter, r *http.Request) {
+	scope, scopeOK := requireResourceScope(w, r)
+	if !scopeOK {
+		return
+	}
 	clientID := r.PathValue("id")
 	if clientID == "" {
 		writeAPIError(w, http.StatusBadRequest, "missing_client_id", "missing client id")
@@ -119,37 +155,22 @@ func (s *Server) handleDeleteClient(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusInternalServerError, "admin_store_unavailable", "admin store unavailable")
 		return
 	}
-	s.clientTunnelMutationMu.Lock()
-	defer s.clientTunnelMutationMu.Unlock()
-	if value, ok := s.clients.Load(clientID); ok {
-		client := value.(*ClientConn)
-		if client.getState() != clientStateClosing {
-			writeAPIError(w, http.StatusConflict, "client_online_delete_forbidden", "client is online and cannot be deleted")
-			return
-		}
-	}
-	if _, ok := s.auth.adminStore.GetRegisteredClient(clientID); !ok {
+	if _, ok := s.auth.adminStore.GetRegisteredClientForUser(scope.OwnerUserID, clientID); !ok {
 		writeAPIError(w, http.StatusNotFound, "client_not_found", "client not found")
 		return
 	}
-
-	if s.store != nil {
-		deletedTunnels, err := s.store.DeleteTunnelsByClientIDReturningDeleted(clientID)
-		if err != nil {
-			writeAPIError(w, http.StatusInternalServerError, "client_tunnels_delete_failed", err.Error())
-			return
-		}
-		for _, tunnel := range deletedTunnels {
-			s.unifiedRuntime.purgeTunnelIssues(tunnel.ID, tunnel.Revision)
-		}
+	releaseMutation, err := s.acquireResourceTunnelMutation(scope, false)
+	if err != nil {
+		writeResourceLifecycleError(w, err)
+		return
 	}
-	if s.trafficStore != nil {
-		if err := s.trafficStore.EvictClient(clientID); err != nil {
-			writeAPIError(w, http.StatusInternalServerError, "client_traffic_delete_failed", err.Error())
-			return
-		}
+	defer releaseMutation()
+	if _, ok := s.clients.Load(clientID); ok {
+		writeAPIError(w, http.StatusConflict, "client_online_delete_forbidden", "client is online or closing and cannot be deleted")
+		return
 	}
-	if err := s.auth.adminStore.DeleteRegisteredClient(clientID); err != nil {
+	result, err := s.deleteRegisteredClientWithActivity(clientID, s.activityActorForRequest(r))
+	if err != nil {
 		switch {
 		case errors.Is(err, ErrRegisteredClientNotFound):
 			writeAPIError(w, http.StatusNotFound, "client_not_found", "client not found")
@@ -158,6 +179,10 @@ func (s *Server) handleDeleteClient(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
+	for _, tunnel := range result.Tunnels {
+		s.unifiedRuntime.purgeTunnelIssues(tunnel.ID, tunnel.Revision)
+	}
+	s.publishActivityIDs(result.ActivityIDs...)
 
 	w.WriteHeader(http.StatusNoContent)
 }
